@@ -1,0 +1,80 @@
+{
+  "provider_id": {
+    "description": "主 LLM 提供商 (覆盖会话默认)",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "留空则使用当前会话的默认模型。填入后本插件的所有 LLM 调用都会走这个提供商",
+    "default": ""
+  },
+  "provider_mode_a": {
+    "description": "模式 A (纯叙事) - 留空用上面的",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "可选覆盖。模式 A 无工具调用,可选用更便宜/更快的模型",
+    "default": ""
+  },
+  "provider_mode_b": {
+    "description": "模式 B (RPG) - 留空用上面的",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "可选覆盖。需要 function calling 能力,推荐用擅长工具调用的模型",
+    "default": ""
+  },
+  "provider_mode_c": {
+    "description": "模式 C (DND 跑团) - 留空用上面的",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "可选覆盖。规则多 + 掷骰多,推荐能力强的模型",
+    "default": ""
+  },
+  "tool_max_steps": {
+    "description": "模式 B/C 单次 LLM 调用最大工具步数",
+    "type": "int",
+    "hint": "tool_loop_agent 的 max_steps。范围 5-100。值过小可能回合未完成,过大响应极慢。默认 30",
+    "default": 30
+  },
+  "tool_call_timeout": {
+    "description": "单次工具调用超时 (秒)",
+    "type": "int",
+    "hint": "tool_loop_agent 的 tool_call_timeout。范围 10-300。默认 60",
+    "default": 60
+  },
+  "max_history_chars": {
+    "description": "叙事历史最大字符数",
+    "type": "int",
+    "hint": "超过此长度时,前面的消息会压缩为【叙事历史摘要】,仅保留最近 keep_tail_messages 条原文。默认 60000",
+    "default": 60000
+  },
+  "keep_tail_messages": {
+    "description": "压缩后保留的最近消息条数",
+    "type": "int",
+    "hint": "默认 20。建议保持偶数 (user + assistant 算一对)",
+    "default": 20
+  },
+  "use_llm_compress": {
+    "description": "历史压缩使用 LLM(默认开)",
+    "type": "bool",
+    "hint": "开启后,超长历史会调用 LLM 压缩成摘要(质量更好,稍慢);关闭则用纯规则抽取标题与世界观(快但粗)。LLM 调用失败会自动回退到规则抽取",
+    "default": true
+  },
+  "compress_provider_id": {
+    "description": "压缩任务专用模型(可路由到便宜/快速的模型)",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "可选。留空则用 provider_id(再留空用主 provider 或会话默认)。压缩只是抽取要点,可以路由到便宜模型而不必用主模型",
+    "default": ""
+  },
+  "use_llm_mode_detect": {
+    "description": "模式识别使用 LLM(更准确)",
+    "type": "bool",
+    "hint": "开启后,/创建 时会调 LLM 分析语境判断 A/B/C(默认开)。关闭则只用关键词匹配(快但简陋,可能误判)。LLM 调用失败自动回退关键词",
+    "default": true
+  },
+  "mode_detect_provider_id": {
+    "description": "模式识别专用模型(可路由到便宜的)",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "可选。模式识别只是简单分类,可路由到便宜快速模型。留空用 provider_id(再留空用主 provider 或会话默认)",
+    "default": ""
+  }
+}
