@@ -121,12 +121,11 @@ def _parse_docstring_params(docstring: str) -> dict:
 
 async def _extract_image(event: AstrMessageEvent) -> list[str]:
     images: list[str] = [
-        getattr(comp, "url")
+        comp.url
         for comp in event.get_messages()
-        if isinstance(comp, Image) and getattr(comp, "url")
+        if isinstance(comp, Image) and comp.url
     ]
-    quoted_image = await QuotedMessageExtractor(event).images()
-    return images + quoted_image
+    return images
 
 
 def _build_quoted_tag(text: str):
@@ -222,7 +221,12 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
     @staticmethod
     def _is_my_tool(name: str) -> bool:
         """过滤:只保留本插件的工具(rpg_*/roll_dice)。"""
-        return bool(name) and (name.startswith("rpg_") or name == "roll_dice")
+        return bool(name) and (
+            name.startswith("rpg_")
+            or name == "roll_dice"
+            or "life_sim_save_character_lore"
+            or "life_sim_save_world_lore"
+        )
 
     def _build_my_tool_set(self) -> ToolSet:
         """直接从 self 自己的方法里收集本插件的工具,构建 ToolSet。
