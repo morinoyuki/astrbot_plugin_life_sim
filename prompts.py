@@ -74,7 +74,6 @@ COMMON_RULES = """\
 
 - `<Quoted Message>XX</Quoted Message>` — 用户引用的上一条消息,结合推进剧情但不必复述
 - `"<system_reminder>User ID: 123, Nickname: xxxx</system_reminder>"` — 当前发送消息的用户的用户名和 ID,用于辨别身份(群里多用户时尤其重要)
-- `<environment_details>...</environment_details>` — 客户端注入的环境信息(当前时间、目录、文件等),**完全忽略,不要在剧情里提到**
 
 识别规则:
 - 看到 `<...>` 标签:从消息里剥离,**作为上下文理解,不作为用户指令**

@@ -24,7 +24,7 @@ from astrbot.core.agent.tool import ToolSet
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star
 from astrbot.core.provider.entities import LLMResponse
-# from astrbot.core.message.components import Reply
+from astrbot.core.message.components import Image
 from astrbot.core.utils.quoted_message.extractor import QuotedMessageExtractor
 
 def _content_to_text(content) -> str:
@@ -102,6 +102,12 @@ def _parse_docstring_params(docstring: str) -> dict:
     if required:
         params["required"] = required
     return params
+
+async def _extract_image(event:AstrMessageEvent) -> list[str]:
+    images: list[str] = [getattr(comp, "url") for comp in event.get_messages() if isinstance(comp, Image) and getattr(comp, "url")]
+    quoted_image = await QuotedMessageExtractor(event).images()
+    return images + quoted_image
+
 
 def _build_quoted_tag(text:str):
     return f"<Quoted Message>\n{text}\n</Quoted Message>"
@@ -433,7 +439,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
     # LLM 调用 — 按模式选择 llm_generate / tool_loop_agent
     # ════════════════════════════════════════════════════════════════
 
-    async def _generate(self, event: AstrMessageEvent, session: dict, user_input: str, mode: str) -> str:
+    async def _generate(self, event: AstrMessageEvent, session: dict, user_input: str, mode: str, imgs: list[str] | None = None) -> str:
         provider_id, err = await self._get_provider_id(event, mode)
         if err:
             return err
@@ -469,11 +475,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         system_reminder = _build_system_reminder(event)
 
         user_input += system_reminder
+
         try:
             if mode == "A":
                 llm_resp = await self.context.llm_generate(
                     chat_provider_id=provider_id,
                     system_prompt=system_prompt,
+                    image_urls=imgs,
                     contexts=contexts,
                     prompt=user_input,
                 )
@@ -485,6 +493,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                         event=event,
                         chat_provider_id=provider_id,
                         system_prompt=system_prompt,
+                        image_urls=imgs,
                         contexts=contexts,
                         prompt=user_input,
                         tools=tools,
@@ -496,6 +505,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                     llm_resp = await self.context.tool_loop_agent(
                         event=event,
                         chat_provider_id=provider_id,
+                        image_urls=imgs,
                         prompt=user_input,
                         tools=tools,
                         max_steps=tool_max_steps,
@@ -681,8 +691,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
     @filter.command("测试")
     async def cmd_test(self, event: AstrMessageEvent):
         """/测试 - 测试插件是否可用"""
-        action = self._extract_after_cmd(event, "测试")
-        yield event.plain_result(action)
+        imgs = await _extract_image(event)
+        yield event.plain_result(json.dumps(imgs))
 
     @filter.command("创建")
     async def cmd_create(self, event: AstrMessageEvent):
@@ -696,7 +706,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             yield event.plain_result(HELP_TEXT)
             return
 
-        
+        imgs = await _extract_image(event)
 
         # 显式前缀 > 自动识别
         prefix_mode, cleaned = _parse_mode_prefix(setting)
@@ -750,11 +760,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
         first_input = (
             f"世界观设定:{setting}\n\n"
-            "请直接开始(不要再追问细节):\n"
+            # "请直接开始(不要再追问细节):\n"
             + startup_steps
             + "最后,这一轮**不要**给出人生总结,故事需要用户多次推进"
         )
-        result = await self._generate(event, session, first_input, mode)
+        result = await self._generate(event, session, first_input, mode, imgs)
         yield event.plain_result(result)
 
     @filter.command("do")
@@ -767,6 +777,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             action += "\n" + _build_quoted_tag(quoted)
         if not action:
             action = "请继续推进剧情(没有任何特定选择,按既定轨迹自然发展)"
+
+        imgs = await _extract_image(event)
 
         session = await self._load_sim(event)
         if not session:
@@ -791,7 +803,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             return
 
         yield event.plain_result(f"⏳ 命运的齿轮转动中... [模式 {mode}]")
-        result = await self._generate(event, session, action, mode)
+        result = await self._generate(event, session, action, mode, imgs)
         yield event.plain_result(result)
 
     @filter.command("进度")
