@@ -18,33 +18,68 @@ import time
 from astrbot.api import logger
 from astrbot.api.event import filter
 
-
 # ════════════════════════════════════════════════════════════════════
 # 1. 配置常量
 # ════════════════════════════════════════════════════════════════════
 
 # 装备槽位的本地化名(出现于格式化输出与 LLM 调用提示)
 SLOT_CN = {
-    "weapon": "武器", "armor": "护甲", "accessory": "饰品",
-    "main_weapon": "主武器", "sub_weapon": "副武器",
-    "tactical_glasses": "战术眼镜", "helmet": "头盔",
-    "boots": "靴子", "gloves": "手套", "ring": "戒指",
-    "necklace": "项链", "shield": "盾牌",
+    "weapon": "武器",
+    "armor": "护甲",
+    "accessory": "饰品",
+    "main_weapon": "主武器",
+    "sub_weapon": "副武器",
+    "tactical_glasses": "战术眼镜",
+    "helmet": "头盔",
+    "boots": "靴子",
+    "gloves": "手套",
+    "ring": "戒指",
+    "necklace": "项链",
+    "shield": "盾牌",
 }
 
 # 角色字典里会被 _format_status 当作「内置键」跳过(避免重复显示)
-BUILTIN_CHAR_KEYS = frozenset({
-    "name", "world", "world_rules", "class", "level", "exp",
-    "hp", "max_hp", "atk", "def", "spd",
-    "skills", "equipment", "buffs", "debuffs", "inventory",
-    "currency", "kills", "unspent_points", "attr_points_per_level",
-    "session_id", "save_info", "game_system", "hit_die", "ability_score_rolls",
-})
+BUILTIN_CHAR_KEYS = frozenset(
+    {
+        "name",
+        "world",
+        "world_rules",
+        "class",
+        "level",
+        "exp",
+        "hp",
+        "max_hp",
+        "atk",
+        "def",
+        "spd",
+        "skills",
+        "equipment",
+        "buffs",
+        "debuffs",
+        "inventory",
+        "currency",
+        "kills",
+        "unspent_points",
+        "attr_points_per_level",
+        "session_id",
+        "save_info",
+        "game_system",
+        "hit_die",
+        "ability_score_rolls",
+    }
+)
 
 DEFAULT_WORLD_RULES = {
-    "base_hp": 100, "base_atk": 7, "base_def": 5, "base_spd": 5,
-    "hp_lv": 13, "atk_lv": 2, "def_lv": 2, "spd_lv": 1,
-    "exp_base": 100, "exp_scale": 1.2,
+    "base_hp": 100,
+    "base_atk": 7,
+    "base_def": 5,
+    "base_spd": 5,
+    "hp_lv": 13,
+    "atk_lv": 2,
+    "def_lv": 2,
+    "spd_lv": 1,
+    "exp_base": 100,
+    "exp_scale": 1.2,
     "auto_stat_growth": 0,
     # 各世界可独立定义自己的额外属性列表(如 GGO 的 STR/VIT/...)。
     # 默认空,表示该世界没有额外属性 — 自动成长与加点都跳过。
@@ -57,18 +92,30 @@ DEFAULT_WORLD_RULES = {
 DND5E_ABILITIES = ("STR", "DEX", "CON", "INT", "WIS", "CHA")
 DND5E_ASI_LEVELS = frozenset({4, 8, 12, 16, 19})
 DND5E_CLASS_HIT_DICE = {
-    "barbarian": 12, "野蛮人": 12,
-    "fighter": 10, "战士": 10,
-    "paladin": 10, "圣武士": 10,
-    "ranger": 10, "游侠": 10,
-    "warlock": 8, "邪术师": 8,
-    "cleric": 8, "牧师": 8,
-    "druid": 8, "德鲁伊": 8,
-    "bard": 8, "吟游诗人": 8,
-    "rogue": 8, "盗贼": 8,
-    "monk": 8, "武僧": 8,
-    "wizard": 6, "法师": 6,
-    "sorcerer": 6, "术士": 6,
+    "barbarian": 12,
+    "野蛮人": 12,
+    "fighter": 10,
+    "战士": 10,
+    "paladin": 10,
+    "圣武士": 10,
+    "ranger": 10,
+    "游侠": 10,
+    "warlock": 8,
+    "邪术师": 8,
+    "cleric": 8,
+    "牧师": 8,
+    "druid": 8,
+    "德鲁伊": 8,
+    "bard": 8,
+    "吟游诗人": 8,
+    "rogue": 8,
+    "盗贼": 8,
+    "monk": 8,
+    "武僧": 8,
+    "wizard": 6,
+    "法师": 6,
+    "sorcerer": 6,
+    "术士": 6,
 }
 
 
@@ -141,7 +188,9 @@ def parse_dnd5e_ability_scores(raw: str) -> tuple[dict[str, int] | None, str | N
 
 
 def initialize_dnd5e_character(
-    char: dict, scores: dict[str, int], rolls_by_ability: dict[str, list[int]] | None = None,
+    char: dict,
+    scores: dict[str, int],
+    rolls_by_ability: dict[str, list[int]] | None = None,
 ) -> None:
     rules = {**char.get("world_rules", {})}
     rules["stats"] = list(DND5E_ABILITIES)
@@ -177,6 +226,7 @@ def initialize_dnd5e_character(
 # ════════════════════════════════════════════════════════════════════
 # 2. 存储层 — 角色存档 + 会话
 # ════════════════════════════════════════════════════════════════════
+
 
 def _char_path(data_dir: str, uid: str) -> str:
     save_dir = os.path.join(data_dir, "rpg_saves")
@@ -294,12 +344,13 @@ def save_session(data_dir: str, session_id: str, data: dict) -> None:
 # 3. 数值层 — 升级 / 经验 / 属性点
 # ════════════════════════════════════════════════════════════════════
 
+
 def exp_needed(level: int, preset: dict) -> int:
     return int(preset["exp_base"] * (preset["exp_scale"] ** (level - 1)))
 
 
 def parse_points_per_level(val) -> int | list[int]:
-    """"5" / 5 / "5-10" -> int 或 [lo, hi];无效返回 0。"""
+    """ "5" / 5 / "5-10" -> int 或 [lo, hi];无效返回 0。"""
     if isinstance(val, list) and len(val) == 2:
         return [int(val[0]), int(val[1])]
     if isinstance(val, int):
@@ -351,7 +402,9 @@ def apply_levelups(char: dict, preset: dict) -> list[int]:
         char["level"] += 1
         if char.get("game_system") == "dnd5e":
             con_score = int(_lookup_char_attr(char, "CON") or 10)
-            hp_gain = max(1, char.get("hit_die", 8) // 2 + 1 + dnd5e_ability_modifier(con_score))
+            hp_gain = max(
+                1, char.get("hit_die", 8) // 2 + 1 + dnd5e_ability_modifier(con_score)
+            )
             char["max_hp"] += hp_gain
             char["hp"] = min(char["hp"] + hp_gain, char["max_hp"])
             str_score = int(_lookup_char_attr(char, "STR") or 10)
@@ -428,9 +481,12 @@ def check_equip_conditions(char: dict, condition_str: str) -> tuple[bool, str]:
         if char_val is None:
             return False, f"未知属性: {key}"
         cmp_ok = {
-            ">=": char_val >= val, "<=": char_val <= val,
-            ">":  char_val >  val, "<":  char_val <  val,
-            "=":  char_val == val, "!=": char_val != val,
+            ">=": char_val >= val,
+            "<=": char_val <= val,
+            ">": char_val > val,
+            "<": char_val < val,
+            "=": char_val == val,
+            "!=": char_val != val,
         }[op]
         if not cmp_ok:
             return False, f"{key}={char_val} 需{op}{val:g}"
@@ -475,8 +531,9 @@ def _take_item_bonuses(char: dict, item: dict) -> None:
         char[k] = char.get(k, 0) - v
 
 
-def _give_item_bonuses(char: dict, b_atk: int, b_def: int,
-                       b_hp: int, b_spd: int, custom: dict) -> None:
+def _give_item_bonuses(
+    char: dict, b_atk: int, b_def: int, b_hp: int, b_spd: int, custom: dict
+) -> None:
     """把一件装备的数值收益应用到 char 上。"""
     char["atk"] = char.get("atk", 0) + b_atk
     char["def"] = char.get("def", 0) + b_def
@@ -491,17 +548,18 @@ def _roll_random_bonuses(item_name: str) -> tuple[int, int, int, int, dict]:
     """基于装备名哈希生成稳定的随机词条。"""
     rng = random.Random(hash(item_name))
     return (
-        rng.randint(0, 5),    # b_atk
-        rng.randint(0, 3),    # b_def
-        rng.randint(0, 20),   # b_hp
-        rng.randint(-1, 2),   # b_spd
-        {},                   # custom
+        rng.randint(0, 5),  # b_atk
+        rng.randint(0, 3),  # b_def
+        rng.randint(0, 20),  # b_hp
+        rng.randint(-1, 2),  # b_spd
+        {},  # custom
     )
 
 
 # ════════════════════════════════════════════════════════════════════
 # 5. 显示层
 # ════════════════════════════════════════════════════════════════════
+
 
 def _bar(cur: int, mx: int, length: int = 10) -> str:
     ratio = max(0, min(1, cur / mx)) if mx > 0 else 0
@@ -557,10 +615,19 @@ def _format_status(char: dict) -> str:
     # 自定义数值属性 — 排除内置键 + 世界属性的所有衍生键(base_/alloc_/原名/小写)
     skip: set[str] = set()
     for s in stats:
-        skip.update({s, s.lower(), f"base_{s}", f"base_{s.lower()}",
-                     f"alloc_{s}", f"alloc_{s.lower()}"})
+        skip.update(
+            {
+                s,
+                s.lower(),
+                f"base_{s}",
+                f"base_{s.lower()}",
+                f"alloc_{s}",
+                f"alloc_{s.lower()}",
+            }
+        )
     custom = {
-        k: v for k, v in char.items()
+        k: v
+        for k, v in char.items()
         if k not in BUILTIN_CHAR_KEYS and k not in skip and isinstance(v, (int, float))
     }
     if custom:
@@ -585,7 +652,9 @@ def _format_status(char: dict) -> str:
             sname = SLOT_CN.get(slot, slot)
             cond = f" [需: {item['condition']}]" if item.get("condition") else ""
             effect = f" ✦{item['special_effect']}" if item.get("special_effect") else ""
-            lines.append(f"  {sname}: {item['name']} ({item.get('desc', '')}){effect}{cond}")
+            lines.append(
+                f"  {sname}: {item['name']} ({item.get('desc', '')}){effect}{cond}"
+            )
 
     # 技能 / 背包 / 增益减益
     skills = char.get("skills", [])
@@ -611,6 +680,7 @@ def _format_status(char: dict) -> str:
 # 6. RPGMixin — LLM 工具
 # ════════════════════════════════════════════════════════════════════
 
+
 class RPGMixin:
     """RPG 工具 mixin。需要主插件在 __init__ 里设置 self.data_dir = StarTools.get_data_dir()。"""
 
@@ -624,7 +694,9 @@ class RPGMixin:
             gid = ""
             if hasattr(event, "get_group_id"):
                 gid = str(event.get_group_id() or "")
-            elif hasattr(event, "message_obj") and hasattr(event.message_obj, "group_id"):
+            elif hasattr(event, "message_obj") and hasattr(
+                event.message_obj, "group_id"
+            ):
                 gid = str(event.message_obj.group_id or "")
             return gid if gid.isdigit() else ""
         except Exception:
@@ -656,7 +728,9 @@ class RPGMixin:
     def _world_preset(self, char: dict) -> dict:
         return {**DEFAULT_WORLD_RULES, **char.get("world_rules", {})}
 
-    def _require_char(self, event, target: str) -> tuple[str | None, dict | None, str | None]:
+    def _require_char(
+        self, event, target: str
+    ) -> tuple[str | None, dict | None, str | None]:
         """统一处理「解析 uid → 读存档」,失败直接返回错误消息。"""
         uid = self._resolve_uid(event, target)
         char = load_char(self.data_dir, uid)
@@ -671,8 +745,12 @@ class RPGMixin:
 
     @filter.llm_tool(name="rpg_create_session")
     async def rpg_create_session(
-        self, event, world: str,
-        points_per_level: str = "", world_rules: str = "", game_system: str = "",
+        self,
+        event,
+        world: str,
+        points_per_level: str = "",
+        world_rules: str = "",
+        game_system: str = "",
     ) -> str:
         """
         Create a game session with a custom world. All characters joining this session will inherit the world's growth rules. Do this BEFORE creating characters.
@@ -715,10 +793,14 @@ class RPGMixin:
                     for key, value in parsed.items():
                         key = str(key)
                         if key == "stats" and isinstance(value, list):
-                            stats = [str(stat).strip() for stat in value if str(stat).strip()]
+                            stats = [
+                                str(stat).strip() for stat in value if str(stat).strip()
+                            ]
                             if stats:
                                 user_rules[key] = stats
-                        elif not isinstance(value, bool) and isinstance(value, (int, float)):
+                        elif not isinstance(value, bool) and isinstance(
+                            value, (int, float)
+                        ):
                             user_rules[key] = value
             except (json.JSONDecodeError, TypeError):
                 pass
@@ -754,8 +836,11 @@ class RPGMixin:
                 "   旧会话的所有角色数据已清除!",
                 "",
             ]
-        rules_str = "(使用默认)" if not user_rules else \
-            ", ".join(f"{k}={v}" for k, v in sorted(user_rules.items()))
+        rules_str = (
+            "(使用默认)"
+            if not user_rules
+            else ", ".join(f"{k}={v}" for k, v in sorted(user_rules.items()))
+        )
         lines += [
             "🌍 会话创建成功",
             f"  ID: {session_id}",
@@ -771,7 +856,11 @@ class RPGMixin:
 
     @filter.llm_tool(name="rpg_join_session")
     async def rpg_join_session(
-        self, event, session_id: str, name: str, character_class: str = "",
+        self,
+        event,
+        session_id: str,
+        name: str,
+        character_class: str = "",
         ability_scores: str = "",
     ) -> str:
         """
@@ -796,8 +885,11 @@ class RPGMixin:
         classes_dict = preset.get("classes") or {}
 
         if not character_class or character_class not in classes_dict:
-            character_class = random.choice(list(classes_dict)) if classes_dict \
+            character_class = (
+                random.choice(list(classes_dict))
+                if classes_dict
                 else (character_class.strip() or "冒险者")
+            )
         cb = classes_dict.get(character_class, {})
         game_system = (session.get("game_system") or "").strip().lower()
         if ability_scores and not game_system:
@@ -836,8 +928,11 @@ class RPGMixin:
         save_info = f" (存档ID: {uid})" if group_id else ""
         lines = [f"✅ {name} 加入会话「{session_id}」{save_info}"]
         if scores is not None:
-            title = "🎲 DND 5E 六维属性(4d6kh3,每项取最高三骰)" if rolls_by_ability else \
-                "🎲 DND 5E 六维属性(指定值)"
+            title = (
+                "🎲 DND 5E 六维属性(4d6kh3,每项取最高三骰)"
+                if rolls_by_ability
+                else "🎲 DND 5E 六维属性(指定值)"
+            )
             lines += ["", title]
             for ability in DND5E_ABILITIES:
                 score = scores[ability]
@@ -853,10 +948,16 @@ class RPGMixin:
         return "\n".join(lines)
 
     @staticmethod
-    def _new_character(name: str, world: str, class_name: str,
-                       class_bonus: dict, preset: dict,
-                       session_id: str, world_rules: dict,
-                       game_system: str = "") -> dict:
+    def _new_character(
+        name: str,
+        world: str,
+        class_name: str,
+        class_bonus: dict,
+        preset: dict,
+        session_id: str,
+        world_rules: dict,
+        game_system: str = "",
+    ) -> dict:
         char = {
             "name": name,
             "world": world,
@@ -929,7 +1030,10 @@ class RPGMixin:
             return f"ℹ️ 会话「{session.get('session_id', session_id)}」暂无成员。"
 
         group_id = self._get_group_id(event)
-        lines = [f"👥 会话「{session.get('session_id', session_id)}」成员 ({len(members)}人)", ""]
+        lines = [
+            f"👥 会话「{session.get('session_id', session_id)}」成员 ({len(members)}人)",
+            "",
+        ]
         for name in members:
             uid = self._make_char_uid(group_id, name, self._uid(event))
             char = load_char(self.data_dir, uid)
@@ -944,7 +1048,9 @@ class RPGMixin:
 
     @filter.llm_tool(name="rpg_delete_session")
     async def rpg_delete_session(
-        self, event, session_id: str,
+        self,
+        event,
+        session_id: str,
     ) -> str:
         """
         Delete a game session and optionally reset all its characters. This is irreversible.
@@ -962,7 +1068,9 @@ class RPGMixin:
         if members:
             group_id = self._get_group_id(event)
             for m in members:
-                path = _char_path(self.data_dir, self._make_char_uid(group_id, m, self._uid(event)))
+                path = _char_path(
+                    self.data_dir, self._make_char_uid(group_id, m, self._uid(event))
+                )
                 if os.path.exists(path):
                     os.remove(path)
                     deleted_chars.append(m)
@@ -983,9 +1091,14 @@ class RPGMixin:
 
     @filter.llm_tool(name="rpg_define_class")
     async def rpg_define_class(
-        self, event, target: str, class_name: str,
-        hit_die: str = "", primary_ability: str = "",
-        custom_bonuses: str = "", description: str = "",
+        self,
+        event,
+        target: str,
+        class_name: str,
+        hit_die: str = "",
+        primary_ability: str = "",
+        custom_bonuses: str = "",
+        description: str = "",
     ) -> str:
         """
         Define a custom class (non-traditional DND or general RPG) and persist it to the active session. Use this for homebrew classes, special jobs ("星见", "魔剑士", "调律师"), or any class not in the standard list. Class can later be applied with rpg_change_class.
@@ -1018,11 +1131,12 @@ class RPGMixin:
                 raw = json.loads(custom_bonuses.strip())
                 if isinstance(raw, dict):
                     parsed_bonuses = {
-                        str(k): v for k, v in raw.items()
+                        str(k): v
+                        for k, v in raw.items()
                         if not isinstance(v, bool) and isinstance(v, (int, float))
                     }
             except (json.JSONDecodeError, TypeError):
-                return "❌ custom_bonuses 必须是 JSON 对象(如 {\"hp\":15,\"atk\":3})。"
+                return '❌ custom_bonuses 必须是 JSON 对象(如 {"hp":15,"atk":3})。'
 
         hit_die_value = None
         if hit_die and hit_die.strip():
@@ -1070,7 +1184,9 @@ class RPGMixin:
             m_rules["classes"] = m_classes
             m_char["world_rules"] = m_rules
             if m_char.get("class") == class_name:
-                m_char["class_hit_die"] = hit_die_value if hit_die_value else m_char.get("class_hit_die")
+                m_char["class_hit_die"] = (
+                    hit_die_value if hit_die_value else m_char.get("class_hit_die")
+                )
             save_char(self.data_dir, m_uid, m_char)
             propagated.append(member_name)
 
@@ -1083,27 +1199,30 @@ class RPGMixin:
         if primary_ability.strip():
             lines.append(f"   主属性: {primary_ability.strip()}")
         if parsed_bonuses:
-            bonus_str = ", ".join(
-                f"{k}+{v}" for k, v in parsed_bonuses.items()
-            )
+            bonus_str = ", ".join(f"{k}+{v}" for k, v in parsed_bonuses.items())
             lines.append(f"   初始加成: {bonus_str}")
         if description.strip():
             lines.append(f"   说明: {description.strip()}")
         if propagated:
-            lines.append(f"   已同步到 {len(propagated)} 名角色: {', '.join(propagated)}")
+            lines.append(
+                f"   已同步到 {len(propagated)} 名角色: {', '.join(propagated)}"
+            )
         lines += [
             "",
-            "💡 用 rpg_change_class 把角色转职为该职业,或新角色加入时直接传 character_class=\""
-            + class_name + "\"。",
+            '💡 用 rpg_change_class 把角色转职为该职业,或新角色加入时直接传 character_class="'
+            + class_name
+            + '"。',
         ]
         return "\n".join(lines)
 
-
     @filter.llm_tool(name="rpg_change_class")
-
     @filter.llm_tool(name="rpg_change_class")
     async def rpg_change_class(
-        self, event, target: str, new_class: str, refund_points: bool = True,
+        self,
+        event,
+        target: str,
+        new_class: str,
+        refund_points: bool = True,
     ) -> str:
         """
         Change the character's class. Can be used mid-game for class changes, or to assign a class to a character that started without one.
@@ -1124,7 +1243,9 @@ class RPGMixin:
         new_cb = preset["classes"].get(new_class, {})
 
         if char.get("game_system") == "dnd5e":
-            explicit_new_hit_die = new_cb.get("hit_die") if isinstance(new_cb, dict) else None
+            explicit_new_hit_die = (
+                new_cb.get("hit_die") if isinstance(new_cb, dict) else None
+            )
             new_hit_die = dnd5e_class_hit_die(new_class, explicit_new_hit_die)
             con_score = int(_lookup_char_attr(char, "CON") or 10)
             con_mod = dnd5e_ability_modifier(con_score)
@@ -1152,10 +1273,12 @@ class RPGMixin:
             char["atk"] = preset["base_atk"] + new_cb.get("atk", 0)
             char["def"] = preset["base_def"] + new_cb.get("def", 0)
             char["spd"] = preset["base_spd"] + new_cb.get("spd", 0)
-            attr_pts_raw = char.get("attr_points_per_level",
-                                    preset.get("attr_points_per_level", 0))
-            char["unspent_points"] = char.get("unspent_points", 0) + \
-                int((char["level"] - 1) * avg_points(attr_pts_raw))
+            attr_pts_raw = char.get(
+                "attr_points_per_level", preset.get("attr_points_per_level", 0)
+            )
+            char["unspent_points"] = char.get("unspent_points", 0) + int(
+                (char["level"] - 1) * avg_points(attr_pts_raw)
+            )
             for attr in old_cb.get("custom", {}):
                 char.pop(attr, None)
             for attr, val in new_cb.get("custom", {}).items():
@@ -1177,7 +1300,6 @@ class RPGMixin:
         self._persist(uid, char)
         mode_str = "(重置模式)" if refund_points else "(叠加模式)"
         return f"🔄 职业变更{mode_str}: {old_class} → {new_class}\n\n{_format_status(char)}"
-
 
     @filter.llm_tool(name="rpg_get_status")
     async def rpg_get_status(self, event, target: str) -> str:
@@ -1226,7 +1348,9 @@ class RPGMixin:
             char["max_hp"] = max(1, char["max_hp"] + hp_delta)
             char["hp"] = max(1, min(char["hp"] + hp_delta, char["max_hp"]))
             old_asi_points = 2 * sum(level <= old_level for level in DND5E_ASI_LEVELS)
-            new_asi_points = 2 * sum(level <= target_level for level in DND5E_ASI_LEVELS)
+            new_asi_points = 2 * sum(
+                level <= target_level for level in DND5E_ASI_LEVELS
+            )
             spent = max(0, old_asi_points - char.get("unspent_points", 0))
             char["unspent_points"] = max(0, new_asi_points - spent)
             str_score = int(_lookup_char_attr(char, "STR") or 10)
@@ -1235,16 +1359,21 @@ class RPGMixin:
                 dnd5e_ability_modifier(str_score),
                 dnd5e_ability_modifier(dex_score),
             )
-            stats_delta = f"HP {hp_delta:+d}  熟练加值 {dnd5e_proficiency_bonus(target_level):+d}"
+            stats_delta = (
+                f"HP {hp_delta:+d}  熟练加值 {dnd5e_proficiency_bonus(target_level):+d}"
+            )
         else:
             char["max_hp"] += preset["hp_lv"] * diff
-            char["hp"] = max(1, min(char["hp"] + preset["hp_lv"] * diff, char["max_hp"]))
+            char["hp"] = max(
+                1, min(char["hp"] + preset["hp_lv"] * diff, char["max_hp"])
+            )
             char["max_hp"] = max(1, char["max_hp"])
             char["atk"] += preset["atk_lv"] * diff
             char["def"] += preset["def_lv"] * diff
             char["spd"] += preset["spd_lv"] * diff
-            attr_pts_raw = char.get("attr_points_per_level",
-                                    preset.get("attr_points_per_level", 0))
+            attr_pts_raw = char.get(
+                "attr_points_per_level", preset.get("attr_points_per_level", 0)
+            )
             pts_per_lv = avg_points(attr_pts_raw)
             if pts_per_lv > 0:
                 old_pts = int((old_level - 1) * pts_per_lv)
@@ -1252,8 +1381,8 @@ class RPGMixin:
                 spent = old_pts - char.get("unspent_points", 0)
                 char["unspent_points"] = max(0, new_pts - spent)
             stats_delta = (
-                f"HP {preset['hp_lv']*diff:+d}  ATK {preset['atk_lv']*diff:+d}"
-                f"  DEF {preset['def_lv']*diff:+d}  SPD {preset['spd_lv']*diff:+d}"
+                f"HP {preset['hp_lv'] * diff:+d}  ATK {preset['atk_lv'] * diff:+d}"
+                f"  DEF {preset['def_lv'] * diff:+d}  SPD {preset['spd_lv'] * diff:+d}"
             )
 
         char["level"] = target_level
@@ -1265,9 +1394,11 @@ class RPGMixin:
         if char.get("game_system") == "dnd5e":
             msg += f"\n⚡ ASI 剩余属性点: {char.get('unspent_points', 0)}"
         elif pts_per_lv > 0:
-            msg += (f"\n⚡ 属性点 +{int(pts_per_lv*diff)} → "
-                    f"剩余 {char.get('unspent_points', 0)} "
-                    f"(每级 {fmt_ppl(attr_pts_raw)})")
+            msg += (
+                f"\n⚡ 属性点 +{int(pts_per_lv * diff)} → "
+                f"剩余 {char.get('unspent_points', 0)} "
+                f"(每级 {fmt_ppl(attr_pts_raw)})"
+            )
         return msg
 
     @filter.llm_tool(name="rpg_add_exp")
@@ -1305,19 +1436,30 @@ class RPGMixin:
                     line += "\n   ⚡ 获得 2 点 ASI"
                 lines.append(line)
         else:
-            lines = [f"🎊 升级!→ Lv.{lv}\n   HP +{preset['hp_lv']} ATK +{preset['atk_lv']}"
-                     f" DEF +{preset['def_lv']} SPD +{preset['spd_lv']}" for lv in level_ups]
+            lines = [
+                f"🎊 升级!→ Lv.{lv}\n   HP +{preset['hp_lv']} ATK +{preset['atk_lv']}"
+                f" DEF +{preset['def_lv']} SPD +{preset['spd_lv']}"
+                for lv in level_ups
+            ]
         if not lines:
-            lines.append(f"📊 +{exp_amount} EXP → {char['exp']}/{exp_needed(char['level'], preset)}")
+            lines.append(
+                f"📊 +{exp_amount} EXP → {char['exp']}/{exp_needed(char['level'], preset)}"
+            )
         lines.append("")
         lines.append(_format_status(char))
         return "\n".join(lines)
 
     @filter.llm_tool(name="rpg_equip_item")
     async def rpg_equip_item(
-        self, event, target: str, item_name: str, slot: str,
-        attributes: str = "", description: str = "",
-        equip_condition: str = "", special_effect: str = "",
+        self,
+        event,
+        target: str,
+        item_name: str,
+        slot: str,
+        attributes: str = "",
+        description: str = "",
+        equip_condition: str = "",
+        special_effect: str = "",
     ) -> str:
         """
         Equip an item to the character. Generates random stat bonuses based on the item name. Unequips the old item in the same slot first. Supports custom attributes, descriptions, and equip conditions.
@@ -1365,7 +1507,9 @@ class RPGMixin:
                 k: v for k, v in custom_attrs.items() if k not in _BUILTIN_ITEM_ATTRS
             }
         else:
-            b_atk, b_def, b_hp, b_spd, custom_stat_changes = _roll_random_bonuses(item_name)
+            b_atk, b_def, b_hp, b_spd, custom_stat_changes = _roll_random_bonuses(
+                item_name
+            )
 
         # 卸下旧装备的词条
         old = char.get("equipment", {}).get(slot)
@@ -1376,7 +1520,10 @@ class RPGMixin:
         item = {
             "name": item_name,
             "desc": "",
-            "ba": b_atk, "bd": b_def, "bh": b_hp, "bs": b_spd,
+            "ba": b_atk,
+            "bd": b_def,
+            "bh": b_hp,
+            "bs": b_spd,
         }
         if custom_stat_changes:
             item["custom"] = custom_stat_changes
@@ -1386,25 +1533,42 @@ class RPGMixin:
             item["special_effect"] = special_effect.strip()
 
         stat_parts = []
-        if b_atk: stat_parts.append(f"ATK+{b_atk}")
-        if b_def: stat_parts.append(f"DEF+{b_def}")
-        if b_hp:  stat_parts.append(f"HP+{b_hp}")
-        if b_spd: stat_parts.append(f"SPD{b_spd:+d}")
+        if b_atk:
+            stat_parts.append(f"ATK+{b_atk}")
+        if b_def:
+            stat_parts.append(f"DEF+{b_def}")
+        if b_hp:
+            stat_parts.append(f"HP+{b_hp}")
+        if b_spd:
+            stat_parts.append(f"SPD{b_spd:+d}")
         for k, v in custom_stat_changes.items():
             stat_parts.append(f"{k}{v:+d}")
         stat_summary = " ".join(stat_parts) or "无属性变化"
 
-        item["desc"] = (f"{description.strip()} [{stat_summary}]"
-                        if description and description.strip() else stat_summary)
+        item["desc"] = (
+            f"{description.strip()} [{stat_summary}]"
+            if description and description.strip()
+            else stat_summary
+        )
 
         char.setdefault("equipment", {})[slot] = item
         _give_item_bonuses(char, b_atk, b_def, b_hp, b_spd, custom_stat_changes)
         self._persist(uid, char)
 
-        cond_info = f" (需: {equip_condition.strip()})" if equip_condition and equip_condition.strip() else ""
-        effect_info = f"\n   ✦ 特殊效果: {special_effect.strip()}" if special_effect and special_effect.strip() else ""
-        return (f"⚔ 装备{SLOT_CN.get(slot, slot)}: {item_name}{cond_info}"
-                f"\n   {item['desc']}{effect_info}\n\n{_format_status(char)}")
+        cond_info = (
+            f" (需: {equip_condition.strip()})"
+            if equip_condition and equip_condition.strip()
+            else ""
+        )
+        effect_info = (
+            f"\n   ✦ 特殊效果: {special_effect.strip()}"
+            if special_effect and special_effect.strip()
+            else ""
+        )
+        return (
+            f"⚔ 装备{SLOT_CN.get(slot, slot)}: {item_name}{cond_info}"
+            f"\n   {item['desc']}{effect_info}\n\n{_format_status(char)}"
+        )
 
     @filter.llm_tool(name="rpg_heal")
     async def rpg_heal(self, event, target: str, amount: int) -> str:
@@ -1427,7 +1591,11 @@ class RPGMixin:
 
     @filter.llm_tool(name="rpg_take_damage")
     async def rpg_take_damage(
-        self, event, target: str, raw_damage: int, source: str,
+        self,
+        event,
+        target: str,
+        raw_damage: int,
+        source: str,
     ) -> str:
         """
         Apply damage to the character. Generic RPG sessions apply DEF reduction; DND 5E applies the rolled damage directly because AC only determines whether an attack hits.
@@ -1463,7 +1631,11 @@ class RPGMixin:
 
     @filter.llm_tool(name="rpg_add_effect")
     async def rpg_add_effect(
-        self, event, target: str, effect_name: str, is_debuff: bool,
+        self,
+        event,
+        target: str,
+        effect_name: str,
+        is_debuff: bool,
     ) -> str:
         """
         Add a buff or debuff status effect to the character.
@@ -1486,7 +1658,11 @@ class RPGMixin:
 
     @filter.llm_tool(name="rpg_manage_currency")
     async def rpg_manage_currency(
-        self, event, target: str, amount: int, action: str,
+        self,
+        event,
+        target: str,
+        amount: int,
+        action: str,
     ) -> str:
         """
         Manage the character's currency (gold, coins, etc). Used for buying items, quest rewards, etc.
@@ -1516,7 +1692,12 @@ class RPGMixin:
 
     @filter.llm_tool(name="rpg_set_attribute")
     async def rpg_set_attribute(
-        self, event, target: str, attribute: str, value: int, mode: str,
+        self,
+        event,
+        target: str,
+        attribute: str,
+        value: int,
+        mode: str,
     ) -> str:
         """
         Directly modify a character attribute. DND 5E ability scores are protected and must use rpg_allocate_point with earned ASI points.
@@ -1536,7 +1717,10 @@ class RPGMixin:
             normalized_attribute = normalized_attribute[5:]
         elif normalized_attribute.startswith("ALLOC_"):
             normalized_attribute = normalized_attribute[6:]
-        if char.get("game_system") == "dnd5e" and normalized_attribute in DND5E_ABILITIES:
+        if (
+            char.get("game_system") == "dnd5e"
+            and normalized_attribute in DND5E_ABILITIES
+        ):
             return "❌ DND 5E 六维属性不能直接修改,请使用 rpg_allocate_point 分配已获得的 ASI。"
         old_val = char.get(attribute, 0)
         if mode == "add":
@@ -1555,7 +1739,11 @@ class RPGMixin:
 
     @filter.llm_tool(name="rpg_allocate_point")
     async def rpg_allocate_point(
-        self, event, target: str, attribute: str, points: int = 1,
+        self,
+        event,
+        target: str,
+        attribute: str,
+        points: int = 1,
     ) -> str:
         """
         Spend unspent attribute points on a specific stat. Works with any stat the world defines (GGO's STR/VIT/AGI/DEX/INT/LUK, or another world's 体力/魔力, etc). Points are stored separately from base stats.
@@ -1611,17 +1799,24 @@ class RPGMixin:
                     dnd5e_ability_modifier(dex_score),
                 )
         self._persist(uid, char)
-        msg = (f"📊 {attribute}: {total - points} → {total}"
-               f"(+{points}点,基础{base_val}+{char[alloc_key]})")
+        msg = (
+            f"📊 {attribute}: {total - points} → {total}"
+            f"(+{points}点,基础{base_val}+{char[alloc_key]})"
+        )
         remaining = char["unspent_points"]
         return msg + (
-            f"\n⚡ 剩余属性点: {remaining}" if remaining > 0
+            f"\n⚡ 剩余属性点: {remaining}"
+            if remaining > 0
             else "\n✅ 属性点已全部分配完毕!"
         )
 
     @filter.llm_tool(name="rpg_manage_inventory")
     async def rpg_manage_inventory(
-        self, event, target: str, action: str, item_name: str = "",
+        self,
+        event,
+        target: str,
+        action: str,
+        item_name: str = "",
     ) -> str:
         """
         Add or remove items from the character's inventory.
@@ -1701,7 +1896,10 @@ class RPGMixin:
                 if session:
                     group_id = self._get_group_id(event)
                     for name in session.get("members", []):
-                        save = _char_path(self.data_dir, self._make_char_uid(group_id, name, self._uid(event)))
+                        save = _char_path(
+                            self.data_dir,
+                            self._make_char_uid(group_id, name, self._uid(event)),
+                        )
                         if os.path.exists(save):
                             os.remove(save)
                 os.remove(fpath)
@@ -1728,6 +1926,8 @@ class RPGMixin:
         if deleted_saves:
             results.append(f"🗑 过期存档: {len(deleted_saves)} 个")
         if not results:
-            return f"ℹ️ 没有超过 {inactive_days} 天未活跃的数据。当前保留 {kept} 个存档。"
+            return (
+                f"ℹ️ 没有超过 {inactive_days} 天未活跃的数据。当前保留 {kept} 个存档。"
+            )
         results.append(f"📦 剩余活跃存档: {kept} 个")
         return f"✅ 清理完成({inactive_days}天未活跃):\n" + "\n".join(results)

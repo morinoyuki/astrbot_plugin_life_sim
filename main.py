@@ -6,26 +6,32 @@
 - 4 个指令: /创建 /do /进度 /删除
 """
 
-import os
-import sys
 import time
-
-# AstrBot 加载插件时不一定把插件目录加进 sys.path,
-# 把 main.py 所在目录(插件目录)显式注入,保证 sibling 模块(prompts/dice/rpg_tools)能被 import。
-_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
-if _PLUGIN_DIR not in sys.path:
-    sys.path.insert(0, _PLUGIN_DIR)
-
 import json
 
 from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star
 from astrbot.core.agent.message import bind_checkpoint_messages
 from astrbot.core.agent.tool import ToolSet
-from astrbot.api.event import filter, AstrMessageEvent
-from astrbot.api.star import Context, Star
-from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.message.components import Image
+from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.utils.quoted_message.extractor import QuotedMessageExtractor
+
+from astrbot.core.config.astrbot_config import AstrBotConfig
+from astrbot.core.star.star_tools import StarTools
+
+from .dice import DiceMixin
+from .prompts import (
+    HELP_TEXT,
+    MODE_DETECT_SYSTEM_PROMPT,
+    MODE_NAMES,
+    SYSTEM_PROMPTS,
+    _keyword_detect_mode,
+    _parse_mode_prefix,
+)
+from .rpg_tools import RPGMixin, purge_group_rpg_data
+
 
 def _content_to_text(content) -> str:
     """把存储的 content 还原成纯文本(给 .strip() / .split() / in / len() 用)。
@@ -63,6 +69,7 @@ def _parse_docstring_params(docstring: str) -> dict:
     if not docstring:
         return {"type": "object", "properties": {}}
     import re
+
     properties = {}
     required = []
     in_args = False
@@ -77,19 +84,27 @@ def _parse_docstring_params(docstring: str) -> dict:
             # 切换到其他段(Returns/Raises 等)
             if ":" in s and not s.startswith(" "):
                 lower = s.lower()
-                if lower.startswith(("returns:", "return:", "raises:", "note:", "notes:", "examples:")):
+                if lower.startswith(
+                    ("returns:", "return:", "raises:", "note:", "notes:", "examples:")
+                ):
                     in_args = False
                     continue
             m = re.match(r"^(\w+)\s*\(([^)]+)\)\s*:?\s*(.*)", s)
             if m:
                 pname, ptype, pdesc = m.group(1), m.group(2).strip(), m.group(3).strip()
                 tmap = {
-                    "string": "string", "str": "string",
-                    "int": "number", "integer": "number",
-                    "float": "number", "number": "number",
-                    "bool": "boolean", "boolean": "boolean",
-                    "list": "array", "array": "array",
-                    "dict": "object", "object": "object",
+                    "string": "string",
+                    "str": "string",
+                    "int": "number",
+                    "integer": "number",
+                    "float": "number",
+                    "number": "number",
+                    "bool": "boolean",
+                    "boolean": "boolean",
+                    "list": "array",
+                    "array": "array",
+                    "dict": "object",
+                    "object": "object",
                 }
                 ptype_clean = tmap.get(ptype.lower().split("[")[0], "string")
                 properties[pname] = {"type": ptype_clean, "description": pdesc}
@@ -103,32 +118,29 @@ def _parse_docstring_params(docstring: str) -> dict:
         params["required"] = required
     return params
 
-async def _extract_image(event:AstrMessageEvent) -> list[str]:
-    images: list[str] = [getattr(comp, "url") for comp in event.get_messages() if isinstance(comp, Image) and getattr(comp, "url")]
+
+async def _extract_image(event: AstrMessageEvent) -> list[str]:
+    images: list[str] = [
+        getattr(comp, "url")
+        for comp in event.get_messages()
+        if isinstance(comp, Image) and getattr(comp, "url")
+    ]
     quoted_image = await QuotedMessageExtractor(event).images()
     return images + quoted_image
 
 
-def _build_quoted_tag(text:str):
+def _build_quoted_tag(text: str):
     return f"<Quoted Message>\n{text}\n</Quoted Message>"
+
 
 def _build_system_reminder(event: AstrMessageEvent) -> str:
     """构造系统提醒的 tag"""
     user_id = event.get_sender_id()
     user_nick = event.get_sender_name()
 
-    return f"<system_reminder>User ID: {user_id}, Nickname: {user_nick}</system_reminder>"
-
-from astrbot.core.config.astrbot_config import AstrBotConfig
-from astrbot.core.star.star_tools import StarTools
-
-from prompts import (
-    SYSTEM_PROMPTS, HELP_TEXT, MODE_NAMES,
-    _parse_mode_prefix, _keyword_detect_mode,
-    MODE_DETECT_SYSTEM_PROMPT,
-)
-from dice import DiceMixin
-from rpg_tools import RPGMixin, purge_group_rpg_data
+    return (
+        f"<system_reminder>User ID: {user_id}, Nickname: {user_nick}</system_reminder>"
+    )
 
 
 class LifeSimPlugin(DiceMixin, RPGMixin, Star):
@@ -136,8 +148,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         super().__init__(context)
         self.data_dir = StarTools.get_data_dir()
         self.kv_prefix = "life_sim_v1_"
-        # AstrBot 在配置存在时传入,缺失时为 None(容错为 dict)
-        self.config = config if config is not None else {}
+        # AstrBot 在配置存在时传入,缺失时为 None
+        self.config = config
 
     # ─── 配置读取助手 ────────────────────────────────────────
 
@@ -201,7 +213,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         idx = text.find(cmd)
         if idx < 0:
             return ""
-        return text[idx + len(cmd):].strip()
+        return text[idx + len(cmd) :].strip()
 
     # ────────────────────────────────────────────────────────────────
     # 工具调用日志(hook 捕获 + 历史落盘)
@@ -224,7 +236,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
         缓存(运行时工具集不变)。
         """
-        from astrbot.core.agent.tool import ToolSet, FunctionTool
+        from astrbot.core.agent.tool import FunctionTool, ToolSet
+
         tool_set = ToolSet()
 
         for attr_name in dir(self):
@@ -249,10 +262,16 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             tool_set.add_tool(new_tool)
 
         if len(tool_set) == 0:
-            logger.warning("life-sim: 未找到任何 rpg_*/roll_dice 工具,请检查插件是否正确注册。")
+            logger.warning(
+                "life-sim: 未找到任何 rpg_*/roll_dice 工具,请检查插件是否正确注册。"
+            )
 
-        web_search = self.context.provider_manager.llm_tools.get_func("web_search_tavily")
-        tavily_extract_web_page = self.context.provider_manager.llm_tools.get_func("tavily_extract_web_page")
+        web_search = self.context.provider_manager.llm_tools.get_func(
+            "web_search_tavily"
+        )
+        tavily_extract_web_page = self.context.provider_manager.llm_tools.get_func(
+            "tavily_extract_web_page"
+        )
         if web_search and tavily_extract_web_page:
             tool_set.add_tool(web_search)
             tool_set.add_tool(tavily_extract_web_page)
@@ -304,7 +323,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             if err:
                 pid = None
         if not pid:
-            raise RuntimeError("无可用 provider (mode_detect_provider_id / provider_id / 会话默认都为空)")
+            raise RuntimeError(
+                "无可用 provider (mode_detect_provider_id / provider_id / 会话默认都为空)"
+            )
 
         user_msg = (
             f"世界观设定:\n---\n{world_setting[:3000]}\n---\n\n"
@@ -338,7 +359,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             if err:
                 pid = None
         if not pid:
-            raise RuntimeError("无可用 provider (compress_provider_id / provider_id / 会话默认都为空)")
+            raise RuntimeError(
+                "无可用 provider (compress_provider_id / provider_id / 会话默认都为空)"
+            )
 
         # 构造 contexts — 把 head_msgs 当上下文,要求模型摘要
         contexts = bind_checkpoint_messages(head_msgs)
@@ -359,7 +382,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         """从丢弃消息中结构性抽取摘要:世界观 + 主要阶段标题 + 结局标记。
         不调用 LLM,纯文本规则抽取 — 速度快、零成本。"""
         n_head = len(head_msgs)
-        lines = [f"📜 [叙事历史摘要] 本局共 {total_msgs} 条对话,前 {n_head} 条已被压缩为以下要点。\n"]
+        lines = [
+            f"📜 [叙事历史摘要] 本局共 {total_msgs} 条对话,前 {n_head} 条已被压缩为以下要点。\n"
+        ]
 
         # 世界观设定(找第一条非空 user 消息,通常就是 /创建 的输入)
         for m in head_msgs:
@@ -392,10 +417,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
         # 结局检测
         if any(
-            m.get("role") == "assistant" and "<LIFE_SIM_END>" in _content_to_text(m.get("content"))
+            m.get("role") == "assistant"
+            and "<LIFE_SIM_END>" in _content_to_text(m.get("content"))
             for m in head_msgs
         ):
-            lines.append("⚠️ 早期曾达到人生结局(<LIFE_SIM_END>),后被用户选择继续/重新开局。")
+            lines.append(
+                "⚠️ 早期曾达到人生结局(<LIFE_SIM_END>),后被用户选择继续/重新开局。"
+            )
 
         # 早期用户决策(前 8 个非空 user 行动)
         user_actions = []
@@ -405,7 +433,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 if a and not a.startswith("请") and len(a) <= 80:
                     user_actions.append(a)
         if user_actions:
-            lines.append(f"\n**早期用户决策**: " + " | ".join(user_actions[:8]))
+            lines.append("\n**早期用户决策**: " + " | ".join(user_actions[:8]))
 
         summary = "\n".join(lines)
         # 摘要自身兜底,避免超长
@@ -439,7 +467,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
     # LLM 调用 — 按模式选择 llm_generate / tool_loop_agent
     # ════════════════════════════════════════════════════════════════
 
-    async def _generate(self, event: AstrMessageEvent, session: dict, user_input: str, mode: str, imgs: list[str] | None = None) -> str:
+    async def _generate(
+        self,
+        event: AstrMessageEvent,
+        session: dict,
+        user_input: str,
+        mode: str,
+        imgs: list[str] | None = None,
+    ) -> str:
         provider_id, err = await self._get_provider_id(event, mode)
         if err:
             return err
@@ -447,7 +482,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         system_prompt_tpl = SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["A"])
         # 提示词里没显式 [本局世界观] 占位符时,直接把设定拼到 system prompt 顶部
         if "[本局世界观]" in system_prompt_tpl:
-            system_prompt = system_prompt_tpl.replace("[本局世界观]", session.get("world_setting", "(未提供)"))
+            system_prompt = system_prompt_tpl.replace(
+                "[本局世界观]", session.get("world_setting", "(未提供)")
+            )
         else:
             system_prompt = (
                 f"## 本局世界观\n---\n{session.get('world_setting', '(未提供)')}\n---\n\n"
@@ -459,7 +496,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         if lore:
             system_prompt += "\n\n" + lore
 
-        messages = await self._compress_history(session.get("messages", []), event=event)
+        messages = await self._compress_history(
+            session.get("messages", []), event=event
+        )
 
         # 用 turn 计数器快照 lore(单调递增,与消息位置/压缩解耦,稳定)
         turn = session.get("lore_turn", 0) + 1
@@ -488,29 +527,17 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             else:
                 # 传 tools 让 LLM 知道 rpg_*/roll_dice 可用(否则 tool_loop_agent 不会调任何工具)
                 tools = self._build_my_tool_set()
-                try:
-                    llm_resp = await self.context.tool_loop_agent(
-                        event=event,
-                        chat_provider_id=provider_id,
-                        system_prompt=system_prompt,
-                        image_urls=imgs,
-                        contexts=contexts,
-                        prompt=user_input,
-                        tools=tools,
-                        max_steps=tool_max_steps,
-                        tool_call_timeout=tool_call_timeout,
-                    )
-                except TypeError:
-                    logger.warning("life-sim: tool_loop_agent 不支持 contexts,回退方案")
-                    llm_resp = await self.context.tool_loop_agent(
-                        event=event,
-                        chat_provider_id=provider_id,
-                        image_urls=imgs,
-                        prompt=user_input,
-                        tools=tools,
-                        max_steps=tool_max_steps,
-                        tool_call_timeout=tool_call_timeout,
-                    )
+                llm_resp = await self.context.tool_loop_agent(
+                    event=event,
+                    chat_provider_id=provider_id,
+                    system_prompt=system_prompt,
+                    image_urls=imgs,
+                    contexts=contexts,
+                    prompt=user_input,
+                    tools=tools,
+                    max_steps=tool_max_steps,
+                    tool_call_timeout=tool_call_timeout,
+                )
         except Exception as e:
             logger.error(f"life-sim: LLM 调用失败: {e}")
             return f"❌ 生成失败:{e}"
@@ -528,7 +555,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         await self._save_sim(event, session)
         return text
 
-    def _llm_resp_to_messages(self, user_input: str, llm_resp, final_text: str) -> list[dict]:
+    def _llm_resp_to_messages(
+        self, user_input: str, llm_resp, final_text: str
+    ) -> list[dict]:
         """把一次 LLM 调用的结果直接转成 AstrBot 原生 Message dict 列表。
 
         单次调用可能产生 1~N 条 message:
@@ -540,26 +569,34 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         直接 model_dump(),读取时 bind_checkpoint_messages 自动还原。
         """
         from astrbot.core.agent.message import (
-            AssistantMessageSegment, UserMessageSegment,
-            ToolCallMessageSegment, TextPart,
+            AssistantMessageSegment,
+            TextPart,
+            ToolCallMessageSegment,
+            UserMessageSegment,
         )
 
         msgs = [UserMessageSegment(content=[TextPart(text=user_input)]).model_dump()]
 
         tool_calls = self._extract_tool_calls(llm_resp)
         if tool_calls:
-            msgs.append(AssistantMessageSegment(
-                content=None,
-                tool_calls=tool_calls,
-            ).model_dump())
+            msgs.append(
+                AssistantMessageSegment(
+                    content=None,
+                    tool_calls=tool_calls,
+                ).model_dump()
+            )
             # 工具结果占位符(真实状态在 RPG 文件存档,叙事文本已描述发生了什么)
             for tc in tool_calls:
-                msgs.append(ToolCallMessageSegment(
-                    content="(详见 RPG 存档)",
-                    tool_call_id=tc.id,
-                ).model_dump())
+                msgs.append(
+                    ToolCallMessageSegment(
+                        content="(详见 RPG 存档)",
+                        tool_call_id=tc.id,
+                    ).model_dump()
+                )
 
-        msgs.append(AssistantMessageSegment(content=[TextPart(text=final_text)]).model_dump())
+        msgs.append(
+            AssistantMessageSegment(content=[TextPart(text=final_text)]).model_dump()
+        )
         return msgs
 
     def _extract_tool_calls(self, llm_resp: LLMResponse) -> list:
@@ -587,10 +624,12 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 args_json = json.dumps(args, ensure_ascii=False)
             except Exception:
                 args_json = "{}"
-            result.append(ToolCall(
-                id=tid,
-                function=ToolCall.FunctionBody(name=name, arguments=args_json),
-            ))
+            result.append(
+                ToolCall(
+                    id=tid,
+                    function=ToolCall.FunctionBody(name=name, arguments=args_json),
+                )
+            )
         return result
 
     # ════════════════════════════════════════════════════════════════
@@ -604,11 +643,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             return "❌ 当前没有活动会话,请先 /创建"
         lore_list = session.get(key) or []
         lore_list = [e for e in lore_list if e.get("section") != section]
-        lore_list.append({
-            "section": section,
-            "content": content,
-            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        })
+        lore_list.append(
+            {
+                "section": section,
+                "content": content,
+                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            }
+        )
         session[key] = lore_list
         await self._save_sim(event, session)
         return f"✅ 「{section}」已保存({len(content)}字)"
@@ -622,11 +663,15 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         深拷贝(每条 entry 复制 dict)避免后续修改 session.lore 影响快照。
         """
         snapshots = session.setdefault("lore_snapshots", [])
-        snapshots.append({
-            "turn": turn,
-            "world_lore": [dict(e) for e in (session.get("world_lore") or [])],
-            "character_lore": [dict(e) for e in (session.get("character_lore") or [])],
-        })
+        snapshots.append(
+            {
+                "turn": turn,
+                "world_lore": [dict(e) for e in (session.get("world_lore") or [])],
+                "character_lore": [
+                    dict(e) for e in (session.get("character_lore") or [])
+                ],
+            }
+        )
 
     def _build_lore_addendum(self, session: dict) -> str:
         """构造注入到 system prompt 的 lore 附加段。"""
@@ -646,7 +691,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         return "\n\n".join(parts)
 
     @filter.llm_tool(name="life_sim_save_world_lore")
-    async def life_sim_save_world_lore(self, event, content: str, section: str = "general") -> str:
+    async def life_sim_save_world_lore(
+        self, event, content: str, section: str = "general"
+    ) -> str:
         """
         永久保存世界观信息
 
@@ -665,7 +712,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         return await self._save_lore(event, "world_lore", section, content)
 
     @filter.llm_tool(name="life_sim_save_character_lore")
-    async def life_sim_save_character_lore(self, event, content: str, section: str = "general") -> str:
+    async def life_sim_save_character_lore(
+        self, event, content: str, section: str = "general"
+    ) -> str:
         """
         永久保存角色设定
 
@@ -692,7 +741,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
     async def cmd_test(self, event: AstrMessageEvent):
         """/测试 - 测试插件是否可用"""
         imgs = await _extract_image(event)
-        yield event.plain_result(json.dumps(imgs))
+        yield event.plain_result("data: " + json.dumps(imgs))
 
     @filter.command("创建")
     async def cmd_create(self, event: AstrMessageEvent):
@@ -783,8 +832,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         session = await self._load_sim(event)
         if not session:
             yield event.plain_result(
-                "❌ 当前没有进行中的转生模拟。\n"
-                "请先使用 /创建 <世界观> 开始。"
+                "❌ 当前没有进行中的转生模拟。\n请先使用 /创建 <世界观> 开始。"
             )
             return
 
@@ -867,10 +915,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             purge = {"deleted_chars": 0, "deleted_sessions": []}
 
         await self._clear_sim(event)
-        char_note = f",{purge['deleted_chars']} 个 RPG 存档" if purge["deleted_chars"] else ""
+        char_note = (
+            f",{purge['deleted_chars']} 个 RPG 存档" if purge["deleted_chars"] else ""
+        )
         sess_note = (
             f",{len(purge['deleted_sessions'])} 个 RPG 会话文件"
-            if purge["deleted_sessions"] else ""
+            if purge["deleted_sessions"]
+            else ""
         )
         yield event.plain_result(
             "🗑️ 会话已删除"
@@ -941,18 +992,23 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         summary_n = sum(1 for m in removed if m.get("_summary"))
         lines = [
             f"⏪ 已撤销最近 {user_n} 轮对话(删 {len(removed)} 条消息)",
-            f"   组成:user × {user_n}, assistant × {asst_n}, tool × {tool_n}" + (f", summary × {summary_n}" if summary_n else ""),
+            f"   组成:user × {user_n}, assistant × {asst_n}, tool × {tool_n}"
+            + (f", summary × {summary_n}" if summary_n else ""),
             f"   剩余历史 {len(messages)} 条",
         ]
         if lore_restored:
-            target_snap = next((s for s in reversed(snapshots) if s["turn"] == target_turn), None)
+            target_snap = next(
+                (s for s in reversed(snapshots) if s["turn"] == target_turn), None
+            )
             if target_snap is not None:
                 w_n = len(target_snap["world_lore"])
                 c_n = len(target_snap["character_lore"])
                 if w_n or c_n:
                     parts = []
-                    if w_n: parts.append(f"世界观 {w_n} 条")
-                    if c_n: parts.append(f"角色 {c_n} 条")
+                    if w_n:
+                        parts.append(f"世界观 {w_n} 条")
+                    if c_n:
+                        parts.append(f"角色 {c_n} 条")
                     lines.append(f"   📜 持久化设定也回滚:{' + '.join(parts)}")
                 else:
                     lines.append("   📜 持久化设定也回滚(本次 turn 无 lore 变更)")
@@ -960,11 +1016,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 lines.append("   📜 持久化设定也回滚")
         lines.append("⚠️ RPG 数值(HP/EXP/装备)未撤销,需要时用 /删除 整个会话")
         # 预览被撤销的最后一个 user 输入
-        last_user = next((m for m in reversed(removed) if m.get("role") == "user"), None)
+        last_user = next(
+            (m for m in reversed(removed) if m.get("role") == "user"), None
+        )
         if last_user:
-            
             preview = _content_to_text(last_user.get("content"))[:60]
-            lines.append(f"   撤销的最后输入:`{preview}{'...' if len(_content_to_text(last_user.get('content',''))) > 60 else ''}`")
+            lines.append(
+                f"   撤销的最后输入:`{preview}{'...' if len(_content_to_text(last_user.get('content', ''))) > 60 else ''}`"
+            )
         yield event.plain_result("\n".join(lines))
 
     async def terminate(self):

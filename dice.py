@@ -3,7 +3,6 @@
 import random
 import re
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api import logger
 
 
 def _roll_dice_expr(expr: str) -> tuple:
@@ -29,13 +28,13 @@ def _roll_dice_expr(expr: str) -> tuple:
 
     while pos < len(expr):
         sign = 1
-        if expr[pos] == '+':
+        if expr[pos] == "+":
             pos += 1
-        elif expr[pos] == '-':
+        elif expr[pos] == "-":
             sign = -1
             pos += 1
         start = pos
-        while pos < len(expr) and expr[pos] not in '+-':
+        while pos < len(expr) and expr[pos] not in "+-":
             pos += 1
         term = expr[start:pos]
         if not term:
@@ -43,7 +42,7 @@ def _roll_dice_expr(expr: str) -> tuple:
                 break
             continue
 
-        m = re.match(r'^(\d*)d(\d+)(?:k([hl])(\d+))?$', term)
+        m = re.match(r"^(\d*)d(\d+)(?:k([hl])(\d+))?$", term)
         if m:
             n = int(m.group(1) or 1)
             sides = int(m.group(2))
@@ -58,13 +57,13 @@ def _roll_dice_expr(expr: str) -> tuple:
             rolls = [random.randint(1, sides) for _ in range(n)]
             kept = list(rolls)
 
-            if keep == 'h' and keep_n and 0 < keep_n < n:
+            if keep == "h" and keep_n and 0 < keep_n < n:
                 sorted_r = sorted(rolls, reverse=True)
                 kept = sorted_r[:keep_n]
                 dropped = sorted_r[keep_n:]
                 rolls_detail = f"[{','.join(map(str, kept))}](kh{keep_n} 弃[{','.join(map(str, dropped))}])"
                 sub = sum(kept)
-            elif keep == 'l' and keep_n and 0 < keep_n < n:
+            elif keep == "l" and keep_n and 0 < keep_n < n:
                 sorted_r = sorted(rolls)
                 kept = sorted_r[:keep_n]
                 dropped = sorted_r[keep_n:]
@@ -96,7 +95,9 @@ class DiceMixin:
     """骰子工具 mixin。"""
 
     @filter.llm_tool(name="roll_dice")
-    async def roll_dice(self, event: AstrMessageEvent, expression: str, label: str = "") -> str:
+    async def roll_dice(
+        self, event: AstrMessageEvent, expression: str, label: str = ""
+    ) -> str:
         """
         Roll dice using standard dice notation. Supports all DND-style rolls.
 
@@ -122,7 +123,7 @@ class DiceMixin:
             )
 
         # 检定自动判 DC(label 里写 "DC15" / "DC 15" 都识别)
-        dc_match = re.search(r'dc\s*(\d+)', (label or "").lower())
+        dc_match = re.search(r"dc\s*(\d+)", (label or "").lower())
         dc_info = ""
         if dc_match:
             dc = int(dc_match.group(1))
