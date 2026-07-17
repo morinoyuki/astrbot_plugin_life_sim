@@ -122,7 +122,7 @@ from prompts import (
     MODE_DETECT_SYSTEM_PROMPT,
 )
 from dice import DiceMixin
-from rpg_tools import RPGMixin
+from rpg_tools import RPGMixin, purge_group_rpg_data
 
 
 class LifeSimPlugin(DiceMixin, RPGMixin, Star):
@@ -847,37 +847,22 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             yield event.plain_result("❌ 当前没有进行中的转生模拟。")
             return
 
-        # 清理该群的 RPG 角色存档与会话文件
         group_id = self._get_group_id(event)
         try:
-            save_dir = os.path.join(self.data_dir, "rpg_saves")
-            if os.path.exists(save_dir) and group_id:
-                prefix = f"{group_id}_"
-                for fname in os.listdir(save_dir):
-                    if fname.startswith(prefix) and fname.endswith(".json"):
-                        os.remove(os.path.join(save_dir, fname))
+            purge = purge_group_rpg_data(self.data_dir, group_id)
         except Exception as e:
             logger.debug(f"life-sim: 清理 RPG 存档失败: {e}")
-        try:
-            sess_dir = self._sessions_dir()
-            if os.path.exists(sess_dir) and group_id:
-                for fname in os.listdir(sess_dir):
-                    if not fname.endswith(".json"):
-                        continue
-                    fp = os.path.join(sess_dir, fname)
-                    try:
-                        with open(fp, "r", encoding="utf-8") as f:
-                            s = json.load(f)
-                        if s.get("group_id") == group_id:
-                            os.remove(fp)
-                    except Exception:
-                        continue
-        except Exception:
-            pass
+            purge = {"deleted_chars": 0, "deleted_sessions": []}
 
         await self._clear_sim(event)
+        char_note = f",{purge['deleted_chars']} 个 RPG 存档" if purge["deleted_chars"] else ""
+        sess_note = (
+            f",{len(purge['deleted_sessions'])} 个 RPG 会话文件"
+            if purge["deleted_sessions"] else ""
+        )
         yield event.plain_result(
-            "🗑️ 会话已删除(同时清理该群的 RPG 存档)。\n"
+            "🗑️ 会话已删除"
+            f"{char_note}{sess_note}。\n"
             "使用 /创建 <世界观> 可以开始一段新的人生。"
         )
 

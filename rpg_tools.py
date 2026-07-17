@@ -219,6 +219,59 @@ def _session_path(data_dir: str, session_id: str) -> str:
     return os.path.join(d, f"{session_id}.json")
 
 
+def purge_group_rpg_data(data_dir: str, group_id: str) -> dict:
+    """删除指定群的所有 RPG 角色存档 + 该群的全部 RPG 会话文件。
+
+    供 /创建(覆盖旧会话)与 /删除(主动清理)共用。
+    返回 {"deleted_chars": int, "deleted_sessions": [session_id, ...]}。
+    group_id 为空字符串时直接返回空统计(私聊无群维度)。
+    """
+    result = {"deleted_chars": 0, "deleted_sessions": []}
+    if not group_id:
+        return result
+
+    # 1) 删除该群的所有 RPG 角色存档(按 {group_id}_ 前缀,跨 sender 清理)
+    save_dir = os.path.join(data_dir, "rpg_saves")
+    if os.path.exists(save_dir):
+        prefix = f"{group_id}_"
+        for fname in list(os.listdir(save_dir)):
+            if fname.startswith(prefix) and fname.endswith(".json"):
+                try:
+                    os.remove(os.path.join(save_dir, fname))
+                    result["deleted_chars"] += 1
+                except OSError as e:
+                    logger.warning("rpg存档删除失败 %s: %s", fname, e)
+
+    # 2) 删除该群的所有 RPG 会话文件 + 它们的成员角色存档(防御性)
+    sess_dir = os.path.join(data_dir, "sessions")
+    if os.path.exists(sess_dir):
+        for fname in list(os.listdir(sess_dir)):
+            if not fname.endswith(".json"):
+                continue
+            fpath = os.path.join(sess_dir, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    s = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                continue
+            if s.get("group_id") != group_id:
+                continue
+            for member_name in s.get("members", []):
+                save = _char_path(data_dir, f"{group_id}_{member_name}")
+                if os.path.exists(save):
+                    try:
+                        os.remove(save)
+                    except OSError:
+                        pass
+            try:
+                os.remove(fpath)
+                result["deleted_sessions"].append(s.get("session_id", fname[:-5]))
+            except OSError as e:
+                logger.warning("rpg会话删除失败 %s: %s", fpath, e)
+
+    return result
+
+
 def load_session(data_dir: str, session_id: str) -> dict | None:
     p = _session_path(data_dir, session_id)
     if not os.path.exists(p):
@@ -649,26 +702,10 @@ class RPGMixin:
 
         # 群聊清理旧会话及其角色
         if group_id:
-            sd = os.path.join(self.data_dir, "sessions")
-            if os.path.exists(sd):
-                for fname in os.listdir(sd):
-                    if not fname.endswith(".json"):
-                        continue
-                    fpath = os.path.join(sd, fname)
-                    try:
-                        with open(fpath, "r", encoding="utf-8") as f:
-                            s = json.load(f)
-                    except (json.JSONDecodeError, OSError):
-                        continue
-                    if s.get("group_id") != group_id:
-                        continue
-                    old_session_name = s.get("session_id", "")
-                    for member_name in s.get("members", []):
-                        save = _char_path(self.data_dir, self._make_char_uid(group_id, member_name, ""))
-                        if os.path.exists(save):
-                            os.remove(save)
-                    os.remove(fpath)
-                    overwritten = True
+            purge = purge_group_rpg_data(self.data_dir, group_id)
+            overwritten = bool(purge["deleted_chars"] or purge["deleted_sessions"])
+            if purge["deleted_sessions"]:
+                old_session_name = purge["deleted_sessions"][0]
 
         user_rules: dict = {}
         if world_rules and world_rules.strip():
@@ -907,23 +944,22 @@ class RPGMixin:
 
     @filter.llm_tool(name="rpg_delete_session")
     async def rpg_delete_session(
-        self, event, session_id: str, reset_characters: bool = True,
+        self, event, session_id: str,
     ) -> str:
         """
         Delete a game session and optionally reset all its characters. This is irreversible.
         Args:
             session_id(string): The session ID to delete (from rpg_list_sessions).
-            reset_characters(bool): If true (default), also delete all character saves in this session. If false, keep character data but remove the session.
         Returns:
             Deletion confirmation with details.
         """
         session = load_session(self.data_dir, session_id)
         if not session:
             return f"❌ 会话 {session_id} 不存在。"
-        members = session.get("members", [])
+        members = session.get("members")
 
         deleted_chars = []
-        if reset_characters and members:
+        if members:
             group_id = self._get_group_id(event)
             for m in members:
                 path = _char_path(self.data_dir, self._make_char_uid(group_id, m, self._uid(event)))
