@@ -119,11 +119,9 @@ def _parse_docstring_params(docstring: str) -> dict:
     return params
 
 
-async def _extract_image(event: AstrMessageEvent) -> list[str]:
-    images: list[str] = [
-        comp.url
-        for comp in event.get_messages()
-        if isinstance(comp, Image) and comp.url
+async def _extract_image(event: AstrMessageEvent) -> list[Image]:
+    images: list[Image] = [
+        comp for comp in event.get_messages() if isinstance(comp, Image)
     ]
     return images
 
@@ -477,7 +475,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         session: dict,
         user_input: str,
         mode: str,
-        imgs: list[str] | None = None,
+        imgs: list[Image] | None = None,
     ) -> str:
         provider_id, err = await self._get_provider_id(event, mode)
         if err:
@@ -515,9 +513,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             rpg_snap = self._rpg_snapshot(event, mode)
             rpg_snaps = session.setdefault("rpg_snapshots", [])
             rpg_snaps.append({"turn": turn, **rpg_snap})
-            # 限制最多保留 50 个快照(每个可能含多角色,避免 KV 膨胀)
-            if len(rpg_snaps) > 50:
-                del rpg_snaps[: len(rpg_snaps) - 50]
+            # 限制最多保留 25 个快照(每个可能含多角色,避免 KV 膨胀)
+            if len(rpg_snaps) > 25:
+                del rpg_snaps[: len(rpg_snaps) - 25]
 
         contexts = bind_checkpoint_messages(messages)
 
@@ -529,12 +527,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
         user_input += system_reminder
 
+        image_urls = [(img.url or img.path) for img in imgs]
         try:
             if mode == "A":
                 llm_resp = await self.context.llm_generate(
                     chat_provider_id=provider_id,
                     system_prompt=system_prompt,
-                    image_urls=imgs,
+                    image_urls=image_urls,
                     contexts=contexts,
                     prompt=user_input,
                 )
@@ -545,7 +544,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                     event=event,
                     chat_provider_id=provider_id,
                     system_prompt=system_prompt,
-                    image_urls=imgs,
+                    image_urls=image_urls,
                     contexts=contexts,
                     prompt=user_input,
                     tools=tools,
@@ -562,34 +561,51 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             return "❌ 模型未返回内容,请重试。"
 
         # 把整轮(user + 工具调用 + 最终回应)一次性转成 AstrBot 原生 Message dict 列表
-        new_msgs = self._llm_resp_to_messages(user_input, llm_resp, text)
+        new_msgs = await self._llm_resp_to_messages(user_input, llm_resp, imgs)
 
         messages.extend(new_msgs)
         session["messages"] = messages
         await self._save_sim(event, session)
         return text
 
-    def _llm_resp_to_messages(
-        self, user_input: str, llm_resp, final_text: str
+    async def _llm_resp_to_messages(
+        self,
+        user_input: str,
+        llm_resp: LLMResponse,
+        images: list[Image] | None,
     ) -> list[dict]:
         """把一次 LLM 调用的结果直接转成 AstrBot 原生 Message dict 列表。
 
         单次调用可能产生 1~N 条 message:
         1. user input
         2. assistant with tool_calls(从 llm_resp.tools_call_* 抽,只保留本插件的工具)
-        3. 每个 tool_call 一条 tool 消息(content = 占位符,真实结果在 RPG 文件存档)
+        3. 每个 tool_call 一条 tool 消息(工具结果由 AstrBot runner 内部消费)
         4. 最终 assistant 文本
 
         直接 model_dump(),读取时 bind_checkpoint_messages 自动还原。
         """
         from astrbot.core.agent.message import (
             AssistantMessageSegment,
-            TextPart,
             ToolCallMessageSegment,
             UserMessageSegment,
+            TextPart,
+            ImageURLPart,
+            # ThinkPart,
         )
 
-        msgs = [UserMessageSegment(content=[TextPart(text=user_input)]).model_dump()]
+        content: list[TextPart | ImageURLPart] = [TextPart(text=user_input)]
+
+        if images:
+            content += [
+                ImageURLPart(
+                    image_url=ImageURLPart.ImageURL(
+                        url="data:image/png;base64," + await img.convert_to_base64()
+                    )
+                )
+                for img in images
+            ]
+
+        msgs = [UserMessageSegment(content=content).model_dump()]
 
         tool_calls = self._extract_tool_calls(llm_resp)
         if tool_calls:
@@ -599,18 +615,18 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                     tool_calls=tool_calls,
                 ).model_dump()
             )
-            # 工具结果占位符(真实状态在 RPG 文件存档,叙事文本已描述发生了什么)
+            # tool_loop_agent 的 tool 返回值不会出现在 LLMResponse 中；真实状态由工具持久化到 RPG 存档。
             for tc in tool_calls:
                 msgs.append(
                     ToolCallMessageSegment(
-                        content="(详见 RPG 存档)",
+                        content=None,
                         tool_call_id=tc.id,
                     ).model_dump()
                 )
-
         msgs.append(
-            AssistantMessageSegment(content=[TextPart(text=final_text)]).model_dump()
+            AssistantMessageSegment(content=llm_resp.result_chain.chain).model_dump()
         )
+        logger.debug(f"life-sim resp: {msgs[-1]}")
         return msgs
 
     def _extract_tool_calls(self, llm_resp: LLMResponse) -> list:
@@ -620,11 +636,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         """
         from astrbot.core.agent.message import ToolCall
 
-        names = getattr(llm_resp, "tools_call_name", None)
+        names = llm_resp.tools_call_name
         if not names:
             return []
-        args_list = getattr(llm_resp, "tools_call_args", None) or []
-        ids = getattr(llm_resp, "tools_call_ids", None) or []
+        args_list = llm_resp.tools_call_args or []
+        ids = llm_resp.tools_call_ids or []
 
         result = []
         for i, name in enumerate(names):
@@ -633,7 +649,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             args = args_list[i] if i < len(args_list) else {}
             if not isinstance(args, dict):
                 args = {}
-            tid = ids[i] if ids[i] else f"call_{i}"
+            tid = ids[i] if i < len(ids) and ids[i] else f"call_{i}"
             try:
                 args_json = json.dumps(args, ensure_ascii=False)
             except Exception:
@@ -1063,9 +1079,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             else:
                 lines.append("   🎮 RPG 数值已回滚(无变化)")
         elif session.get("mode") in ("B", "C"):
-            lines.append(
-                "   ⚠️ 未找到该 turn 的 RPG 快照(数值未回滚),用 /删除 重建会话"
-            )
+            lines.append("   ⚠️ 未找到该 turn 的 RPG 快照(数值未回滚),用 /删除 重建会话")
         # 预览被撤销的最后一个 user 输入
         last_user = next(
             (m for m in reversed(removed) if m.get("role") == "user"), None
