@@ -49,8 +49,6 @@ def _content_to_text(content) -> str:
         parts = []
         for p in content:
             if isinstance(p, dict):
-                if p.get("type") != "text":
-                    continue
                 t = p.get("text", "")
                 if t:
                     parts.append(t)
@@ -58,6 +56,26 @@ def _content_to_text(content) -> str:
                 parts.append(p.text)
         return "\n".join(parts)
     return str(content)
+
+
+def _strip_xml_tags(text: str) -> str:
+    """去除 <xxx>...</xxx> 标签块(包括内部内容),只保留用户真实输入。
+
+    用于 /undo 预览时去掉 <system_reminder>、<Quoted Message>、<environment_details>
+    等噪声。
+    """
+    import re
+
+    cleaned = re.sub(
+        r"<[A-Za-z_][\w\- ]*?>([\s\S]*?)</[A-Za-z_][\w\- ]*?>",
+        "",
+        text,
+        flags=re.DOTALL,
+    )
+    cleaned = re.sub(r"</?[A-Za-z_][\w\- ]*?/?>", "", cleaned)
+    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned.strip()
 
 
 def _parse_docstring_params(docstring: str) -> dict:
@@ -562,9 +580,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             return "⏳ 上一条消息还在处理中,请稍候再试..."
 
         async with lock:
-            return await self._generate_locked(
-                event, session, user_input, mode, imgs
-            )
+            return await self._generate_locked(event, session, user_input, mode, imgs)
 
     async def _generate_locked(
         self,
@@ -751,15 +767,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             # tool_loop_agent 最终响应有时 result_chain 为 None;
             # 兜底从 _completion_text + reasoning_content 重建(保留 thinking)
             text = (getattr(llm_resp, "_completion_text", "") or "").strip()
-            think = (
-                getattr(llm_resp, "reasoning_content", None) or ""
-            ).strip()
+            think = (getattr(llm_resp, "reasoning_content", None) or "").strip()
             think_sig = getattr(llm_resp, "reasoning_signature", None)
             final_content = []
             if think:
-                final_content.append(
-                    ThinkPart(think=think, encrypted=think_sig)
-                )
+                final_content.append(ThinkPart(think=think, encrypted=think_sig))
             if text:
                 final_content.append(TextPart(text=text))
             if not final_content:
@@ -1201,11 +1213,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                         parts.append(f"世界观 {w_n} 条")
                     if c_n:
                         parts.append(f"角色 {c_n} 条")
-                    lines.append(f"   📜 持久化设定也回滚:{' + '.join(parts)}")
+                    lines.append(f"   📜 持久化设定回滚:{' + '.join(parts)}")
                 else:
-                    lines.append("   📜 持久化设定也回滚(本次 turn 无 lore 变更)")
+                    lines.append("   📜 持久化设定回滚(本次 turn 无 lore 变更)")
             else:
-                lines.append("   📜 持久化设定也回滚")
+                lines.append("   📜 持久化设定回滚")
         if rpg_stats is not None:
             rc = rpg_stats["restored_chars"]
             rs = rpg_stats["restored_sessions"]
@@ -1226,15 +1238,16 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 lines.append("   🎮 RPG 数值已回滚(无变化)")
         elif session.get("mode") in ("B", "C"):
             lines.append("   ⚠️ 未找到该 turn 的 RPG 快照(数值未回滚),用 /删除 重建会话")
-        # 预览被撤销的最后一个 user 输入
+        # 预览被撤销的最后一个 user 输入(去掉 <system_reminder>、<Quoted Message> 等标签)
         last_user = next(
             (m for m in reversed(removed) if m.get("role") == "user"), None
         )
         if last_user:
-            preview = _content_to_text(last_user.get("content"))[:60]
-            lines.append(
-                f"   撤销的最后输入:`{preview}{'...' if len(_content_to_text(last_user.get('content', ''))) > 60 else ''}`"
-            )
+            raw = _content_to_text(last_user.get("content"))
+            stripped = _strip_xml_tags(raw)
+            preview = stripped[:60]
+            more = "..." if len(stripped) > 60 else ""
+            lines.append(f"   撤销的最后输入:`{preview}{more}`")
         yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
