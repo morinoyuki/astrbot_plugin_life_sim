@@ -6,6 +6,7 @@
 - 4 个指令: /创建 /do /进度 /删除
 """
 
+import asyncio
 import time
 import json
 
@@ -48,6 +49,8 @@ def _content_to_text(content) -> str:
         parts = []
         for p in content:
             if isinstance(p, dict):
+                if p.get("type") != "text":
+                    continue
                 t = p.get("text", "")
                 if t:
                     parts.append(t)
@@ -143,23 +146,64 @@ def _build_system_reminder(event: AstrMessageEvent) -> str:
 
 
 class _LifeSimToolHooks(BaseAgentRunHooks[AstrAgentContext]):
-    """从 run_context.messages 中按 tool_call_id 取每条 tool 消息的最终 content。
+    """从 run_context.messages 中提取本轮 agent 新增的工具调用上下文。
 
-    runner 已把同一批 ToolCallMessageSegment 原对象加入 run_context.messages,
-    所以这里的 content 就是 runner 最终喂回 LLM 的内容(包括重复调用提示/超长落盘/follow-up)。
+    工具调用 / 工具结果 / 思考 都保存在 run_context.messages 里,
+    不在最终 LLMResponse 中(LLMResponse.tools_call_* 只剩最后一轮、且最终轮往往没有 tool call)。
+    完整序列才能让下次 LLM 看到正确的对话历史。
     """
 
     def __init__(self) -> None:
+        # tool_call_id → 最终 content(已经包含重复调用提示/超长落盘/follow-up)
         self.results_by_call_id: dict[str, str] = {}
+        # 按出现顺序收集:[(tool_call_id, name, args_dict), ...]
+        self.tool_calls: list[dict] = []
+        self._before_count: int = 0
+
+    async def on_agent_begin(self, run_context) -> None:
+        self._before_count = len(run_context.messages)
+
+    @staticmethod
+    def _extract_tool_call(tc) -> dict | None:
+        """从 ToolCall 对象或 dict 抽取 {id, name, args}。"""
+        if hasattr(tc, "id"):
+            tid = tc.id
+            fn = getattr(tc, "function", None)
+            name = getattr(fn, "name", None) if fn else None
+            args_str = getattr(fn, "arguments", None) if fn else None
+        elif isinstance(tc, dict):
+            tid = tc.get("id")
+            fn = tc.get("function") or {}
+            name = fn.get("name") if isinstance(fn, dict) else None
+            args_str = fn.get("arguments") if isinstance(fn, dict) else None
+        else:
+            return None
+        if not tid or not name:
+            return None
+        if isinstance(args_str, dict):
+            args = args_str
+        else:
+            try:
+                args = json.loads(args_str) if args_str else {}
+            except Exception:
+                args = {}
+        if not isinstance(args, dict):
+            args = {}
+        return {"id": tid, "name": name, "args": args}
 
     async def on_agent_done(self, run_context, llm_response) -> None:
-        for msg in run_context.messages:
-            if getattr(msg, "role", None) != "tool":
-                continue
-            call_id = getattr(msg, "tool_call_id", None)
-            content = getattr(msg, "content", None)
-            if call_id and isinstance(content, str) and content:
-                self.results_by_call_id[call_id] = content
+        for msg in run_context.messages[self._before_count :]:
+            role = getattr(msg, "role", None)
+            if role == "tool":
+                call_id = getattr(msg, "tool_call_id", None)
+                content = getattr(msg, "content", None)
+                if call_id and isinstance(content, str) and content:
+                    self.results_by_call_id[call_id] = content
+            elif role == "assistant":
+                for tc in getattr(msg, "tool_calls", None) or []:
+                    data = self._extract_tool_call(tc)
+                    if data is not None:
+                        self.tool_calls.append(data)
 
 
 class LifeSimPlugin(DiceMixin, RPGMixin, Star):
@@ -169,6 +213,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         self.kv_prefix = "life_sim_v1_"
         # AstrBot 在配置存在时传入,缺失时为 None
         self.config = config
+        # 每个会话(group/user)一把 asyncio.Lock,防止同一会话并发触发 _generate 造成竞态
+        self._sim_locks: dict[str, asyncio.Lock] = {}
 
     # ─── 配置读取助手 ────────────────────────────────────────
 
@@ -191,6 +237,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         if gid:
             return f"{self.kv_prefix}group_{gid}"
         return f"{self.kv_prefix}user_{event.get_sender_id()}"
+
+    def _get_sim_lock(self, key: str) -> asyncio.Lock:
+        """每个会话一把锁(惰性创建)。同一 key 上的并发命令直接返回处理中提示。"""
+        lock = self._sim_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._sim_locks[key] = lock
+        return lock
 
     async def _load_sim(self, event: AstrMessageEvent):
         key = self._sim_session_key(event)
@@ -502,6 +556,24 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         mode: str,
         imgs: list[Image] | None = None,
     ) -> str:
+        # 同会话并发上锁:避免多次 LLM 调用/快照/save_sim 互相覆盖
+        lock = self._get_sim_lock(self._sim_session_key(event))
+        if lock.locked():
+            return "⏳ 上一条消息还在处理中,请稍候再试..."
+
+        async with lock:
+            return await self._generate_locked(
+                event, session, user_input, mode, imgs
+            )
+
+    async def _generate_locked(
+        self,
+        event: AstrMessageEvent,
+        session: dict,
+        user_input: str,
+        mode: str,
+        imgs: list[Image] | None,
+    ) -> str:
         provider_id, err = await self._get_provider_id(event, mode)
         if err:
             return err
@@ -609,7 +681,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
         单次调用可能产生 1~N 条 message:
         1. user input
-        2. assistant with tool_calls(从 llm_resp.tools_call_* 抽,只保留本插件的工具)
+        2. assistant with tool_calls(从 agent_hooks.tool_calls 抽,只保留本插件的工具)
         3. 每个 tool_call 一条 tool 消息(content = 真实返回值,通过 agent_hooks 捕获)
         4. 最终 assistant 文本
 
@@ -621,7 +693,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             UserMessageSegment,
             TextPart,
             ImageURLPart,
-            # ThinkPart,
+            ThinkPart,
+            ToolCall,
         )
 
         content: list[TextPart | ImageURLPart] = [TextPart(text=user_input)]
@@ -638,64 +711,62 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
         msgs = [UserMessageSegment(content=content).model_dump()]
 
-        tool_calls = self._extract_tool_calls(llm_resp)
-        if tool_calls:
+        # 从 agent_hooks 取本轮所有 tool_call(覆盖多步调用;LLMResponse 只会保留最后一轮)
+        my_tool_calls: list[ToolCall] = []
+        if tool_hooks is not None:
+            for tc in tool_hooks.tool_calls:
+                if not self._is_my_tool(tc["name"]):
+                    continue
+                try:
+                    args_json = json.dumps(tc["args"], ensure_ascii=False)
+                except Exception:
+                    args_json = "{}"
+                my_tool_calls.append(
+                    ToolCall(
+                        id=tc["id"],
+                        function=ToolCall.FunctionBody(
+                            name=tc["name"], arguments=args_json
+                        ),
+                    )
+                )
+
+        if my_tool_calls:
             msgs.append(
                 AssistantMessageSegment(
                     content=None,
-                    tool_calls=tool_calls,
+                    tool_calls=my_tool_calls,
                 ).model_dump()
             )
-            # 通过 agent_hooks 取真实返回值;缺失则用 None
-            # (runner 会自己补齐后续 LLM 调用所需的 tool 消息,这里只是存档侧)
-            for tc in tool_calls:
-                real_content = None
-                if tool_hooks is not None:
-                    real_content = tool_hooks.results_by_call_id.get(tc.id)
+            for tc in my_tool_calls:
+                real_content = tool_hooks.results_by_call_id.get(tc.id)
                 msgs.append(
                     ToolCallMessageSegment(
                         content=real_content,
                         tool_call_id=tc.id,
                     ).model_dump()
                 )
-        msgs.append(
-            AssistantMessageSegment(content=llm_resp.result_chain.chain).model_dump()
-        )
+        if llm_resp.result_chain is not None and llm_resp.result_chain.chain:
+            final_content = llm_resp.result_chain.chain
+        else:
+            # tool_loop_agent 最终响应有时 result_chain 为 None;
+            # 兜底从 _completion_text + reasoning_content 重建(保留 thinking)
+            text = (getattr(llm_resp, "_completion_text", "") or "").strip()
+            think = (
+                getattr(llm_resp, "reasoning_content", None) or ""
+            ).strip()
+            think_sig = getattr(llm_resp, "reasoning_signature", None)
+            final_content = []
+            if think:
+                final_content.append(
+                    ThinkPart(think=think, encrypted=think_sig)
+                )
+            if text:
+                final_content.append(TextPart(text=text))
+            if not final_content:
+                final_content = [TextPart(text="(模型未输出文本)")]
+        msgs.append(AssistantMessageSegment(content=final_content).model_dump())
         logger.debug(f"life-sim resp: {msgs[-1]}")
         return msgs
-
-    def _extract_tool_calls(self, llm_resp: LLMResponse) -> list:
-        """从 LLMResponse 抽取本插件的 ToolCall 对象列表。
-        LLMResponse.tools_call_name/args/ids 是平行数组,任一缺失或为空列表即视为无 tool call。
-        只保留本插件(rpg_*/roll_dice)。
-        """
-        from astrbot.core.agent.message import ToolCall
-
-        names = llm_resp.tools_call_name
-        if not names:
-            return []
-        args_list = llm_resp.tools_call_args or []
-        ids = llm_resp.tools_call_ids or []
-
-        result = []
-        for i, name in enumerate(names):
-            if not self._is_my_tool(name):
-                continue
-            args = args_list[i] if i < len(args_list) else {}
-            if not isinstance(args, dict):
-                args = {}
-            tid = ids[i] if i < len(ids) and ids[i] else f"call_{i}"
-            try:
-                args_json = json.dumps(args, ensure_ascii=False)
-            except Exception:
-                args_json = "{}"
-            result.append(
-                ToolCall(
-                    id=tid,
-                    function=ToolCall.FunctionBody(name=name, arguments=args_json),
-                )
-            )
-        return result
 
     # ════════════════════════════════════════════════════════════════
     # 持久化 lore(角色设定 + 世界观,直到 /删除 或 /创建)
@@ -974,9 +1045,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
         session = await self._load_sim(event)
         if not session:
-            yield event.plain_result(
-                "❌ 当前没有活动会话,请先 /创建"
-            )
+            yield event.plain_result("❌ 当前没有活动会话,请先 /创建")
             return
 
         if full:
