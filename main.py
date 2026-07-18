@@ -18,6 +18,8 @@ from astrbot.core.message.components import Image
 from astrbot.core.provider.entities import LLMResponse
 from astrbot.core.utils.quoted_message.extractor import QuotedMessageExtractor
 
+from astrbot.core.agent.hooks import BaseAgentRunHooks
+from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.star.star_tools import StarTools
 
@@ -140,6 +142,26 @@ def _build_system_reminder(event: AstrMessageEvent) -> str:
     )
 
 
+class _LifeSimToolHooks(BaseAgentRunHooks[AstrAgentContext]):
+    """从 run_context.messages 中按 tool_call_id 取每条 tool 消息的最终 content。
+
+    runner 已把同一批 ToolCallMessageSegment 原对象加入 run_context.messages,
+    所以这里的 content 就是 runner 最终喂回 LLM 的内容(包括重复调用提示/超长落盘/follow-up)。
+    """
+
+    def __init__(self) -> None:
+        self.results_by_call_id: dict[str, str] = {}
+
+    async def on_agent_done(self, run_context, llm_response) -> None:
+        for msg in run_context.messages:
+            if getattr(msg, "role", None) != "tool":
+                continue
+            call_id = getattr(msg, "tool_call_id", None)
+            content = getattr(msg, "content", None)
+            if call_id and isinstance(content, str) and content:
+                self.results_by_call_id[call_id] = content
+
+
 class LifeSimPlugin(DiceMixin, RPGMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
@@ -218,12 +240,15 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
     @staticmethod
     def _is_my_tool(name: str) -> bool:
-        """过滤:只保留本插件的工具(rpg_*/roll_dice)。"""
+        """过滤:只保留本插件的工具(rpg_*/roll_dice/life_sim_save_*)。"""
         return bool(name) and (
             name.startswith("rpg_")
-            or name == "roll_dice"
-            or "life_sim_save_character_lore"
-            or "life_sim_save_world_lore"
+            or name
+            in {
+                "roll_dice",
+                "life_sim_save_character_lore",
+                "life_sim_save_world_lore",
+            }
         )
 
     def _build_my_tool_set(self) -> ToolSet:
@@ -528,6 +553,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         user_input += system_reminder
 
         image_urls = [(img.url or img.path) for img in imgs]
+        tool_hooks: _LifeSimToolHooks | None = None
         try:
             if mode == "A":
                 llm_resp = await self.context.llm_generate(
@@ -540,6 +566,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             else:
                 # 传 tools 让 LLM 知道 rpg_*/roll_dice 可用(否则 tool_loop_agent 不会调任何工具)
                 tools = self._build_my_tool_set()
+                tool_hooks = _LifeSimToolHooks()
                 llm_resp = await self.context.tool_loop_agent(
                     event=event,
                     chat_provider_id=provider_id,
@@ -550,6 +577,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                     tools=tools,
                     max_steps=tool_max_steps,
                     tool_call_timeout=tool_call_timeout,
+                    agent_hooks=tool_hooks,
                 )
         except Exception as e:
             logger.error(f"life-sim: LLM 调用失败: {e}")
@@ -561,7 +589,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             return "❌ 模型未返回内容,请重试。"
 
         # 把整轮(user + 工具调用 + 最终回应)一次性转成 AstrBot 原生 Message dict 列表
-        new_msgs = await self._llm_resp_to_messages(user_input, llm_resp, imgs)
+        new_msgs = await self._llm_resp_to_messages(
+            user_input, llm_resp, imgs, tool_hooks
+        )
 
         messages.extend(new_msgs)
         session["messages"] = messages
@@ -573,13 +603,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         user_input: str,
         llm_resp: LLMResponse,
         images: list[Image] | None,
+        tool_hooks: "_LifeSimToolHooks | None" = None,
     ) -> list[dict]:
         """把一次 LLM 调用的结果直接转成 AstrBot 原生 Message dict 列表。
 
         单次调用可能产生 1~N 条 message:
         1. user input
         2. assistant with tool_calls(从 llm_resp.tools_call_* 抽,只保留本插件的工具)
-        3. 每个 tool_call 一条 tool 消息(工具结果由 AstrBot runner 内部消费)
+        3. 每个 tool_call 一条 tool 消息(content = 真实返回值,通过 agent_hooks 捕获)
         4. 最终 assistant 文本
 
         直接 model_dump(),读取时 bind_checkpoint_messages 自动还原。
@@ -615,11 +646,15 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                     tool_calls=tool_calls,
                 ).model_dump()
             )
-            # tool_loop_agent 的 tool 返回值不会出现在 LLMResponse 中；真实状态由工具持久化到 RPG 存档。
+            # 通过 agent_hooks 取真实返回值;缺失则用 None
+            # (runner 会自己补齐后续 LLM 调用所需的 tool 消息,这里只是存档侧)
             for tc in tool_calls:
+                real_content = None
+                if tool_hooks is not None:
+                    real_content = tool_hooks.results_by_call_id.get(tc.id)
                 msgs.append(
                     ToolCallMessageSegment(
-                        content=None,
+                        content=real_content,
                         tool_call_id=tc.id,
                     ).model_dump()
                 )
@@ -928,6 +963,48 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             lines.append(f"\n—— 最近一段 ——\n{tail}")
 
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("dump")
+    async def cmd_dump(self, event: AstrMessageEvent):
+        """/dump [full] - 调试用,把当前会话从 KV 完整导出为 JSON。
+        不带参数:只导出 messages + 摘要字段;
+        full:导出整个 session(包含 lore/快照等)。"""
+        arg = self._extract_after_cmd(event, "dump").strip().lower()
+        full = arg in ("full", "all", "完整", "全部")
+
+        session = await self._load_sim(event)
+        if not session:
+            yield event.plain_result(
+                "❌ 当前没有活动会话,请先 /创建"
+            )
+            return
+
+        if full:
+            payload = session
+        else:
+            payload = {
+                "mode": session.get("mode"),
+                "world_setting": session.get("world_setting", ""),
+                "owner_id": session.get("owner_id"),
+                "owner_name": session.get("owner_name"),
+                "created_at": session.get("created_at"),
+                "lore_turn": session.get("lore_turn"),
+                "messages": session.get("messages", []),
+                "message_count": len(session.get("messages", [])),
+            }
+
+        try:
+            text = json.dumps(payload, ensure_ascii=False, indent=2)
+        except Exception as e:
+            yield event.plain_result(f"❌ 序列化失败:{e}")
+            return
+
+        header = (
+            f"📦 session dump ({'full' if full else 'summary'})"
+            f"  key=`{self._sim_session_key(event)}`"
+        )
+        # 头部 + 内容,避免太长看不到 key
+        yield event.plain_result(f"{header}\n{text}")
 
     @filter.command("删除")
     async def cmd_delete(self, event: AstrMessageEvent):
