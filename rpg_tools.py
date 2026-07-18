@@ -828,7 +828,11 @@ class RPGMixin:
 
         save_dir = os.path.join(self.data_dir, "rpg_saves")
         os.makedirs(save_dir, exist_ok=True)
+        sess_dir = os.path.join(self.data_dir, "sessions")
+        os.makedirs(sess_dir, exist_ok=True)
 
+        # ── 阶段 1:只读分析(必须在任何写盘/删除之前完成) ──
+        # 字符当前集合
         current_uids: set[str] = set()
         if group_id:
             prefix = f"{group_id}_"
@@ -841,6 +845,45 @@ class RPGMixin:
             if os.path.exists(path):
                 current_uids.add(sender_uid)
 
+        # 私聊 scope:回滚后存活的字符(chars_snap)所引用的 session 也算 in-scope,
+        # 避免"在回滚区间内创建的新会话"漏删。
+        # 进一步:当前磁盘上(current_uids)字符所引用的 session 也算 in-scope —
+        # 这样"回滚期间切换了 session_id"和"空快照"两个场景都能识别出哪些
+        # session 是自己的。注意必须在写盘前完成,否则 char 文件已被删,
+        # load_char 返回 None。
+        referenced_sids: set[str] = set()
+        for char in chars_snap.values():
+            sid = char.get("session_id")
+            if sid:
+                referenced_sids.add(sid)
+        for uid in current_uids:
+            cur_char = load_char(self.data_dir, uid)
+            if cur_char:
+                sid = cur_char.get("session_id")
+                if sid:
+                    referenced_sids.add(sid)
+
+        # 会话当前集合 + in-scope 判定
+        current_sids: set[str] = set()
+        snap_sids = set(sessions_snap.keys())
+        if os.path.exists(sess_dir):
+            for fname in os.listdir(sess_dir):
+                if not fname.endswith(".json"):
+                    continue
+                sid = fname[:-5]
+                s = load_session(self.data_dir, sid)
+                if s is None:
+                    continue
+                if group_id:
+                    if s.get("group_id") == group_id:
+                        current_sids.add(sid)
+                else:
+                    if not s.get("group_id") and (
+                        sid in snap_sids or sid in referenced_sids
+                    ):
+                        current_sids.add(sid)
+
+        # ── 阶段 2:写盘(分析已结束,可以安全增删) ──
         for uid in current_uids:
             if uid in chars_snap:
                 save_char(self.data_dir, uid, chars_snap[uid])
@@ -857,26 +900,6 @@ class RPGMixin:
             if uid not in current_uids:
                 save_char(self.data_dir, uid, char)
                 stats["restored_chars"] += 1
-
-        sess_dir = os.path.join(self.data_dir, "sessions")
-        os.makedirs(sess_dir, exist_ok=True)
-
-        current_sids: set[str] = set()
-        snap_sids = set(sessions_snap.keys())
-        if os.path.exists(sess_dir):
-            for fname in os.listdir(sess_dir):
-                if not fname.endswith(".json"):
-                    continue
-                sid = fname[:-5]
-                s = load_session(self.data_dir, sid)
-                if s is None:
-                    continue
-                if group_id:
-                    if s.get("group_id") == group_id:
-                        current_sids.add(sid)
-                else:
-                    if (not s.get("group_id")) and sid in snap_sids:
-                        current_sids.add(sid)
 
         for sid in current_sids:
             if sid in sessions_snap:

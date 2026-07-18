@@ -509,8 +509,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         session["lore_turn"] = turn
         self._snapshot_lore(session, turn)
         # 同步快照 RPG 数值状态,供 /undo 回滚 HP/EXP/装备/会话等
-        rpg_snap = self._rpg_snapshot(event, mode)
-        if rpg_snap["chars"] or rpg_snap["sessions"]:
+        # mode B/C 一律保存(包括空快照)— 否则回滚到"首个创建 RPG 数据的 turn"时找不到快照,
+        # 导致本应被删除的新建角色/会话漏网。
+        if mode in ("B", "C"):
+            rpg_snap = self._rpg_snapshot(event, mode)
             rpg_snaps = session.setdefault("rpg_snapshots", [])
             rpg_snaps.append({"turn": turn, **rpg_snap})
             # 限制最多保留 50 个快照(每个可能含多角色,避免 KV 膨胀)
