@@ -820,8 +820,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         result = await self._generate(event, session, first_input, mode, imgs)
         yield event.plain_result(result)
 
-    @filter.command("do")
-    async def cmd_continue(self, event: AstrMessageEvent):
+    @filter.command("do", alias={"input", "输入"})
+    async def cmd_input(self, event: AstrMessageEvent):
         """/do <选项/自定义行动/反馈> - 继续推进模拟"""
         action = self._extract_after_cmd(event, "do")
         extractor = QuotedMessageExtractor(event=event)
