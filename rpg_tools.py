@@ -741,6 +741,162 @@ class RPGMixin:
     def _persist(self, uid: str, char: dict) -> None:
         save_char(self.data_dir, uid, char)
 
+    # ─────────────── 数值快照 / 回滚(给 /undo 用) ───────────────
+
+    def _rpg_snapshot(self, event, mode: str) -> dict:
+        """抓取当前 RPG 数值快照(角色存档 + 会话文件),供 /undo 回滚。
+
+        mode A(纯叙事)没有 RPG 状态,直接返回空快照。
+        群聊 scope = `{group_id}_*.json` 全部角色 + 同 group_id 的全部 session。
+        私聊 scope = 当前 sender 的存档 + 该存档引用的 session(避免误删别人的私聊存档)。
+        """
+        if mode not in ("B", "C"):
+            return {"scope": {"group_id": "", "sender_uid": ""}, "chars": {}, "sessions": {}}
+
+        group_id = self._get_group_id(event)
+        sender_uid = self._uid(event)
+        chars: dict[str, dict] = {}
+        session_ids: set[str] = set()
+
+        save_dir = os.path.join(self.data_dir, "rpg_saves")
+        if os.path.exists(save_dir):
+            if group_id:
+                prefix = f"{group_id}_"
+                for fname in os.listdir(save_dir):
+                    if fname.startswith(prefix) and fname.endswith(".json"):
+                        uid = fname[:-5]
+                        char = load_char(self.data_dir, uid)
+                        if char is not None:
+                            chars[uid] = char
+            else:
+                char = load_char(self.data_dir, sender_uid)
+                if char is not None:
+                    chars[sender_uid] = char
+
+        sess_dir = os.path.join(self.data_dir, "sessions")
+        if os.path.exists(sess_dir):
+            if group_id:
+                for fname in os.listdir(sess_dir):
+                    if not fname.endswith(".json"):
+                        continue
+                    sid = fname[:-5]
+                    try:
+                        with open(os.path.join(sess_dir, fname), "r", encoding="utf-8") as f:
+                            s = json.load(f)
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    if s.get("group_id") == group_id:
+                        session_ids.add(sid)
+            else:
+                for char in chars.values():
+                    sid = char.get("session_id")
+                    if sid:
+                        session_ids.add(sid)
+
+        sessions: dict[str, dict] = {}
+        for sid in session_ids:
+            s = load_session(self.data_dir, sid)
+            if s is not None:
+                sessions[sid] = s
+
+        return {
+            "scope": {"group_id": group_id, "sender_uid": sender_uid},
+            "chars": chars,
+            "sessions": sessions,
+        }
+
+    def _rpg_restore(self, snapshot: dict) -> dict:
+        """把 RPG 状态回滚到 snapshot。
+
+        - snapshot 中存在 → 写回磁盘
+        - 当前磁盘上存在但 snapshot 不存在(被回滚期间创建)→ 删除
+        返回 {"restored_chars": int, "restored_sessions": int,
+              "deleted_chars": int, "deleted_sessions": int}。
+        """
+        scope = snapshot.get("scope") or {}
+        group_id = scope.get("group_id", "") or ""
+        sender_uid = scope.get("sender_uid", "") or ""
+        chars_snap: dict = snapshot.get("chars") or {}
+        sessions_snap: dict = snapshot.get("sessions") or {}
+
+        stats = {
+            "restored_chars": 0,
+            "restored_sessions": 0,
+            "deleted_chars": 0,
+            "deleted_sessions": 0,
+        }
+
+        save_dir = os.path.join(self.data_dir, "rpg_saves")
+        os.makedirs(save_dir, exist_ok=True)
+
+        current_uids: set[str] = set()
+        if group_id:
+            prefix = f"{group_id}_"
+            if os.path.exists(save_dir):
+                for fname in os.listdir(save_dir):
+                    if fname.startswith(prefix) and fname.endswith(".json"):
+                        current_uids.add(fname[:-5])
+        else:
+            path = os.path.join(save_dir, f"{sender_uid}.json")
+            if os.path.exists(path):
+                current_uids.add(sender_uid)
+
+        for uid in current_uids:
+            if uid in chars_snap:
+                save_char(self.data_dir, uid, chars_snap[uid])
+                stats["restored_chars"] += 1
+            else:
+                path = os.path.join(save_dir, f"{uid}.json")
+                try:
+                    os.remove(path)
+                    stats["deleted_chars"] += 1
+                except OSError as e:
+                    logger.debug("rpg 回滚删除角色失败 %s: %s", uid, e)
+
+        for uid, char in chars_snap.items():
+            if uid not in current_uids:
+                save_char(self.data_dir, uid, char)
+                stats["restored_chars"] += 1
+
+        sess_dir = os.path.join(self.data_dir, "sessions")
+        os.makedirs(sess_dir, exist_ok=True)
+
+        current_sids: set[str] = set()
+        snap_sids = set(sessions_snap.keys())
+        if os.path.exists(sess_dir):
+            for fname in os.listdir(sess_dir):
+                if not fname.endswith(".json"):
+                    continue
+                sid = fname[:-5]
+                s = load_session(self.data_dir, sid)
+                if s is None:
+                    continue
+                if group_id:
+                    if s.get("group_id") == group_id:
+                        current_sids.add(sid)
+                else:
+                    if (not s.get("group_id")) and sid in snap_sids:
+                        current_sids.add(sid)
+
+        for sid in current_sids:
+            if sid in sessions_snap:
+                save_session(self.data_dir, sid, sessions_snap[sid])
+                stats["restored_sessions"] += 1
+            else:
+                path = os.path.join(sess_dir, f"{sid}.json")
+                try:
+                    os.remove(path)
+                    stats["deleted_sessions"] += 1
+                except OSError as e:
+                    logger.debug("rpg 回滚删除会话失败 %s: %s", sid, e)
+
+        for sid, s in sessions_snap.items():
+            if sid not in current_sids:
+                save_session(self.data_dir, sid, s)
+                stats["restored_sessions"] += 1
+
+        return stats
+
     # ─────────────── 会话管理 ───────────────
 
     @filter.llm_tool(name="rpg_create_session")

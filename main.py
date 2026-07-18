@@ -508,6 +508,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         turn = session.get("lore_turn", 0) + 1
         session["lore_turn"] = turn
         self._snapshot_lore(session, turn)
+        # 同步快照 RPG 数值状态,供 /undo 回滚 HP/EXP/装备/会话等
+        rpg_snap = self._rpg_snapshot(event, mode)
+        if rpg_snap["chars"] or rpg_snap["sessions"]:
+            rpg_snaps = session.setdefault("rpg_snapshots", [])
+            rpg_snaps.append({"turn": turn, **rpg_snap})
+            # 限制最多保留 50 个快照(每个可能含多角色,避免 KV 膨胀)
+            if len(rpg_snaps) > 50:
+                del rpg_snaps[: len(rpg_snaps) - 50]
 
         contexts = bind_checkpoint_messages(messages)
 
@@ -935,7 +943,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
     @filter.command("undo")
     async def cmd_undo(self, event: AstrMessageEvent):
-        """/undo [N] - 撤销最近 N 轮对话(默认 1)。仅清叙事历史,RPG 数值状态不变"""
+        """/undo [N] - 撤销最近 N 轮对话(默认 1)。叙事历史、持久化 lore、RPG 数值(HP/EXP/装备/会话)全部回滚"""
         arg = self._extract_after_cmd(event, "undo").strip()
         n = 1
         if arg:
@@ -971,7 +979,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
         # 回滚持久化 lore:用 turn 计数,不受压缩影响
         current_turn = session.get("lore_turn", 0)
-        target_turn = max(0, current_turn - take)
+        # target_turn = 当前 turn - take + 1 = 第一个被回滚的 turn;
+        # 该 turn 的快照 = "该 turn 尚未执行任何工具调用"的状态,正好是我们要恢复到的状态。
+        # max(1, ...) 防止 target_turn=0 时找不到快照(从 turn=1 开始计数)。
+        target_turn = max(1, current_turn - take + 1)
         snapshots = session.get("lore_snapshots") or []
         target_snapshot = next(
             (s for s in reversed(snapshots) if s["turn"] == target_turn),
@@ -985,6 +996,19 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         # 同时回滚 lore_turn 计数
         session["lore_turn"] = target_turn
         lore_restored = target_snapshot is not None
+
+        # 回滚 RPG 数值状态(HP/EXP/装备/会话/角色档案)
+        rpg_snapshots = session.get("rpg_snapshots") or []
+        target_rpg_snap = next(
+            (s for s in reversed(rpg_snapshots) if s["turn"] == target_turn),
+            None,
+        )
+        rpg_stats = None
+        if target_rpg_snap is not None:
+            rpg_stats = self._rpg_restore(target_rpg_snap)
+        session["rpg_snapshots"] = [
+            s for s in rpg_snapshots if s["turn"] <= target_turn
+        ]
 
         session["messages"] = messages
         await self._save_sim(event, session)
@@ -1018,7 +1042,28 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                     lines.append("   📜 持久化设定也回滚(本次 turn 无 lore 变更)")
             else:
                 lines.append("   📜 持久化设定也回滚")
-        lines.append("⚠️ RPG 数值(HP/EXP/装备)未撤销,需要时用 /删除 整个会话")
+        if rpg_stats is not None:
+            rc = rpg_stats["restored_chars"]
+            rs = rpg_stats["restored_sessions"]
+            dc = rpg_stats["deleted_chars"]
+            ds = rpg_stats["deleted_sessions"]
+            if rc or rs or dc or ds:
+                parts = []
+                if rc:
+                    parts.append(f"恢复角色 ×{rc}")
+                if rs:
+                    parts.append(f"恢复会话 ×{rs}")
+                if dc:
+                    parts.append(f"删除角色 ×{dc}")
+                if ds:
+                    parts.append(f"删除会话 ×{ds}")
+                lines.append(f"   🎮 RPG 数值已回滚:{', '.join(parts)}")
+            else:
+                lines.append("   🎮 RPG 数值已回滚(无变化)")
+        elif session.get("mode") in ("B", "C"):
+            lines.append(
+                "   ⚠️ 未找到该 turn 的 RPG 快照(数值未回滚),用 /删除 重建会话"
+            )
         # 预览被撤销的最后一个 user 输入
         last_user = next(
             (m for m in reversed(removed) if m.get("role") == "user"), None
