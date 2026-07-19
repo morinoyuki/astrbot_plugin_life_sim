@@ -9,6 +9,7 @@
 import asyncio
 import time
 import json
+import re
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -31,7 +32,10 @@ from astrbot.core.utils.quoted_message.extractor import QuotedMessageExtractor
 from astrbot.core.agent.hooks import BaseAgentRunHooks
 from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.config.astrbot_config import AstrBotConfig
+from astrbot.core.provider.func_tool_manager import PY_TO_JSON_TYPE
 from astrbot.core.star.star_tools import StarTools
+
+import docstring_parser
 
 from .dice import DiceMixin
 from .prompts import (
@@ -90,62 +94,52 @@ def _strip_xml_tags(text: str) -> str:
 def _parse_docstring_params(docstring: str) -> dict:
     """从 @filter.llm_tool 风格的 docstring 抽取 parameters schema。
 
+    复用 astrbot.core.star.register.star_handler 的解析思路:
+    - 使用 docstring_parser 解析(正确处理多行参数描述)
+    - 类型映射复用 astrbot.core.provider.func_tool_manager.PY_TO_JSON_TYPE
+
     格式:
         Args:
-            param_name(type): desc
-            optional_param(type): desc (会被当作 optional,因为有 = 默认值或写 "Optional")
+            param_name(type): desc(可换行续写)
+            optional_param(type): desc(可换行续写) (description 含 "Optional"/"optional" → 可选)
 
     返回 OpenAI tool parameters 格式:
         {"type": "object", "properties": {name: {"type": ..., "description": ...}}, "required": [...]}
     """
     if not docstring:
         return {"type": "object", "properties": {}}
-    import re
 
-    properties = {}
-    required = []
-    in_args = False
-    for line in docstring.split("\n"):
-        s = line.strip()
-        if not s:
+    parsed = docstring_parser.parse(docstring)
+    properties: dict = {}
+    required: list[str] = []
+
+    for arg in parsed.params:
+        type_name = (arg.type_name or "").strip()
+        if not type_name:
             continue
-        if s.lower().startswith(("args:", "arguments:")):
-            in_args = True
-            continue
-        if in_args:
-            # 切换到其他段(Returns/Raises 等)
-            if ":" in s and not s.startswith(" "):
-                lower = s.lower()
-                if lower.startswith(
-                    ("returns:", "return:", "raises:", "note:", "notes:", "examples:")
-                ):
-                    in_args = False
-                    continue
-            m = re.match(r"^(\w+)\s*\(([^)]+)\)\s*:?\s*(.*)", s)
-            if m:
-                pname, ptype, pdesc = m.group(1), m.group(2).strip(), m.group(3).strip()
-                tmap = {
-                    "string": "string",
-                    "str": "string",
-                    "int": "number",
-                    "integer": "number",
-                    "float": "number",
-                    "number": "number",
-                    "bool": "boolean",
-                    "boolean": "boolean",
-                    "list": "array",
-                    "array": "array",
-                    "dict": "object",
-                    "object": "object",
-                }
-                ptype_clean = tmap.get(ptype.lower().split("[")[0], "string")
-                properties[pname] = {"type": ptype_clean, "description": pdesc}
-                # 必填判定:行内有 =、default 关键字、或显式 "Optional" → 可选
-                sl = s.lower()
-                has_default = "=" in s or "default" in sl or "optional" in sl
-                if not has_default:
-                    required.append(pname)
-    params = {"type": "object", "properties": properties}
+        # 处理 list[type] / array[type] 这类嵌套
+        sub_type_name = None
+        nested = re.match(r"(\w+)\s*\[\s*(\w+)\s*\]", type_name)
+        if nested:
+            type_name, sub_type_name = nested.group(1), nested.group(2)
+        json_type = PY_TO_JSON_TYPE.get(type_name.lower(), type_name.lower())
+        prop: dict = {
+            "type": json_type,
+            "description": (arg.description or "").strip(),
+        }
+        if sub_type_name:
+            sub_json_type = PY_TO_JSON_TYPE.get(
+                sub_type_name.lower(), sub_type_name.lower()
+            )
+            if json_type == "array":
+                prop["items"] = {"type": sub_json_type}
+        properties[arg.arg_name] = prop
+        # 必填判定:description 含 "optional" / "default" / "=" → 可选
+        desc_lower = (arg.description or "").lower()
+        if "optional" not in desc_lower and "default" not in desc_lower and "=" not in desc_lower:
+            required.append(arg.arg_name)
+
+    params: dict = {"type": "object", "properties": properties}
     if required:
         params["required"] = required
     return params
