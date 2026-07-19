@@ -13,7 +13,16 @@ import json
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star
-from astrbot.core.agent.message import bind_checkpoint_messages
+from astrbot.core.agent.message import (
+    AssistantMessageSegment,
+    ToolCallMessageSegment,
+    UserMessageSegment,
+    TextPart,
+    ImageURLPart,
+    ThinkPart,
+    ToolCall,
+    bind_checkpoint_messages,
+)
 from astrbot.core.agent.tool import ToolSet
 from astrbot.core.message.components import Image
 from astrbot.core.provider.entities import LLMResponse
@@ -174,8 +183,8 @@ class _LifeSimToolHooks(BaseAgentRunHooks[AstrAgentContext]):
     def __init__(self) -> None:
         # tool_call_id → 最终 content(已经包含重复调用提示/超长落盘/follow-up)
         self.results_by_call_id: dict[str, str] = {}
-        # 按出现顺序收集:[(tool_call_id, name, args_dict), ...]
-        self.tool_calls: list[dict] = []
+        # 每一步:{content: [parts...], tool_calls: [{id, name, args}, ...]}
+        self.steps: list[dict] = []
         self._before_count: int = 0
 
     async def on_agent_begin(self, run_context) -> None:
@@ -209,7 +218,19 @@ class _LifeSimToolHooks(BaseAgentRunHooks[AstrAgentContext]):
             args = {}
         return {"id": tid, "name": name, "args": args}
 
+    @staticmethod
+    def _extract_content_parts(content) -> list:
+        """从 AssistantMessageSegment.content(可能 list/str/None)抽取 ContentPart list。"""
+        if content is None:
+            return []
+        if isinstance(content, str):
+            return [TextPart(text=content)] if content else []
+        if isinstance(content, list):
+            return [c for c in content if c is not None]
+        return []
+
     async def on_agent_done(self, run_context, llm_response) -> None:
+
         for msg in run_context.messages[self._before_count :]:
             role = getattr(msg, "role", None)
             if role == "tool":
@@ -218,10 +239,24 @@ class _LifeSimToolHooks(BaseAgentRunHooks[AstrAgentContext]):
                 if call_id and isinstance(content, str) and content:
                     self.results_by_call_id[call_id] = content
             elif role == "assistant":
-                for tc in getattr(msg, "tool_calls", None) or []:
+                tcs = getattr(msg, "tool_calls", None) or []
+                if not tcs:
+                    continue
+                step_calls = []
+                for tc in tcs:
                     data = self._extract_tool_call(tc)
                     if data is not None:
-                        self.tool_calls.append(data)
+                        step_calls.append(data)
+                if not step_calls:
+                    continue
+                self.steps.append(
+                    {
+                        "content": self._extract_content_parts(
+                            getattr(msg, "content", None)
+                        ),
+                        "tool_calls": step_calls,
+                    }
+                )
 
 
 class LifeSimPlugin(DiceMixin, RPGMixin, Star):
@@ -703,16 +738,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
         直接 model_dump(),读取时 bind_checkpoint_messages 自动还原。
         """
-        from astrbot.core.agent.message import (
-            AssistantMessageSegment,
-            ToolCallMessageSegment,
-            UserMessageSegment,
-            TextPart,
-            ImageURLPart,
-            ThinkPart,
-            ToolCall,
-        )
-
         content: list[TextPart | ImageURLPart] = [TextPart(text=user_input)]
 
         if images:
@@ -727,40 +752,45 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
         msgs = [UserMessageSegment(content=content).model_dump()]
 
-        # 从 agent_hooks 取本轮所有 tool_call(覆盖多步调用;LLMResponse 只会保留最后一轮)
-        my_tool_calls: list[ToolCall] = []
-        if tool_hooks is not None:
-            for tc in tool_hooks.tool_calls:
-                if not self._is_my_tool(tc["name"]):
-                    continue
-                try:
-                    args_json = json.dumps(tc["args"], ensure_ascii=False)
-                except Exception:
-                    args_json = "{}"
-                my_tool_calls.append(
-                    ToolCall(
-                        id=tc["id"],
-                        function=ToolCall.FunctionBody(
-                            name=tc["name"], arguments=args_json
-                        ),
+        # 从 agent_hooks 取本轮所有 step(覆盖多步调用;每步的 content 也保留下来)
+        # 每步:AssistantMessageSegment(content + tool_calls) + N 个 ToolCallMessageSegment
+        if tool_hooks is not None and tool_hooks.steps:
+            for step in tool_hooks.steps:
+                step_tool_calls: list[ToolCall] = []
+                for tc in step["tool_calls"]:
+                    if not self._is_my_tool(tc["name"]):
+                        continue
+                    try:
+                        args_json = json.dumps(tc["args"], ensure_ascii=False)
+                    except Exception:
+                        args_json = "{}"
+                    step_tool_calls.append(
+                        ToolCall(
+                            id=tc["id"],
+                            function=ToolCall.FunctionBody(
+                                name=tc["name"], arguments=args_json
+                            ),
+                        )
                     )
-                )
-
-        if my_tool_calls:
-            msgs.append(
-                AssistantMessageSegment(
-                    content=None,
-                    tool_calls=my_tool_calls,
-                ).model_dump()
-            )
-            for tc in my_tool_calls:
-                real_content = tool_hooks.results_by_call_id.get(tc.id)
+                if not step_tool_calls:
+                    continue
+                # content 可以是 [ThinkPart, TextPart] / str / None — 没有就 None
+                step_content = step["content"] or None
                 msgs.append(
-                    ToolCallMessageSegment(
-                        content=real_content,
-                        tool_call_id=tc.id,
+                    AssistantMessageSegment(
+                        content=step_content,
+                        tool_calls=step_tool_calls,
                     ).model_dump()
                 )
+                for tc in step_tool_calls:
+                    # 没拿到结果时用空串兜底(None 会让 ToolCallMessageSegment 校验失败)
+                    real_content = tool_hooks.results_by_call_id.get(tc.id) or ""
+                    msgs.append(
+                        ToolCallMessageSegment(
+                            content=real_content,
+                            tool_call_id=tc.id,
+                        ).model_dump()
+                    )
         if llm_resp.result_chain is not None and llm_resp.result_chain.chain:
             final_content = llm_resp.result_chain.chain
         else:
@@ -1084,6 +1114,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             f"📦 session dump ({'full' if full else 'summary'})"
             f"  key=`{self._sim_session_key(event)}`"
         )
+        if len(text) > 3000:
+            logger.info(text)
+            event.stop_event()
+            return
         # 头部 + 内容,避免太长看不到 key
         yield event.plain_result(f"{header}\n{text}")
 
