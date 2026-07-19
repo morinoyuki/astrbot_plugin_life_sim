@@ -140,7 +140,11 @@ def _parse_tool_from_docstring(docstring: str) -> tuple[str, dict]:
         properties[arg.arg_name] = prop
         # 必填判定:description 含 "optional" / "default" / "=" → 可选
         desc_lower = (arg.description or "").lower()
-        if "optional" not in desc_lower and "default" not in desc_lower and "=" not in desc_lower:
+        if (
+            "optional" not in desc_lower
+            and "default" not in desc_lower
+            and "=" not in desc_lower
+        ):
             required.append(arg.arg_name)
 
     parameters: dict = {"type": "object", "properties": properties}
@@ -377,10 +381,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 continue
             attr = getattr(self, attr_name, None)
             if attr is None or not callable(attr):
-                continue
-            # 已经是 FunctionTool 实例(装饰器有时会这样存)
-            if hasattr(attr, "parameters") and hasattr(attr, "description"):
-                tool_set.add_tool(attr)
                 continue
             # 是 bound method — 自己包成 FunctionTool(补 schema + bound handler)
             doc = getattr(attr, "__doc__", None) or ""
