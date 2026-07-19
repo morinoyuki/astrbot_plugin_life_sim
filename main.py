@@ -1021,7 +1021,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
         lines = [f"📜 转生模拟进度  |  模式: {mode} - {MODE_NAMES[mode]}"]
         if owner:
-            lines.append(f"👤 玩家:{owner}")
+            lines.append(f"👤 创建玩家:{owner}")
         world_disp = world if len(world) <= 120 else world[:120] + "..."
         lines.append(f"🌍 世界:{world_disp}")
         lines.append(f"🔄 已交互:{turn_count} 轮")
