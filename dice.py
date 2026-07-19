@@ -94,7 +94,6 @@ def _roll_dice_expr(expr: str) -> tuple:
 class DiceMixin:
     """骰子工具 mixin。"""
 
-    @filter.llm_tool(name="roll_dice")
     async def roll_dice(
         self, event: AstrMessageEvent, expression: str, label: str = ""
     ) -> str:

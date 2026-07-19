@@ -922,7 +922,6 @@ class RPGMixin:
 
     # ─────────────── 会话管理 ───────────────
 
-    @filter.llm_tool(name="rpg_create_session")
     async def rpg_create_session(
         self,
         event,
@@ -1033,7 +1032,6 @@ class RPGMixin:
         ]
         return "\n".join(lines)
 
-    @filter.llm_tool(name="rpg_join_session")
     async def rpg_join_session(
         self,
         event,
@@ -1163,7 +1161,6 @@ class RPGMixin:
             char[attr] = val
         return char
 
-    @filter.llm_tool(name="rpg_list_sessions")
     async def rpg_list_sessions(self, event) -> str:
         """
         List all active game sessions.
@@ -1192,7 +1189,6 @@ class RPGMixin:
             ]
         return "\n".join(lines)
 
-    @filter.llm_tool(name="rpg_list_members")
     async def rpg_list_members(self, event, session_id: str) -> str:
         """
         List all members in a game session with their class and level info (looked up from character saves).
@@ -1225,7 +1221,6 @@ class RPGMixin:
                 lines.append(f"  · {name} — (存档未找到)")
         return "\n".join(lines)
 
-    @filter.llm_tool(name="rpg_delete_session")
     async def rpg_delete_session(
         self,
         event,
@@ -1268,7 +1263,6 @@ class RPGMixin:
 
     # ─────────────── 角色操作 ───────────────
 
-    @filter.llm_tool(name="rpg_define_class")
     async def rpg_define_class(
         self,
         event,
@@ -1394,8 +1388,6 @@ class RPGMixin:
         ]
         return "\n".join(lines)
 
-    @filter.llm_tool(name="rpg_change_class")
-    @filter.llm_tool(name="rpg_change_class")
     async def rpg_change_class(
         self,
         event,
@@ -1480,7 +1472,6 @@ class RPGMixin:
         mode_str = "(重置模式)" if refund_points else "(叠加模式)"
         return f"🔄 职业变更{mode_str}: {old_class} → {new_class}\n\n{_format_status(char)}"
 
-    @filter.llm_tool(name="rpg_get_status")
     async def rpg_get_status(self, event, target: str) -> str:
         """
         Get the current character's full status sheet including HP, EXP, stats, equipment, skills and buffs/debuffs.
@@ -1494,7 +1485,6 @@ class RPGMixin:
             return err
         return _format_status(char)
 
-    @filter.llm_tool(name="rpg_set_level")
     async def rpg_set_level(self, event, target: str, target_level: int) -> str:
         """
         Directly set the character's level. Stats grow automatically based on the world preset. If the world uses attr_points_per_level, unspent_points is correctly adjusted to match the new level.
@@ -1580,7 +1570,6 @@ class RPGMixin:
             )
         return msg
 
-    @filter.llm_tool(name="rpg_add_exp")
     async def rpg_add_exp(self, event, target: str, exp_amount: int) -> str:
         """
         Add experience points to the character (e.g. from quests, exploration, or story events). Automatically handles level-ups.
@@ -1628,7 +1617,6 @@ class RPGMixin:
         lines.append(_format_status(char))
         return "\n".join(lines)
 
-    @filter.llm_tool(name="rpg_equip_item")
     async def rpg_equip_item(
         self,
         event,
@@ -1749,7 +1737,6 @@ class RPGMixin:
             f"\n   {item['desc']}{effect_info}\n\n{_format_status(char)}"
         )
 
-    @filter.llm_tool(name="rpg_heal")
     async def rpg_heal(self, event, target: str, amount: int) -> str:
         """
         Heal the character's HP.
@@ -1768,7 +1755,6 @@ class RPGMixin:
         healed = char["hp"] - old_hp
         return f"💚 恢复 {healed} HP → {char['hp']}/{char['max_hp']}"
 
-    @filter.llm_tool(name="rpg_take_damage")
     async def rpg_take_damage(
         self,
         event,
@@ -1808,7 +1794,6 @@ class RPGMixin:
             result += "\n💀 你倒下了……"
         return result
 
-    @filter.llm_tool(name="rpg_add_effect")
     async def rpg_add_effect(
         self,
         event,
@@ -1835,7 +1820,6 @@ class RPGMixin:
         label = "减益" if is_debuff else "增益"
         return f"{icon} 获得{label}: {effect_name}"
 
-    @filter.llm_tool(name="rpg_manage_currency")
     async def rpg_manage_currency(
         self,
         event,
@@ -1869,7 +1853,6 @@ class RPGMixin:
         self._persist(uid, char)
         return f"💰 {action} {amount} → 余额: {char['currency']}"
 
-    @filter.llm_tool(name="rpg_set_attribute")
     async def rpg_set_attribute(
         self,
         event,
@@ -1916,7 +1899,6 @@ class RPGMixin:
         self._persist(uid, char)
         return f"📊 {attribute}: {old_val} → {new_val}"
 
-    @filter.llm_tool(name="rpg_allocate_point")
     async def rpg_allocate_point(
         self,
         event,
@@ -1989,7 +1971,6 @@ class RPGMixin:
             else "\n✅ 属性点已全部分配完毕!"
         )
 
-    @filter.llm_tool(name="rpg_manage_inventory")
     async def rpg_manage_inventory(
         self,
         event,
@@ -2032,7 +2013,6 @@ class RPGMixin:
             return f"🎒 背包里没有「{item_name}」"
         return "❌ action 必须是 add / remove / list"
 
-    @filter.llm_tool(name="rpg_reset_character")
     async def rpg_reset_character(self, event, target: str) -> str:
         """
         Delete the current character data and start fresh. Use when starting a new life simulation.
@@ -2048,7 +2028,6 @@ class RPGMixin:
             return "🗑 角色数据已清除,可以重新开始了。"
         return "ℹ️ 没有找到角色数据。"
 
-    @filter.llm_tool(name="rpg_cleanup_old_data")
     async def rpg_cleanup_old_data(self, event, inactive_days: int) -> str:
         """
         Clean up old character save files AND game sessions that haven't been modified in the specified number of days. Deleting a session also removes its member character saves.

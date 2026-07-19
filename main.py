@@ -91,28 +91,32 @@ def _strip_xml_tags(text: str) -> str:
     return cleaned.strip()
 
 
-def _parse_docstring_params(docstring: str) -> dict:
-    """从 @filter.llm_tool 风格的 docstring 抽取 parameters schema。
+def _parse_tool_from_docstring(docstring: str) -> tuple[str, dict]:
+    """从 llm_tool 风格的 docstring 一次解析出 (description, parameters schema)。
 
     复用 astrbot.core.star.register.star_handler 的解析思路:
-    - 使用 docstring_parser 解析(正确处理多行参数描述)
+    - 使用 docstring_parser 解析(正确处理多行描述、含 / 不含空行分隔符)
     - 类型映射复用 astrbot.core.provider.func_tool_manager.PY_TO_JSON_TYPE
 
-    格式:
+    docstring 格式:
+        <description: 多行 summary,可含 bullet 列表,直到 Args:/Returns:/... 之前>
         Args:
             param_name(type): desc(可换行续写)
             optional_param(type): desc(可换行续写) (description 含 "Optional"/"optional" → 可选)
 
-    返回 OpenAI tool parameters 格式:
-        {"type": "object", "properties": {name: {"type": ..., "description": ...}}, "required": [...]}
+    返回:
+        description: 短描述(str,可能含换行)
+        parameters: OpenAI tool parameters 格式
+            {"type": "object", "properties": {name: {"type": ..., "description": ...}}, "required": [...]}
     """
     if not docstring:
-        return {"type": "object", "properties": {}}
+        return "", {"type": "object", "properties": {}}
 
     parsed = docstring_parser.parse(docstring)
+    description = (parsed.description or "").strip()
+
     properties: dict = {}
     required: list[str] = []
-
     for arg in parsed.params:
         type_name = (arg.type_name or "").strip()
         if not type_name:
@@ -139,10 +143,10 @@ def _parse_docstring_params(docstring: str) -> dict:
         if "optional" not in desc_lower and "default" not in desc_lower and "=" not in desc_lower:
             required.append(arg.arg_name)
 
-    params: dict = {"type": "object", "properties": properties}
+    parameters: dict = {"type": "object", "properties": properties}
     if required:
-        params["required"] = required
-    return params
+        parameters["required"] = required
+    return description, parameters
 
 
 async def _extract_image(event: AstrMessageEvent) -> list[Image]:
@@ -380,11 +384,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 continue
             # 是 bound method — 自己包成 FunctionTool(补 schema + bound handler)
             doc = getattr(attr, "__doc__", None) or ""
-            params = _parse_docstring_params(doc)
+            description, parameters = _parse_tool_from_docstring(doc)
             new_tool = FunctionTool(
                 name=attr_name,
-                parameters=params,
-                description=doc.split("\n\n")[0].strip() if doc else "",
+                parameters=parameters,
+                description=description,
                 handler=attr,  # bound method,event 参数不会被当成 self
             )
             tool_set.add_tool(new_tool)
@@ -862,7 +866,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             parts.append("\n".join(lines))
         return "\n\n".join(parts)
 
-    @filter.llm_tool(name="life_sim_save_world_lore")
     async def life_sim_save_world_lore(
         self, event, content: str, section: str = "general"
     ) -> str:
@@ -883,7 +886,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         """
         return await self._save_lore(event, "world_lore", section, content)
 
-    @filter.llm_tool(name="life_sim_save_character_lore")
     async def life_sim_save_character_lore(
         self, event, content: str, section: str = "general"
     ) -> str:
