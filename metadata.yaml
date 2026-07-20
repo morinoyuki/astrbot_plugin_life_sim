@@ -1,6 +1,7 @@
 name: astrbot_plugin_life_sim
 display_name: 转生模拟器
 desc: 在群聊/私聊中模拟转生到任意世界的一生。由凯伊代为叙述,独立上下文避免污染和过长。
-author: yuki
+author: morinoyuki
 version: 1.0.0
 short_desc: 群聊转生人生模拟器
+repo: https://github.com/morinoyuki/astrbot_plugin_life_sim
