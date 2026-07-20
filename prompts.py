@@ -338,8 +338,10 @@ C. 睡觉
 - **世界观相关**:世界规则/政治格局/地理/历史/势力/魔法体系/重要 NPC 设定/其他设定
 
 调工具:
-- 角色 → `life_sim_save_character_lore(content, section)`
+- 角色 → `life_sim_save_character_lore(content, section, character="角色名")`
 - 世界观 → `life_sim_save_world_lore(content, section)`
+
+`character` 默认 `"主角"`,出现重要 NPC 时填 NPC 真名/称号(如 `"反抗军首领"`、`"导师·艾尔登"`),同 `(character, section)` 会被覆盖,不同组合累积。多个角色并行出现时分别调多次。
 
 **section 分类**(同 section 会被覆盖,不同 section 累积):
 - 角色:forms / appearance / personality / skills / relationships / inventory

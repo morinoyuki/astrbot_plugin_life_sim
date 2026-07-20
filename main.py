@@ -270,6 +270,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         self.config = config
         # 每个会话(group/user)一把 asyncio.Lock,防止同一会话并发触发 _generate 造成竞态
         self._sim_locks: dict[str, asyncio.Lock] = {}
+        # 工具调用期间的 lore 暂存:{event_key: {"world_lore": [...], "character_lore": {...}}}
+        # 工具 handler 只写这里,_generate_locked 结束时统一合并到 session 并落库,
+        # 避免工具内 _load_sim 拿到新 dict B 后又被外层旧 dict A 全量覆写。
+        self._pending_lore: dict[str, dict] = {}
 
     # ─── 配置读取助手 ────────────────────────────────────────
 
@@ -329,6 +333,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             await self.delete_kv_data(key)
         except Exception as e:
             logger.warning(f"life-sim: 清除会话失败: {e}")
+
+    def _busy_message(self) -> str:
+        return "⏳ 上一条消息还在处理中,请稍候再试..."
 
     def _extract_after_cmd(self, event: AstrMessageEvent, cmd: str) -> str:
         """提取 cmd 首次出现位置之后的所有内容。
@@ -607,13 +614,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         mode: str,
         imgs: list[Image] | None = None,
     ) -> str:
-        # 同会话并发上锁:避免多次 LLM 调用/快照/save_sim 互相覆盖
-        lock = self._get_sim_lock(self._sim_session_key(event))
-        if lock.locked():
-            return "⏳ 上一条消息还在处理中,请稍候再试..."
-
-        async with lock:
-            return await self._generate_locked(event, session, user_input, mode, imgs)
+        # 锁已上提到各命令入口(cmd_input / cmd_undo / cmd_create / cmd_delete),
+        # 此处仅做透传。调用方需自行保证同 session 互斥。
+        return await self._generate_locked(event, session, user_input, mode, imgs)
 
     async def _generate_locked(
         self,
@@ -626,6 +629,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         provider_id, err = await self._get_provider_id(event, mode)
         if err:
             return err
+
+        # 为本轮开一个 staging 槽位:工具 handler 写到 self._pending_lore[event_key],
+        # 本函数末尾统一合并到 session 并落库(成功路径)。失败路径在 finally 释放。
+        event_key = self._sim_session_key(event)
+        self._pending_lore[event_key] = {}
 
         system_prompt_tpl = SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["A"])
         # 提示词里没显式 [本局世界观] 占位符时,直接把设定拼到 system prompt 顶部
@@ -702,11 +710,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 )
         except Exception as e:
             logger.error(f"life-sim: LLM 调用失败: {e}")
+            self._pending_lore.pop(event_key, None)
             return f"❌ 生成失败:{e}"
 
         # 拿到 final text(用于返回值 + 校验)
         text = (getattr(llm_resp, "completion_text", "") or "").strip()
         if not text:
+            self._pending_lore.pop(event_key, None)
             return "❌ 模型未返回内容,请重试。"
 
         # 把整轮(user + 工具调用 + 最终回应)一次性转成 AstrBot 原生 Message dict 列表
@@ -716,6 +726,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
         messages.extend(new_msgs)
         session["messages"] = messages
+
+        # 把本轮工具暂存的 lore 合并到 session,随消息一起落库。
+        # 这是唯一一次的 _save_sim,工具 handler 内部不再写 KV。
+        staging = self._pending_lore.pop(event_key, {}) or {}
+        for k in ("world_lore", "character_lore"):
+            if k in staging:
+                session[k] = staging[k]
+
         await self._save_sim(event, session)
         return text
 
@@ -812,23 +830,107 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
     # 持久化 lore(角色设定 + 世界观,直到 /删除 或 /创建)
     # ════════════════════════════════════════════════════════════════
 
-    async def _save_lore(self, event, key: str, section: str, content: str) -> str:
-        """保存到 session.world_lore / session.character_lore(同 section 覆盖)。"""
-        session = await self._load_sim(event)
-        if not session:
-            return "❌ 当前没有活动会话,请先 /创建"
-        lore_list = session.get(key) or []
-        lore_list = [e for e in lore_list if e.get("section") != section]
-        lore_list.append(
-            {
-                "section": section,
-                "content": content,
-                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-        )
-        session[key] = lore_list
-        await self._save_sim(event, session)
-        return f"✅ 「{section}」已保存({len(content)}字)"
+    async def _save_lore(
+        self,
+        event,
+        key: str,
+        section: str,
+        content: str,
+        character: str | None = None,
+    ) -> str:
+        """暂存到 self._pending_lore,由 _generate_locked 统一合并落库。
+
+        world_lore:list 结构 [{section, content, updated_at}]
+        character_lore:dict 结构 {角色名: [{section, content, updated_at}]}
+
+        若当前不在 _generate_locked 流程中(无 staging 槽位),回退为立即落库,
+        保证 /admin / 调试等非 tool-loop 路径仍能持久化。
+        """
+        event_key = self._sim_session_key(event)
+        staging = self._pending_lore.get(event_key)
+        if staging is None:
+            # 不在 LLM 流程内 → 立即加载→改→保存
+            session = await self._load_sim(event)
+            if not session:
+                return "❌ 当前没有活动会话,请先 /创建"
+            self._merge_lore_entry(session, key, section, content, character)
+            await self._save_sim(event, session)
+            return self._lore_label(key, section, character) + f"已保存({len(content)}字)"
+
+        # 在 staging 中累积:首次写需要把 KV 现有值作为基线,否则会丢掉之前 turn 的 lore
+        if key not in staging:
+            baseline = await self._load_sim(event)
+            if baseline:
+                existing = baseline.get(key)
+                if key == "character_lore":
+                    staging[key] = self._normalize_character_lore(existing)
+                else:
+                    staging[key] = [dict(e) for e in (existing or [])]
+            else:
+                staging[key] = (
+                    self._normalize_character_lore(None) if key == "character_lore" else []
+                )
+
+        self._merge_lore_entry(staging, key, section, content, character)
+        label = self._lore_label(key, section, character)
+        return f"✅ 「{label}」已暂存({len(content)}字,本轮结束时统一落库)"
+
+    def _merge_lore_entry(
+        self,
+        target: dict,
+        key: str,
+        section: str,
+        content: str,
+        character: str | None,
+    ):
+        """把一条 lore 合并进 target[key](就地修改),不负责落库。"""
+        entry = {
+            "section": section,
+            "content": content,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        if key == "character_lore":
+            char_name = (character or "主角").strip() or "主角"
+            lore_dict = self._normalize_character_lore(target.get("character_lore"))
+            char_list = [e for e in lore_dict.get(char_name, []) if e.get("section") != section]
+            char_list.append(entry)
+            lore_dict[char_name] = char_list
+            target["character_lore"] = lore_dict
+        else:
+            lore_list = [e for e in (target.get(key) or []) if e.get("section") != section]
+            lore_list.append(entry)
+            target[key] = lore_list
+
+    @staticmethod
+    def _lore_label(key: str, section: str, character: str | None) -> str:
+        if key == "character_lore":
+            return f"{(character or '主角').strip() or '主角'} / {section}"
+        return section
+
+    @staticmethod
+    def _normalize_character_lore(raw) -> dict:
+        """把历史 list 结构(单角色)迁移为 dict {角色名: [entries]}。
+
+        旧数据 [{section, content, updated_at}] → {"主角": [...]}
+        已是 dict 原样返回。空 / None 视为 {"主角": {}}。
+        """
+        if raw is None:
+            return {"主角": []}
+        if isinstance(raw, list):
+            if not raw:
+                return {"主角": []}
+            # 兼容:旧条目里若已带 character 字段,按其分组;否则统一归到「主角」。
+            migrated: dict = {}
+            for e in raw:
+                if not isinstance(e, dict):
+                    continue
+                name = (e.get("character") or "主角").strip() or "主角"
+                entry = {k: v for k, v in e.items() if k != "character"}
+                migrated.setdefault(name, []).append(entry)
+            return migrated
+        if isinstance(raw, dict):
+            return raw
+        return {"主角": []}
 
     def _snapshot_lore(self, session: dict, turn: int):
         """在 turn 处快照当前 lore 状态,供 /undo 回滚。
@@ -836,16 +938,18 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         每个 turn 开始时(LLM 调用前)调用一次。/undo 时用 turn 计数回滚,
         比 msg_index 更稳定 — 压缩 / 增删消息不影响 turn 计数。
 
-        深拷贝(每条 entry 复制 dict)避免后续修改 session.lore 影响快照。
+        深拷贝避免后续修改 session.lore 影响快照。
         """
         snapshots = session.setdefault("lore_snapshots", [])
+        char_lore_dict = self._normalize_character_lore(session.get("character_lore"))
+        char_lore_copy = {
+            name: [dict(e) for e in entries] for name, entries in char_lore_dict.items()
+        }
         snapshots.append(
             {
                 "turn": turn,
                 "world_lore": [dict(e) for e in (session.get("world_lore") or [])],
-                "character_lore": [
-                    dict(e) for e in (session.get("character_lore") or [])
-                ],
+                "character_lore": char_lore_copy,
             }
         )
 
@@ -858,11 +962,17 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             for e in world_lore:
                 lines.append(f"### {e['section']}\n{e['content']}")
             parts.append("\n".join(lines))
-        char_lore = session.get("character_lore") or []
-        if char_lore:
+        char_lore_dict = self._normalize_character_lore(session.get("character_lore"))
+        has_any_char = any(char_lore_dict.values())
+        if has_any_char:
             lines = ["## 持久化角色设定(用户在对话中确认过的设定,自动注入每次对话)"]
-            for e in char_lore:
-                lines.append(f"### {e['section']}\n{e['content']}")
+            for char_name in sorted(char_lore_dict.keys()):
+                entries = char_lore_dict[char_name]
+                if not entries:
+                    continue
+                lines.append(f"### {char_name}")
+                for e in entries:
+                    lines.append(f"- **{e['section']}**: {e['content']}")
             parts.append("\n".join(lines))
         return "\n\n".join(parts)
 
@@ -887,10 +997,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         return await self._save_lore(event, "world_lore", section, content)
 
     async def life_sim_save_character_lore(
-        self, event, content: str, section: str = "general"
+        self,
+        event,
+        content: str,
+        section: str = "general",
+        character: str = "主角",
     ) -> str:
         """
-        永久保存角色设定
+        永久保存角色设定(支持多角色,按 character 分组累积)
 
         适用场景:
         - 形态变化(变身 / 进化 / 解锁新形态 / 退化)
@@ -898,14 +1012,18 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         - 性格变化(觉醒 / 黑化 / 成长 / 信念改变)
         - 重要记忆 / 关系变化
         - 习得技能 / 称号 / 职业变更
+        - 重要 NPC 的设定
 
         Args:
             content(string): 角色设定内容(详细描述)
-            section(string): 分类标签,如 "forms"、"appearance"、"personality"、"relationships"、"skills"。默认 "general"。同 section 会被覆盖。
+            section(string): 分类标签,如 "forms"、"appearance"、"personality"、"relationships"、"skills"。默认 "general"。同 character + 同 section 会被覆盖。
+            character(string): 角色名。默认 "主角"。可用 NPC 真名 / 称号区分。
         Returns:
             确认消息。
         """
-        return await self._save_lore(event, "character_lore", section, content)
+        return await self._save_lore(
+            event, "character_lore", section, content, character=character
+        )
 
     # ════════════════════════════════════════════════════════════════
     # 指令
@@ -920,6 +1038,16 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
     @filter.command("创建")
     async def cmd_create(self, event: AstrMessageEvent):
         """/创建 [rpg|dnd] <世界观设定> - 创建转生模拟会话(覆盖已有)"""
+        lock = self._get_sim_lock(self._sim_session_key(event))
+        if lock.locked():
+            yield event.plain_result(self._busy_message())
+            return
+
+        async with lock:
+            async for _ in self._cmd_create_body(event):
+                yield _
+
+    async def _cmd_create_body(self, event: AstrMessageEvent):
         setting = self._extract_after_cmd(event, "创建")
         extractor = QuotedMessageExtractor(event=event)
         quoted = await extractor.text()
@@ -959,10 +1087,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         }
         await self._save_sim(event, session)
 
-        yield event.plain_result(
-            f"🎬 命运开始转动 [模式 {mode} - {MODE_NAMES[mode]}],正在编织你的人生..."
-        )
-
         if mode == "C":
             startup_steps = (
                 "1) 叙事前先调 rpg_create_session,game_system 必须为 dnd5e\n"
@@ -983,9 +1107,12 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
         first_input = (
             f"世界观设定:{setting}\n\n"
-            # "请直接开始(不要再追问细节):\n"
             + startup_steps
             + "最后,这一轮**不要**给出人生总结,故事需要用户多次推进"
+        )
+
+        yield event.plain_result(
+            f"🎬 命运开始转动 [模式 {mode} - {MODE_NAMES[mode]}],正在编织你的人生..."
         )
         result = await self._generate(event, session, first_input, mode, imgs)
         yield event.plain_result(result)
@@ -993,6 +1120,16 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
     @filter.command("do", alias={"input", "输入"})
     async def cmd_input(self, event: AstrMessageEvent):
         """/do <选项/自定义行动/反馈> - 继续推进模拟"""
+        lock = self._get_sim_lock(self._sim_session_key(event))
+        if lock.locked():
+            yield event.plain_result(self._busy_message())
+            return
+
+        async with lock:
+            async for _ in self._cmd_input_body(event):
+                yield _
+
+    async def _cmd_input_body(self, event: AstrMessageEvent):
         action = self._extract_after_cmd(event, "do")
         extractor = QuotedMessageExtractor(event=event)
         quoted = await extractor.text()
@@ -1120,36 +1257,53 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
     @filter.command("删除")
     async def cmd_delete(self, event: AstrMessageEvent):
         """/删除 - 删除当前会话(同时清理对应 RPG 存档)"""
-        session = await self._load_sim(event)
-        if not session:
-            yield event.plain_result("❌ 当前没有进行中的转生模拟。")
+        lock = self._get_sim_lock(self._sim_session_key(event))
+        if lock.locked():
+            yield event.plain_result(self._busy_message())
             return
 
-        group_id = self._get_group_id(event)
-        try:
-            purge = purge_group_rpg_data(self.data_dir, group_id)
-        except Exception as e:
-            logger.debug(f"life-sim: 清理 RPG 存档失败: {e}")
-            purge = {"deleted_chars": 0, "deleted_sessions": []}
+        async with lock:
+            session = await self._load_sim(event)
+            if not session:
+                yield event.plain_result("❌ 当前没有进行中的转生模拟。")
+                return
 
-        await self._clear_sim(event)
-        char_note = (
-            f",{purge['deleted_chars']} 个 RPG 存档" if purge["deleted_chars"] else ""
-        )
-        sess_note = (
-            f",{len(purge['deleted_sessions'])} 个 RPG 会话文件"
-            if purge["deleted_sessions"]
-            else ""
-        )
-        yield event.plain_result(
-            "🗑️ 会话已删除"
-            f"{char_note}{sess_note}。\n"
-            "使用 /创建 <世界观> 可以开始一段新的人生。"
-        )
+            group_id = self._get_group_id(event)
+            try:
+                purge = purge_group_rpg_data(self.data_dir, group_id)
+            except Exception as e:
+                logger.debug(f"life-sim: 清理 RPG 存档失败: {e}")
+                purge = {"deleted_chars": 0, "deleted_sessions": []}
+
+            await self._clear_sim(event)
+            char_note = (
+                f",{purge['deleted_chars']} 个 RPG 存档" if purge["deleted_chars"] else ""
+            )
+            sess_note = (
+                f",{len(purge['deleted_sessions'])} 个 RPG 会话文件"
+                if purge["deleted_sessions"]
+                else ""
+            )
+            yield event.plain_result(
+                "🗑️ 会话已删除"
+                f"{char_note}{sess_note}。\n"
+                "使用 /创建 <世界观> 可以开始一段新的人生。"
+            )
+            return
 
     @filter.command("undo")
     async def cmd_undo(self, event: AstrMessageEvent):
         """/undo [N] - 撤销最近 N 轮对话(默认 1)。叙事历史、持久化 lore、RPG 数值(HP/EXP/装备/会话)全部回滚"""
+        lock = self._get_sim_lock(self._sim_session_key(event))
+        if lock.locked():
+            yield event.plain_result(self._busy_message())
+            return
+
+        async with lock:
+            async for _ in self._cmd_undo_body(event):
+                yield _
+
+    async def _cmd_undo_body(self, event: AstrMessageEvent):
         arg = self._extract_after_cmd(event, "undo").strip()
         n = 1
         if arg:
@@ -1236,13 +1390,15 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             )
             if target_snap is not None:
                 w_n = len(target_snap["world_lore"])
-                c_n = len(target_snap["character_lore"])
+                char_dict = target_snap["character_lore"] or {}
+                c_n = sum(len(v) for v in char_dict.values() if isinstance(v, list))
+                c_chars = sum(1 for v in char_dict.values() if v)
                 if w_n or c_n:
                     parts = []
                     if w_n:
                         parts.append(f"世界观 {w_n} 条")
                     if c_n:
-                        parts.append(f"角色 {c_n} 条")
+                        parts.append(f"角色 {c_n} 条(共 {c_chars} 名)")
                     lines.append(f"   📜 持久化设定回滚:{' + '.join(parts)}")
                 else:
                     lines.append("   📜 持久化设定回滚(本次 turn 无 lore 变更)")
