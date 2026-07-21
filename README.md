@@ -5,10 +5,13 @@
 ## 特性
 
 - **三种模式** — 纯叙事 A / 游戏世界 RPG B / DND 5E 跑团 C,自动按世界观关键词识别或显式指定
-- **独立上下文** — 叙事历史走 KV 存储 + 显式 `contexts` 传入 LLM,不污染主对话
+- **独立上下文** — 叙事历史走文件存储 + 显式 `contexts` 传入 LLM,不污染主对话
 - **LLM 智能压缩** — 超长历史调 LLM 提炼成摘要(失败自动回退规则抽取),不是简单丢消息
 - **LLM 模式识别** — `/创建` 时调 LLM 分析语境判断 A/B/C(失败回退关键词匹配)
 - **完整 RPG/DND 工具链** — 27 个 `rpg_*` 工具(HP/EXP/装备/技能/技能点/物品)+ `roll_dice` 骰子工具(模式 C)
+- **持久化 lore** — 角色设定(支持多角色,按 `character` 分组)+ 世界观设定由 LLM 在对话中自动调用工具落库,后续每轮注入 system prompt
+- **/undo 完整回滚** — 叙事历史 + lore 快照 + RPG 数值(HP/EXP/装备/会话)按 turn 计数一起回滚
+- **每会话互斥锁** — `/创建` `/do` `/undo` `/删除` 各持同 session 的 `asyncio.Lock`,并发命令直接返回"上一条还在处理"
 - **灵活模型路由** — 主 provider / 模式专属 / 压缩 / 模式识别各自分配,可把不同任务路由到不同模型
 - **引用兼容** — 回复消息时自动提取引用内容作为补充背景传入
 - **人生结束标记** — 死亡结局输出 `<LIFE_SIM_END>`,插件自动识别并提示重开
@@ -17,11 +20,11 @@
 
 | 指令                        | 说明                                                                          |
 | --------------------------- | ----------------------------------------------------------------------------- |
-| `/创建 [rpg\|dnd] <世界观>` | 创建会话(覆盖已有)。可加 `rpg` / `dnd` 前缀强制模式,否则自动判断              |
+| `/创建 [rpg\|dnd] <世界观>` | 创建会话(覆盖已有)。可加 `rpg` / `dnd` 前缀强制模式,否则自动判断;会自动清理旧 RPG 存档 |
 | `/do <选项/行动/反馈>`      | 推进剧情。可发选项序号、自定义行动、或对剧情的反馈;引用消息会一并传入         |
 | `/进度`                     | 查看进度:世界/轮数/当前位置(## 标题)/最近一段                                 |
-| `/undo [N]`                 | 撤销最近 N 轮对话(默认 1)。仅清叙事历史;RPG 数值(HP/EXP/装备/持久化 lore)不变 |
-| `/删除`                     | 删除当前会话,同时清理该群的 RPG 存档与会话文件                                |
+| `/undo [N]`                 | 撤销最近 N 轮对话(默认 1)。叙事历史 + 持久化 lore + RPG 数值全部按 turn 回滚  |
+| `/删除`                     | 删除当前会话,同时清理该群/私聊的 RPG 存档与会话文件                          |
 
 **支持群聊和私聊**(私聊可能无 prefix,插件通过 `text.find(cmd)` 自适应)。
 
@@ -76,6 +79,7 @@
 /继续 上一段写得太惨了,重新写  # 反馈修正
 
 /进度                       # 查看进度
+/undo 2                     # 撤销最近 2 轮(含 lore 与 RPG 状态回滚)
 /删除                       # 删档重来
 ```
 
@@ -135,9 +139,10 @@ astrbot_plugin_life_sim/
 ├── README.md             # 本文档
 ├── main.py               # 主入口 - LifeSimPlugin 类
 │                         #   - 4 个指令 + LLM 调度
-│                         #   - 独立 KV 会话
+│                         #   - 文件会话 (SimStore)
 │                         #   - 历史压缩 (LLM + 规则)
 │                         #   - 模式识别 (LLM + 关键词)
+│                         #   - lore 暂存 + 多角色 character_lore
 ├── prompts.py            # 系统提示词 + 模式检测
 │                         #   - COMMON_RULES (三模式共用)
 │                         #   - SYSTEM_PROMPT_A / B / C
@@ -147,17 +152,57 @@ astrbot_plugin_life_sim/
 ├── dice.py               # 骰子工具 (模式 C)
 │                         #   - _roll_dice_expr (NdM, NdMk{h,l}X, +/-)
 │                         #   - DiceMixin.roll_dice (LLM 工具)
-└── rpg_tools.py          # RPG 工具全套(模式 B/C)
-                          #   - 27 个 rpg_* LLM 工具
-                          #   - DEFAULT_WORLD_RULES + 文件存储
-                          #   - RPGMixin 类
+├── rpg_tools.py          # RPG 工具全套(模式 B/C)
+│                         #   - 27 个 rpg_* LLM 工具
+│                         #   - DEFAULT_WORLD_RULES
+│                         #   - RPGMixin 类(标注 self.data_dir / self.rpg_store)
+├── storage_base.py       # JSON 文件存储公共原语
+│                         #   - read_json / write_json_atomic(原子写)
+│                         #   - safe_remove / ensure_dir
+│                         #   - list_json_stems / sanitize_key
+├── storage_sim.py        # SimStore:sim 会话存储
+│                         #   - <data>/sim_sessions/<key>.json
+│                         #   - asyncio.to_thread 包装同步 IO
+└── storage_rpg.py        # RpgStore:RPG 角色 + 会话存储
+                          #   - <data>/rpg_saves/<uid>.json
+                          #   - <data>/sessions/<sid>.json
+                          #   - purge_group(group_id, sender_uid) 群/私聊清理
 ```
 
 ## 关键技术点
 
-### 独立上下文
+### 独立上下文 + 文件存储
 
-叙事历史存在 `data/plugin_data/astrbot_plugin_life_sim/{kv}` 的 KV 存储里,以 `group_{group_id}` 或 `user_{user_id}` 为 key。LLM 调用时通过 `contexts=[...]` 显式传入,完全不走主对话的 `conversation_manager`。
+叙事历史存到 `<data>/sim_sessions/<key>.json`,key 形如 `group_<gid>` / `user_<uid>`。
+文件层不依赖 AstrBot 的 KV(原 KV 实现因并发工具调用存在"工具保存被外层覆写"的竞态,见更新日志 v3.0)。
+LLM 调用时通过 `contexts=[...]` 显式传入,完全不走主对话的 `conversation_manager`。
+
+### 持久化 lore
+
+- `character_lore`:dict 结构 `{角色名: [{section, content, updated_at}]}`,多角色并行支持;
+  旧 list 结构自动迁移到"主角"桶。工具签名:
+  ```
+  life_sim_save_character_lore(content, section, character="主角")
+  ```
+- `world_lore`:list 结构 `[{section, content, updated_at}]`,同 section 覆盖。工具签名:
+  ```
+  life_sim_save_world_lore(content, section)
+  ```
+- 工具调用写入 `self._pending_lore` 实例暂存,**不立即落库**;`_generate_locked` 末尾与消息一起一次性 `_save_sim`,消除"工具内 save vs 外层 save"的竞态。
+- `/undo` 用 turn 计数回滚 lore(每 turn 开始时拍快照),不受消息压缩/增删影响。
+
+### RPG 状态快照与回滚
+
+`_generate_locked` 每个 turn 起始调用 `_rpg_snapshot(event, mode)` 抓 RPG 数据快照:
+
+- 群聊:`{group_id}_*.json` 全部角色 + 同 group_id 的全部 session。
+- 私聊:当前 sender 的存档 + 该存档引用的 session(避免误删别人的私聊存档)。
+
+`/undo` 找到对应 turn 的快照,先写回快照中存在的文件,再删"快照里没有但磁盘上有"的(被回滚期间新建的),统计 `restored_*` / `deleted_*`。
+
+### 并发互斥
+
+每个 session 一把 `asyncio.Lock`,挂在 `self._sim_locks[key]`。`/创建` `/do` `/undo` `/删除` 各自在命令入口取锁;`lock.locked()` 时返回"⏳ 上一条还在处理"提示,不等待。`asyncio.Lock` 不可重入,所以 `_generate` 不再取锁,锁完全在命令层互斥。
 
 ### 历史压缩
 
@@ -182,8 +227,7 @@ astrbot_plugin_life_sim/
 
 ## 注意事项
 
-- **每个群(或私聊)同时只有一段人生** — 新 `/创建` 会覆盖旧的,同时清理该群的 RPG 存档
-- **RPG 数据存储** — `data/plugin_data/astrbot_plugin_life_sim/rpg_saves/` 和 `sessions/`,跟独立 `astrbot_plugin_rpg_calc` 插件共用,工具名相同会冲突,装一个即可
+- **每个群(或私聊)同时只有一段人生** — 新 `/创建` 会覆盖旧的,同时清理该群/私聊的 RPG 存档
 - **依赖**:无第三方依赖,使用 AstrBot 自带能力
 - **最低 AstrBot 版本**: `>=4.5.7`(用到 `llm_generate` 的 `system_prompt` / `contexts` 参数;老版本会自动回退)
 - **上下文窗口**:大部分模型支持 32k-128k,设置 `max_history_chars` 在 30k-100k 之间比较合理
@@ -197,3 +241,11 @@ astrbot_plugin_life_sim/
 - v2.3 — 模式识别改用 LLM(关键词降级为 fallback)
 - v2.4 — 指令前缀不硬编码(text.find 自适应)
 - v2.5 — 禁止 LLM 输出 UI/菜单式提示语
+- v3.0 — **存储重构**:
+  - KV 存储迁出,改为 `storage_sim.py` / `storage_rpg.py` + `storage_base.py` 公共原语层,sim/rpg 各自独立模块
+  - 写盘走 `tmp + os.replace` 原子替换;私聊/非数字平台 group_id 兼容
+  - `/undo` 引入 lore 快照 + RPG 数值快照,按 turn 计数完整回滚
+  - 工具 lore 调用改为 `self._pending_lore` 实例暂存 + 统一落库,修复"工具保存被外层覆写"竞态
+  - 多角色 `character_lore`:`{角色名: [{section,...}]}` 结构,旧 list 自动迁移到"主角"
+  - 每会话一把 `asyncio.Lock`,`/创建` `/do` `/undo` `/删除` 各自在命令入口互斥
+  - 修复 `rpg_set_attribute` 大小写 bypass、`rpg_change_class` respec 重复加点、`rpg_define_class` 非 DND 误判 hit_die、`cmd_dump` 大 payload 静默吞输出 等多项 bug
