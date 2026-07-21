@@ -2,7 +2,7 @@
 
 import random
 import re
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent
 
 
 def _roll_dice_expr(expr: str) -> tuple:

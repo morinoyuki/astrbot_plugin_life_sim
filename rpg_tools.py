@@ -15,8 +15,8 @@ import random
 import re
 import time
 
-from astrbot.api import logger
-from astrbot.api.event import filter
+from .storage_base import safe_remove
+from .storage_rpg import RpgStore
 
 # ════════════════════════════════════════════════════════════════════
 # 1. 配置常量
@@ -142,19 +142,6 @@ def dnd5e_class_hit_die(class_name: str, explicit_hit_die: int | None = None) ->
     return 8
 
 
-def class_record(char: dict, class_name: str | None = None) -> dict:
-    """从 char -> 当前会话 -> 内置表 顺序查找职业记录。
-    返回 {hit_die, primary_ability?, source}。
-    """
-    name = class_name if class_name else char.get("class", "")
-    explicit = char.get("class_hit_die") if class_name is None else None
-    if class_name is None and explicit:
-        return {"hit_die": int(explicit), "source": "char"}
-    hit_die = dnd5e_class_hit_die(name, explicit)
-    record = {"hit_die": hit_die, "source": "builtin"}
-    return record
-
-
 def roll_dnd5e_ability_scores() -> tuple[dict[str, int], dict[str, list[int]]]:
     scores = {}
     rolls_by_ability = {}
@@ -224,122 +211,12 @@ def initialize_dnd5e_character(
 
 
 # ════════════════════════════════════════════════════════════════════
-# 2. 存储层 — 角色存档 + 会话
+# 2. 存储层 — 见 storage_rpg.py
 # ════════════════════════════════════════════════════════════════════
 
 
-def _char_path(data_dir: str, uid: str) -> str:
-    save_dir = os.path.join(data_dir, "rpg_saves")
-    os.makedirs(save_dir, exist_ok=True)
-    return os.path.join(save_dir, f"{uid}.json")
-
-
-def load_char(data_dir: str, uid: str) -> dict | None:
-    """加载角色存档,对旧存档做惰性迁移。"""
-    path = _char_path(data_dir, uid)
-    if not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            char = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning("rpg存档损坏 %s: %s", path, e)
-        return None
-    migrated = False
-    if "world_rules" not in char:
-        char["world_rules"] = {}
-        migrated = True
-    if "world" not in char:
-        char["world"] = "default"
-        migrated = True
-    if migrated:
-        save_char(data_dir, uid, char)  # 失败也无所谓,内存版本已完整
-    return char
-
-
-def save_char(data_dir: str, uid: str, char: dict) -> None:
-    path = _char_path(data_dir, uid)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(char, f, ensure_ascii=False, indent=2)
-
-
-def _session_path(data_dir: str, session_id: str) -> str:
-    d = os.path.join(data_dir, "sessions")
-    os.makedirs(d, exist_ok=True)
-    return os.path.join(d, f"{session_id}.json")
-
-
-def purge_group_rpg_data(data_dir: str, group_id: str) -> dict:
-    """删除指定群的所有 RPG 角色存档 + 该群的全部 RPG 会话文件。
-
-    供 /创建(覆盖旧会话)与 /删除(主动清理)共用。
-    返回 {"deleted_chars": int, "deleted_sessions": [session_id, ...]}。
-    group_id 为空字符串时直接返回空统计(私聊无群维度)。
-    """
-    result = {"deleted_chars": 0, "deleted_sessions": []}
-    if not group_id:
-        return result
-
-    # 1) 删除该群的所有 RPG 角色存档(按 {group_id}_ 前缀,跨 sender 清理)
-    save_dir = os.path.join(data_dir, "rpg_saves")
-    if os.path.exists(save_dir):
-        prefix = f"{group_id}_"
-        for fname in list(os.listdir(save_dir)):
-            if fname.startswith(prefix) and fname.endswith(".json"):
-                try:
-                    os.remove(os.path.join(save_dir, fname))
-                    result["deleted_chars"] += 1
-                except OSError as e:
-                    logger.warning("rpg存档删除失败 %s: %s", fname, e)
-
-    # 2) 删除该群的所有 RPG 会话文件 + 它们的成员角色存档(防御性)
-    sess_dir = os.path.join(data_dir, "sessions")
-    if os.path.exists(sess_dir):
-        for fname in list(os.listdir(sess_dir)):
-            if not fname.endswith(".json"):
-                continue
-            fpath = os.path.join(sess_dir, fname)
-            try:
-                with open(fpath, "r", encoding="utf-8") as f:
-                    s = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                continue
-            if s.get("group_id") != group_id:
-                continue
-            for member_name in s.get("members", []):
-                save = _char_path(data_dir, f"{group_id}_{member_name}")
-                if os.path.exists(save):
-                    try:
-                        os.remove(save)
-                    except OSError:
-                        pass
-            try:
-                os.remove(fpath)
-                result["deleted_sessions"].append(s.get("session_id", fname[:-5]))
-            except OSError as e:
-                logger.warning("rpg会话删除失败 %s: %s", fpath, e)
-
-    return result
-
-
-def load_session(data_dir: str, session_id: str) -> dict | None:
-    p = _session_path(data_dir, session_id)
-    if not os.path.exists(p):
-        return None
-    try:
-        with open(p, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        logger.warning("rpg会话损坏 %s: %s", p, e)
-        return None
-
-
-def save_session(data_dir: str, session_id: str, data: dict) -> None:
-    p = _session_path(data_dir, session_id)
-    with open(p, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-
-
+# ════════════════════════════════════════════════════════════════════
+# 3. 数值层 — 升级 / 经验 / 属性点
 # ════════════════════════════════════════════════════════════════════
 # 3. 数值层 — 升级 / 经验 / 属性点
 # ════════════════════════════════════════════════════════════════════
@@ -682,7 +559,19 @@ def _format_status(char: dict) -> str:
 
 
 class RPGMixin:
-    """RPG 工具 mixin。需要主插件在 __init__ 里设置 self.data_dir = StarTools.get_data_dir()。"""
+    """RPG 工具 mixin。需要主插件在 __init__ 里设置:
+
+        self.data_dir  = StarTools.get_data_dir()
+        self.rpg_store = RpgStore(self.data_dir)
+
+    一切 RPG 读写都走 `self.rpg_store`,不直接拼路径。
+
+    实例属性仅作类型标注,运行时由宿主在 __init__ 里赋值;
+    `TYPE_CHECKING` 守卫避免运行时导入 `storage_rpg` 形成循环。
+    """
+
+    data_dir: str
+    rpg_store: RpgStore
 
     # ─────────────── 私有助手 ───────────────
 
@@ -698,7 +587,7 @@ class RPGMixin:
                 event.message_obj, "group_id"
             ):
                 gid = str(event.message_obj.group_id or "")
-            return gid if gid.isdigit() else ""
+            return gid.strip()
         except Exception:
             return ""
 
@@ -709,18 +598,19 @@ class RPGMixin:
         """把 LLM 传入的「角色名」解析成存档 uid。"""
         sender_uid = self._uid(event)
         group_id = self._get_group_id(event)
+        store = self.rpg_store
         candidates = []
         if group_id:
             candidates.append(self._make_char_uid(group_id, target, sender_uid))
         candidates.append(target)
         for c in candidates:
-            if load_char(self.data_dir, c):
+            if store.load_char(c):
                 return c
         # 退回到当前用户的会话上下文
-        char = load_char(self.data_dir, sender_uid)
+        char = store.load_char(sender_uid)
         session_id = char.get("session_id", "") if char else ""
         if session_id:
-            session = load_session(self.data_dir, session_id)
+            session = store.load_session(session_id)
             if session and target in session.get("members", []):
                 return self._make_char_uid(group_id, target, sender_uid)
         return candidates[0]
@@ -733,13 +623,13 @@ class RPGMixin:
     ) -> tuple[str | None, dict | None, str | None]:
         """统一处理「解析 uid → 读存档」,失败直接返回错误消息。"""
         uid = self._resolve_uid(event, target)
-        char = load_char(self.data_dir, uid)
+        char = self.rpg_store.load_char(uid)
         if not char:
             return uid, None, "❌ 还没有角色,请先用 rpg_join_session 创建。"
         return uid, char, None
 
     def _persist(self, uid: str, char: dict) -> None:
-        save_char(self.data_dir, uid, char)
+        self.rpg_store.save_char(uid, char)
 
     # ─────────────── 数值快照 / 回滚(给 /undo 用) ───────────────
 
@@ -753,49 +643,40 @@ class RPGMixin:
         if mode not in ("B", "C"):
             return {"scope": {"group_id": "", "sender_uid": ""}, "chars": {}, "sessions": {}}
 
+        store = self.rpg_store
         group_id = self._get_group_id(event)
         sender_uid = self._uid(event)
         chars: dict[str, dict] = {}
         session_ids: set[str] = set()
 
-        save_dir = os.path.join(self.data_dir, "rpg_saves")
-        if os.path.exists(save_dir):
-            if group_id:
-                prefix = f"{group_id}_"
-                for fname in os.listdir(save_dir):
-                    if fname.startswith(prefix) and fname.endswith(".json"):
-                        uid = fname[:-5]
-                        char = load_char(self.data_dir, uid)
-                        if char is not None:
-                            chars[uid] = char
-            else:
-                char = load_char(self.data_dir, sender_uid)
-                if char is not None:
-                    chars[sender_uid] = char
+        if group_id:
+            prefix = f"{group_id}_"
+            for uid in store.list_chars():
+                if uid.startswith(prefix):
+                    char = store.load_char(uid)
+                    if char is not None:
+                        chars[uid] = char
+        else:
+            char = store.load_char(sender_uid)
+            if char is not None:
+                chars[sender_uid] = char
 
-        sess_dir = os.path.join(self.data_dir, "sessions")
-        if os.path.exists(sess_dir):
-            if group_id:
-                for fname in os.listdir(sess_dir):
-                    if not fname.endswith(".json"):
-                        continue
-                    sid = fname[:-5]
-                    try:
-                        with open(os.path.join(sess_dir, fname), "r", encoding="utf-8") as f:
-                            s = json.load(f)
-                    except (OSError, json.JSONDecodeError):
-                        continue
-                    if s.get("group_id") == group_id:
-                        session_ids.add(sid)
-            else:
-                for char in chars.values():
-                    sid = char.get("session_id")
-                    if sid:
-                        session_ids.add(sid)
+        if group_id:
+            for sid in store.list_sessions():
+                s = store.load_session(sid)
+                if s is None:
+                    continue
+                if s.get("group_id") == group_id:
+                    session_ids.add(sid)
+        else:
+            for char in chars.values():
+                sid = char.get("session_id")
+                if sid:
+                    session_ids.add(sid)
 
         sessions: dict[str, dict] = {}
         for sid in session_ids:
-            s = load_session(self.data_dir, sid)
+            s = store.load_session(sid)
             if s is not None:
                 sessions[sid] = s
 
@@ -813,6 +694,7 @@ class RPGMixin:
         返回 {"restored_chars": int, "restored_sessions": int,
               "deleted_chars": int, "deleted_sessions": int}。
         """
+        store = self.rpg_store
         scope = snapshot.get("scope") or {}
         group_id = scope.get("group_id", "") or ""
         sender_uid = scope.get("sender_uid", "") or ""
@@ -826,23 +708,16 @@ class RPGMixin:
             "deleted_sessions": 0,
         }
 
-        save_dir = os.path.join(self.data_dir, "rpg_saves")
-        os.makedirs(save_dir, exist_ok=True)
-        sess_dir = os.path.join(self.data_dir, "sessions")
-        os.makedirs(sess_dir, exist_ok=True)
-
         # ── 阶段 1:只读分析(必须在任何写盘/删除之前完成) ──
         # 字符当前集合
         current_uids: set[str] = set()
         if group_id:
             prefix = f"{group_id}_"
-            if os.path.exists(save_dir):
-                for fname in os.listdir(save_dir):
-                    if fname.startswith(prefix) and fname.endswith(".json"):
-                        current_uids.add(fname[:-5])
+            for uid in store.list_chars():
+                if uid.startswith(prefix):
+                    current_uids.add(uid)
         else:
-            path = os.path.join(save_dir, f"{sender_uid}.json")
-            if os.path.exists(path):
+            if store.load_char(sender_uid) is not None:
                 current_uids.add(sender_uid)
 
         # 私聊 scope:回滚后存活的字符(chars_snap)所引用的 session 也算 in-scope,
@@ -857,7 +732,7 @@ class RPGMixin:
             if sid:
                 referenced_sids.add(sid)
         for uid in current_uids:
-            cur_char = load_char(self.data_dir, uid)
+            cur_char = store.load_char(uid)
             if cur_char:
                 sid = cur_char.get("session_id")
                 if sid:
@@ -866,56 +741,44 @@ class RPGMixin:
         # 会话当前集合 + in-scope 判定
         current_sids: set[str] = set()
         snap_sids = set(sessions_snap.keys())
-        if os.path.exists(sess_dir):
-            for fname in os.listdir(sess_dir):
-                if not fname.endswith(".json"):
-                    continue
-                sid = fname[:-5]
-                s = load_session(self.data_dir, sid)
-                if s is None:
-                    continue
-                if group_id:
-                    if s.get("group_id") == group_id:
-                        current_sids.add(sid)
-                else:
-                    if not s.get("group_id") and (
-                        sid in snap_sids or sid in referenced_sids
-                    ):
-                        current_sids.add(sid)
+        for sid in store.list_sessions():
+            s = store.load_session(sid)
+            if s is None:
+                continue
+            if group_id:
+                if s.get("group_id") == group_id:
+                    current_sids.add(sid)
+            else:
+                if not s.get("group_id") and (
+                    sid in snap_sids or sid in referenced_sids
+                ):
+                    current_sids.add(sid)
 
         # ── 阶段 2:写盘(分析已结束,可以安全增删) ──
         for uid in current_uids:
             if uid in chars_snap:
-                save_char(self.data_dir, uid, chars_snap[uid])
+                store.save_char(uid, chars_snap[uid])
                 stats["restored_chars"] += 1
             else:
-                path = os.path.join(save_dir, f"{uid}.json")
-                try:
-                    os.remove(path)
+                if store.delete_char(uid):
                     stats["deleted_chars"] += 1
-                except OSError as e:
-                    logger.debug("rpg 回滚删除角色失败 %s: %s", uid, e)
 
         for uid, char in chars_snap.items():
             if uid not in current_uids:
-                save_char(self.data_dir, uid, char)
+                store.save_char(uid, char)
                 stats["restored_chars"] += 1
 
         for sid in current_sids:
             if sid in sessions_snap:
-                save_session(self.data_dir, sid, sessions_snap[sid])
+                store.save_session(sid, sessions_snap[sid])
                 stats["restored_sessions"] += 1
             else:
-                path = os.path.join(sess_dir, f"{sid}.json")
-                try:
-                    os.remove(path)
+                if store.delete_session(sid):
                     stats["deleted_sessions"] += 1
-                except OSError as e:
-                    logger.debug("rpg 回滚删除会话失败 %s: %s", sid, e)
 
         for sid, s in sessions_snap.items():
             if sid not in current_sids:
-                save_session(self.data_dir, sid, s)
+                store.save_session(sid, s)
                 stats["restored_sessions"] += 1
 
         return stats
@@ -943,6 +806,7 @@ class RPGMixin:
             Session ID and config summary.
         """
         group_id = self._get_group_id(event)
+        sender_uid = self._uid(event)
         overwritten = False
         old_session_name = ""
         game_system = (game_system or "").strip().lower()
@@ -956,9 +820,9 @@ class RPGMixin:
         if game_system not in ("", "dnd5e"):
             return "❌ game_system 仅支持空值或 dnd5e。"
 
-        # 群聊清理旧会话及其角色
+        # 群聊清理旧会话及其角色(私聊无需清理:自身一次性资源)
         if group_id:
-            purge = purge_group_rpg_data(self.data_dir, group_id)
+            purge = self.rpg_store.purge_group(group_id, sender_uid)
             overwritten = bool(purge["deleted_chars"] or purge["deleted_sessions"])
             if purge["deleted_sessions"]:
                 old_session_name = purge["deleted_sessions"][0]
@@ -1004,8 +868,9 @@ class RPGMixin:
             "members": [],
             "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "group_id": group_id,
+            "owner_uid": sender_uid,
         }
-        save_session(self.data_dir, session_id, session)
+        self.rpg_store.save_session(session_id, session)
 
         lines = []
         if overwritten:
@@ -1054,7 +919,7 @@ class RPGMixin:
         group_id = self._get_group_id(event)
         uid = self._make_char_uid(group_id, name, sender_uid)
 
-        session = load_session(self.data_dir, session_id)
+        session = self.rpg_store.load_session(session_id)
         if not session:
             return f"❌ 会话 {session_id} 不存在。"
 
@@ -1100,7 +965,7 @@ class RPGMixin:
 
         if name not in session["members"]:
             session["members"].append(name)
-        save_session(self.data_dir, session_id, session)
+        self.rpg_store.save_session(session_id, session)
         self._persist(uid, char)
         save_info = f" (存档ID: {uid})" if group_id else ""
         lines = [f"✅ {name} 加入会话「{session_id}」{save_info}"]
@@ -1167,19 +1032,15 @@ class RPGMixin:
         Returns:
             List of sessions with their configs and member counts.
         """
-        sd = os.path.join(self.data_dir, "sessions")
-        if not os.path.exists(sd):
-            return "暂无会话。用 rpg_create_session 创建一个吧。"
-        files = [f for f in os.listdir(sd) if f.endswith(".json")]
-        if not files:
+        store = self.rpg_store
+        sids = store.list_sessions()
+        if not sids:
             return "暂无会话。用 rpg_create_session 创建一个吧。"
 
         lines = ["📋 活跃会话:"]
-        for fname in sorted(files):
-            try:
-                with open(os.path.join(sd, fname), "r", encoding="utf-8") as fh:
-                    s = json.load(fh)
-            except (json.JSONDecodeError, OSError):
+        for sid in sorted(sids):
+            s = store.load_session(sid)
+            if s is None:
                 continue
             members = ", ".join(s.get("members", [])) or "无"
             lines += [
@@ -1197,7 +1058,7 @@ class RPGMixin:
         Returns:
             List of members with their character info.
         """
-        session = load_session(self.data_dir, session_id)
+        session = self.rpg_store.load_session(session_id)
         if not session:
             return f"❌ 会话 {session_id} 不存在。"
         members = session.get("members", [])
@@ -1211,7 +1072,7 @@ class RPGMixin:
         ]
         for name in members:
             uid = self._make_char_uid(group_id, name, self._uid(event))
-            char = load_char(self.data_dir, uid)
+            char = self.rpg_store.load_char(uid)
             if char:
                 lines.append(
                     f"  · {name} — {char.get('class', '无')} Lv.{char.get('level', 1)}"
@@ -1233,7 +1094,7 @@ class RPGMixin:
         Returns:
             Deletion confirmation with details.
         """
-        session = load_session(self.data_dir, session_id)
+        session = self.rpg_store.load_session(session_id)
         if not session:
             return f"❌ 会话 {session_id} 不存在。"
         members = session.get("members")
@@ -1242,16 +1103,11 @@ class RPGMixin:
         if members:
             group_id = self._get_group_id(event)
             for m in members:
-                path = _char_path(
-                    self.data_dir, self._make_char_uid(group_id, m, self._uid(event))
-                )
-                if os.path.exists(path):
-                    os.remove(path)
+                member_uid = self._make_char_uid(group_id, m, self._uid(event))
+                if self.rpg_store.delete_char(member_uid):
                     deleted_chars.append(m)
 
-        p = _session_path(self.data_dir, session_id)
-        if os.path.exists(p):
-            os.remove(p)
+        self.rpg_store.delete_session(session_id)
 
         lines = [f"🗑 会话 ({session_id}) 已删除"]
         if deleted_chars:
@@ -1294,7 +1150,7 @@ class RPGMixin:
         session_id = char.get("session_id", "")
         if not session_id:
             return "❌ 角色未加入会话,无法定义职业。"
-        session = load_session(self.data_dir, session_id)
+        session = self.rpg_store.load_session(session_id)
         if not session:
             return f"❌ 会话 {session_id} 不存在。"
 
@@ -1311,17 +1167,18 @@ class RPGMixin:
             except (json.JSONDecodeError, TypeError):
                 return '❌ custom_bonuses 必须是 JSON 对象(如 {"hp":15,"atk":3})。'
 
-        hit_die_value = None
-        if hit_die and hit_die.strip():
-            m = re.match(r"^\s*d\s*([0-9]+)\s*$", hit_die.strip(), re.IGNORECASE)
-            if m:
-                hit_die_value = max(6, min(12, int(m.group(1))))
-            else:
-                return "❌ hit_die 必须是 d6 / d8 / d10 / d12 之一。"
-
         game_system = char.get("game_system", "")
-        if game_system == "dnd5e" and hit_die_value is None:
-            hit_die_value = 8
+        hit_die_value = None
+        # 仅 DND 5E 会话校验 hit_die 格式;非 DND 透传忽略
+        if game_system == "dnd5e":
+            if hit_die and hit_die.strip():
+                m = re.match(r"^\s*d\s*([0-9]+)\s*$", hit_die.strip(), re.IGNORECASE)
+                if m:
+                    hit_die_value = max(6, min(12, int(m.group(1))))
+                else:
+                    return "❌ hit_die 必须是 d6 / d8 / d10 / d12 之一。"
+            else:
+                hit_die_value = 8  # DND 默认 d8
 
         world_rules = session.get("world_rules", {}) or {}
         classes = world_rules.get("classes") or {}
@@ -1339,14 +1196,14 @@ class RPGMixin:
         classes[class_name] = record
         world_rules["classes"] = classes
         session["world_rules"] = world_rules
-        save_session(self.data_dir, session_id, session)
+        self.rpg_store.save_session(session_id, session)
 
         group_id = self._get_group_id(event)
         sender_uid = self._uid(event)
         propagated = []
         for member_name in session.get("members", []):
             m_uid = self._make_char_uid(group_id, member_name, sender_uid)
-            m_char = load_char(self.data_dir, m_uid)
+            m_char = self.rpg_store.load_char(m_uid)
             if not m_char:
                 continue
             m_rules = m_char.get("world_rules") or {}
@@ -1360,7 +1217,7 @@ class RPGMixin:
                 m_char["class_hit_die"] = (
                     hit_die_value if hit_die_value else m_char.get("class_hit_die")
                 )
-            save_char(self.data_dir, m_uid, m_char)
+            self.rpg_store.save_char(m_uid, m_char)
             propagated.append(member_name)
 
         lines = [
@@ -1447,7 +1304,9 @@ class RPGMixin:
             attr_pts_raw = char.get(
                 "attr_points_per_level", preset.get("attr_points_per_level", 0)
             )
-            char["unspent_points"] = char.get("unspent_points", 0) + int(
+            # respec:把所有本应通过升级获得的属性点全部退还为未分配点。
+            # 用 = 而非 += 是关键,避免旧的未分配点叠加导致重复计数。
+            char["unspent_points"] = int(
                 (char["level"] - 1) * avg_points(attr_pts_raw)
             )
             for attr in old_cb.get("custom", {}):
@@ -1879,12 +1738,14 @@ class RPGMixin:
             normalized_attribute = normalized_attribute[5:]
         elif normalized_attribute.startswith("ALLOC_"):
             normalized_attribute = normalized_attribute[6:]
+        # 始终用规范化后的 key 读写 — 避免 LLM 传 "base_STR" 时绕过 DND 保护
+        attr_key = normalized_attribute
         if (
             char.get("game_system") == "dnd5e"
-            and normalized_attribute in DND5E_ABILITIES
+            and attr_key in DND5E_ABILITIES
         ):
             return "❌ DND 5E 六维属性不能直接修改,请使用 rpg_allocate_point 分配已获得的 ASI。"
-        old_val = char.get(attribute, 0)
+        old_val = char.get(attr_key, 0)
         if mode == "add":
             new_val = old_val + value
         elif mode == "set":
@@ -1893,11 +1754,11 @@ class RPGMixin:
             new_val = min(old_val, value)
         else:
             return "❌ mode 必须是 add / set / max"
-        char[attribute] = new_val
-        if attribute == "hp" and "max_hp" in char:
+        char[attr_key] = new_val
+        if attr_key == "hp" and "max_hp" in char:
             char["hp"] = min(char["hp"], char["max_hp"])
         self._persist(uid, char)
-        return f"📊 {attribute}: {old_val} → {new_val}"
+        return f"📊 {attr_key}: {old_val} → {new_val}"
 
     async def rpg_allocate_point(
         self,
@@ -2022,9 +1883,7 @@ class RPGMixin:
             Confirmation that the character has been reset.
         """
         uid = self._resolve_uid(event, target)
-        path = _char_path(self.data_dir, uid)
-        if os.path.exists(path):
-            os.remove(path)
+        if self.rpg_store.delete_char(uid):
             return "🗑 角色数据已清除,可以重新开始了。"
         return "ℹ️ 没有找到角色数据。"
 
@@ -2036,12 +1895,13 @@ class RPGMixin:
         Returns:
             Summary of deleted files and sessions.
         """
+        store = self.rpg_store
         inactive_days = max(7, inactive_days)
         cutoff = time.time() - inactive_days * 86400
 
         # 过期会话 → 连带删除成员角色
-        sess_dir = os.path.join(self.data_dir, "sessions")
         deleted_sessions: list[str] = []
+        sess_dir = store.sessions_dir
         if os.path.exists(sess_dir):
             for fname in os.listdir(sess_dir):
                 if not fname.endswith(".json"):
@@ -2050,31 +1910,29 @@ class RPGMixin:
                 if os.path.getmtime(fpath) >= cutoff:
                     continue
                 session_id = fname[:-5]
-                session = load_session(self.data_dir, session_id)
+                session = store.load_session(session_id)
                 if session:
                     group_id = self._get_group_id(event)
                     for name in session.get("members", []):
-                        save = _char_path(
-                            self.data_dir,
-                            self._make_char_uid(group_id, name, self._uid(event)),
+                        member_uid = self._make_char_uid(
+                            group_id, name, self._uid(event)
                         )
-                        if os.path.exists(save):
-                            os.remove(save)
-                os.remove(fpath)
+                        store.delete_char(member_uid)
+                store.delete_session(session_id)
                 deleted_sessions.append(session_id)
 
         # 过期存档
-        save_dir = os.path.join(self.data_dir, "rpg_saves")
         deleted_saves: list[str] = []
         kept = 0
-        if os.path.exists(save_dir):
-            for fname in os.listdir(save_dir):
+        chars_dir = store.chars_dir
+        if os.path.exists(chars_dir):
+            for fname in os.listdir(chars_dir):
                 if not fname.endswith(".json"):
                     continue
-                fpath = os.path.join(save_dir, fname)
+                fpath = os.path.join(chars_dir, fname)
                 if os.path.getmtime(fpath) < cutoff:
-                    os.remove(fpath)
-                    deleted_saves.append(fname[:-5])
+                    if safe_remove(fpath):
+                        deleted_saves.append(fname[:-5])
                 else:
                     kept += 1
 

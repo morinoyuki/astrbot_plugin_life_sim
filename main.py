@@ -46,7 +46,9 @@ from .prompts import (
     _keyword_detect_mode,
     _parse_mode_prefix,
 )
-from .rpg_tools import RPGMixin, purge_group_rpg_data
+from .rpg_tools import RPGMixin
+from .storage_rpg import RpgStore
+from .storage_sim import SimStore
 
 
 def _content_to_text(content) -> str:
@@ -77,8 +79,6 @@ def _strip_xml_tags(text: str) -> str:
     用于 /undo 预览时去掉 <system_reminder>、<Quoted Message>、<environment_details>
     等噪声。
     """
-    import re
-
     cleaned = re.sub(
         r"<[A-Za-z_][\w\- ]*?>([\s\S]*?)</[A-Za-z_][\w\- ]*?>",
         "",
@@ -265,7 +265,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.data_dir = StarTools.get_data_dir()
-        self.kv_prefix = "life_sim_v1_"
+        # 文件存储实例(sim 会话 + RPG 数据,各自独立模块)
+        self.sim_store = SimStore(self.data_dir)
+        self.rpg_store = RpgStore(self.data_dir)
         # AstrBot 在配置存在时传入,缺失时为 None
         self.config = config
         # 每个会话(group/user)一把 asyncio.Lock,防止同一会话并发触发 _generate 造成竞态
@@ -288,14 +290,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             return default
 
     # ════════════════════════════════════════════════════════════════
-    # 转生模拟:独立 KV 会话(叙事历史)
+    # 转生模拟:独立文件会话(叙事历史)
     # ════════════════════════════════════════════════════════════════
 
     def _sim_session_key(self, event: AstrMessageEvent) -> str:
         gid = event.message_obj.group_id
         if gid:
-            return f"{self.kv_prefix}group_{gid}"
-        return f"{self.kv_prefix}user_{event.get_sender_id()}"
+            return f"group_{gid}"
+        return f"user_{event.get_sender_id()}"
 
     def _get_sim_lock(self, key: str) -> asyncio.Lock:
         """每个会话一把锁(惰性创建)。同一 key 上的并发命令直接返回处理中提示。"""
@@ -306,33 +308,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         return lock
 
     async def _load_sim(self, event: AstrMessageEvent):
-        key = self._sim_session_key(event)
-        data = await self.get_kv_data(key, None)
-        if data is None:
-            return None
-        if isinstance(data, dict):
-            return data
-        if isinstance(data, str):
-            try:
-                return json.loads(data)
-            except Exception:
-                return None
-        return None
+        return await self.sim_store.load(self._sim_session_key(event))
 
     async def _save_sim(self, event: AstrMessageEvent, session: dict):
-        key = self._sim_session_key(event)
-        logger.debug(f"life-sim: 保存会话到 KV({key}),消息={session}")
-        try:
-            await self.put_kv_data(key, session)
-        except Exception:
-            await self.put_kv_data(key, json.dumps(session, ensure_ascii=False))
+        await self.sim_store.save(self._sim_session_key(event), session)
 
     async def _clear_sim(self, event: AstrMessageEvent):
-        key = self._sim_session_key(event)
-        try:
-            await self.delete_kv_data(key)
-        except Exception as e:
-            logger.warning(f"life-sim: 清除会话失败: {e}")
+        await self.sim_store.delete(self._sim_session_key(event))
 
     def _busy_message(self) -> str:
         return "⏳ 上一条消息还在处理中,请稍候再试..."
@@ -1249,6 +1231,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         )
         if len(text) > 3000:
             logger.info(text)
+            yield event.plain_result(
+                f"{header}\n(内容过长,{len(text)} 字符,完整 dump 已写入日志)"
+            )
             event.stop_event()
             return
         # 头部 + 内容,避免太长看不到 key
@@ -1269,8 +1254,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 return
 
             group_id = self._get_group_id(event)
+            sender_uid = str(event.get_sender_id() or "")
             try:
-                purge = purge_group_rpg_data(self.data_dir, group_id)
+                purge = self.rpg_store.purge_group(group_id, sender_uid)
             except Exception as e:
                 logger.debug(f"life-sim: 清理 RPG 存档失败: {e}")
                 purge = {"deleted_chars": 0, "deleted_sessions": []}
