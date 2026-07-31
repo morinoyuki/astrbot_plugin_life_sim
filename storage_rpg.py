@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import os
 
+from astrbot.api import logger
+
 from .storage_base import (
     ensure_dir,
     list_json_stems,
@@ -21,7 +23,6 @@ from .storage_base import (
     safe_remove,
     write_json_atomic,
 )
-from astrbot.api import logger
 
 CHARS_SUBDIR = "rpg_saves"
 SESS_SUBDIR = "sessions"
@@ -115,10 +116,9 @@ class RpgStore:
             if gid:
                 if not stem.startswith(prefix):
                     continue
-            elif uid:
                 # 私聊:仅删除文件名为 sender_uid 的角色(保留含下划线的其他存档)
-                if stem != uid:
-                    continue
+            elif uid and stem != uid:
+                continue
             if safe_remove(self._char_path(stem)):
                 result["deleted_chars"] += 1
 
@@ -149,9 +149,7 @@ class RpgStore:
                 if safe_remove(self._char_path(member_uid)):
                     result["deleted_chars"] += 1
             if safe_remove(self._sess_path(sid)):
-                result["deleted_sessions"].append(
-                    s.get("session_id", sid)
-                )
+                result["deleted_sessions"].append(s.get("session_id", sid))
             else:
                 logger.debug("rpg 会话删除失败 %s", sid)
 
