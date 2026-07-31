@@ -617,6 +617,17 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         if lore:
             system_prompt += "\n\n" + lore
 
+        # 输出前自检 — 放在 system prompt 最末尾,利用 recency bias 强化设定遵从度
+        system_prompt += (
+
+            "\n\n## ✅ 输出前自检清单(写正文前必须过一遍)\n"
+            "1. **本次要描写的角色是否已在「持久化角色设定」中?** — 在的话,先把他的 `appearance` / `forms` / `personality` 字段值在脑子里过一遍\n"
+            "2. **发色 / 瞳色 / 发型 / 服装 / 配饰**是否与设定一致?不一致就改;不要拿「氛围需要」「光线效果」「换季了」当借口\n"
+            "3. **外貌以外的世界观细节**(地点名、组织名、规则)是否与「持久化世界观」一致?\n"
+            "4. **本次要记录的新事实**是否已经在设定里?是的话不要重复调 `life_sim_save_*_lore`\n"
+            "任何与持久化设定冲突的描写 = 违规,即使「写得更好看」也不允许。"
+        )
+
         messages = await self._compress_history(
             session.get("messages", []), event=event
         )
@@ -936,32 +947,51 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
         按 (角色 / section) 分组,每组的条目按 seq 升序排列成时间轴,
         每条标注 `[#seq | timestamp]`。新条目永远追加,旧细节永不被覆盖。
+
+        在块顶部加粗体权威性声明,`appearance` 等硬约束 section 前面插入
+        「禁止脑补」警告,强化模型对这些字段的遵从度。
         """
+        HARD_SECTIONS = {"appearance", "forms"}
         parts = []
         world_lore = session.get("world_lore") or []
         if world_lore:
-            lines = ["## 持久化世界观(按时间轴排列,自动注入每次对话)"]
+            lines = [
+                "## 持久化世界观(按时间轴排列,自动注入每次对话)",
+                "**⚠️ 以下世界观设定为本局唯一权威事实,叙事必须严格遵循,严禁凭印象修改、补充或「修正」。**",
+            ]
             lines.extend(self._render_lore_timeline(world_lore))
             parts.append("\n".join(lines))
         char_lore_dict = self._normalize_character_lore(session.get("character_lore"))
         if any(char_lore_dict.values()):
-            lines = ["## 持久化角色设定(按时间轴排列,自动注入每次对话)"]
+            lines = [
+                "## 持久化角色设定(按时间轴排列,自动注入每次对话)",
+                "**⚠️ 以下角色设定为本局唯一权威事实。描写任何角色前必须先回扫本块,严格按字段值写。**",
+                "**外貌(发色/瞳色/发型/服装/配饰/体型等)为硬性约束 — 严禁凭训练印象脑补、换色或「合理化」,除非本块末尾有变更条目明确覆盖。**",
+            ]
             for char_name in sorted(char_lore_dict.keys()):
                 entries = char_lore_dict[char_name]
                 if not entries:
                     continue
                 lines.append(f"### {char_name}")
-                lines.extend(self._render_lore_timeline(entries, indent="- "))
+                lines.extend(
+                    self._render_lore_timeline(entries, indent="- ", hard_sections=HARD_SECTIONS)
+                )
             parts.append("\n".join(lines))
         return "\n\n".join(parts)
 
     @staticmethod
-    def _render_lore_timeline(entries: list, indent: str = "") -> list[str]:
+    def _render_lore_timeline(
+        entries: list, indent: str = "", hard_sections: set[str] | None = None
+    ) -> list[str]:
         """把 (角色 / 世界观) 的 entries 列表渲染成时间轴字符串列表。
 
         按 section 分组,组内按 seq 升序,每条标注 `[#seq | timestamp]`。
         返回每行已加好 `indent` 前缀的字符串,直接 extend 进块。
+
+        `hard_sections` 指定的 section(如 appearance / forms)在首条前会插入
+        一行「禁止脑补」警告,强化模型对这些字段的遵从度。
         """
+        hard_sections = hard_sections or set()
         sorted_entries = sorted(
             entries,
             key=lambda e: (
@@ -970,12 +1000,18 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             ),
         )
         lines: list[str] = []
+        prev_section: str | None = None
         for e in sorted_entries:
             sec = e.get("section", "")
             seq = e.get("seq", "?")
             ts = e.get("updated_at", "")
             content = e.get("content", "")
+            if sec != prev_section and sec in hard_sections:
+                lines.append(
+                    f"{indent}> 🔒 **「{sec}」为硬性约束 — 发色/瞳色/服装/配饰等严禁凭印象脑补,叙事必须照写。**"
+                )
             lines.append(f"{indent}[#{seq} | {ts}] **{sec}** — {content}")
+            prev_section = sec
         return lines
 
     async def life_sim_save_world_lore(
