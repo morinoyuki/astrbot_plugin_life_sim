@@ -157,7 +157,9 @@ class NarrativeStore:
                 data = read_json(os.path.join(scope_dir, fname))
                 if data:
                     out.append(data)
-            out.sort(key=lambda r: r.get("created_at", ""))
+            # created_at 只到秒,同秒内用 id 作 tie-breaker 保证稳定顺序
+            # (ID 含 secrets.token_hex,无序;但能保证全序)
+            out.sort(key=lambda r: (r.get("created_at", ""), r.get("id", "")))
             return out
 
         return await asyncio.to_thread(_load_all)
