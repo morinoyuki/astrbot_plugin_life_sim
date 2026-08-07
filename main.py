@@ -8,6 +8,7 @@
 
 import asyncio
 import json
+import os
 import re
 import time
 
@@ -46,6 +47,7 @@ from .prompts import (
     _parse_mode_prefix,
 )
 from .rpg_tools import RPGMixin
+from .storage_narrative import NarrativeStore
 from .storage_rpg import RpgStore
 from .storage_sim import SimStore
 
@@ -264,9 +266,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.data_dir = StarTools.get_data_dir()
-        # 文件存储实例(sim 会话 + RPG 数据,各自独立模块)
+        # 文件存储实例(sim 会话 + RPG 数据 + 剧情历史,各自独立模块)
         self.sim_store = SimStore(self.data_dir)
         self.rpg_store = RpgStore(self.data_dir)
+        self.narrative_store = NarrativeStore(self.data_dir)
         # AstrBot 在配置存在时传入,缺失时为 None
         self.config = config
         # 每个会话(group/user)一把 asyncio.Lock,防止同一会话并发触发 _generate 造成竞态
@@ -275,6 +278,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         # 工具 handler 只写这里,_generate 结束时统一合并到 session 并落库,
         # 避免工具内 _load_sim 拿到新 dict B 后又被外层旧 dict A 全量覆写。
         self._pending_lore: dict[str, dict] = {}
+        # 本轮 revise 标记:{event_key: bool} — 本轮 LLM 是否调用过
+        # life_sim_revise_narrative?若是,跳过本轮的 _auto_record_narrative
+        # (避免修订后的剧情被同时当成"新记录"再存一份)
+        self._pending_revise: dict[str, bool] = {}
 
     # ─── 配置读取助手 ────────────────────────────────────────
 
@@ -337,7 +344,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
     @staticmethod
     def _is_my_tool(name: str) -> bool:
-        """过滤:只保留本插件的工具(rpg_*/roll_dice/life_sim_save_*)。"""
+        """过滤:只保留本插件的工具(rpg_*/roll_dice/life_sim_save_*/life_sim_revise_narrative)。"""
         return bool(name) and (
             name.startswith("rpg_")
             or name
@@ -345,6 +352,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 "roll_dice",
                 "life_sim_save_character_lore",
                 "life_sim_save_world_lore",
+                "life_sim_revise_narrative",
             }
         )
 
@@ -602,6 +610,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         # 本函数末尾统一合并到 session 并落库(成功路径)。失败路径在 finally 释放。
         event_key = self._sim_session_key(event)
         self._pending_lore[event_key] = {}
+        self._pending_revise[event_key] = False
 
         world_setting = session.get("world_setting")
         system_prompt_tpl = SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["A"])
@@ -617,9 +626,20 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         if lore:
             system_prompt += "\n\n" + lore
 
+        # 注入 last_narrative_id — 让 LLM 知道如何调用 life_sim_revise_narrative
+        last_nid = session.get("last_narrative_id")
+        if last_nid:
+            system_prompt += (
+                f"\n\n## 📌 最近剧情ID\n"
+                f"`{last_nid}` — 这是你**上一段输出**对应的剧情记录 ID。\n"
+                f"用户反馈那段剧情需要修改时,直接调\n"
+                f"`life_sim_revise_narrative(record_id=\"{last_nid}\", narrative=\"<新剧情全文>\")`\n"
+                f"即可覆盖,不必让用户复制 ID。\n"
+                f"(也可以省略 record_id,会自动修订最近一条。)"
+            )
+
         # 输出前自检 — 放在 system prompt 最末尾,利用 recency bias 强化设定遵从度
         system_prompt += (
-
             "\n\n## ✅ 输出前自检清单(写正文前必须过一遍)\n"
             "1. **本次要描写的角色是否已在「持久化角色设定」中?** — 在的话,先把他的 `appearance` / `forms` / `personality` 字段值在脑子里过一遍\n"
             "2. **发色 / 瞳色 / 发型 / 服装 / 配饰**是否与设定一致?不一致就改;不要拿「氛围需要」「光线效果」「换季了」当借口\n"
@@ -636,6 +656,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         turn = session.get("lore_turn", 0) + 1
         session["lore_turn"] = turn
         self._snapshot_lore(session, turn)
+        # 同步快照剧情历史状态(供 /undo 回滚被本 turn 新增/修订的记录)
+        # 必须在 LLM 调用前抓取 — `_auto_record_narrative` 在调用结束后才写。
+        await self._snapshot_narrative_history(session, turn, event_key)
         # 同步快照 RPG 数值状态,供 /undo 回滚 HP/EXP/装备/会话等
         # mode B/C 一律保存(包括空快照)— 否则回滚到"首个创建 RPG 数据的 turn"时找不到快照,
         # 导致本应被删除的新建角色/会话漏网。
@@ -687,12 +710,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         except (ValueError, KeyError, TimeoutError, OSError, ConnectionError) as e:
             logger.error(f"life-sim: LLM 调用失败: {e}")
             self._pending_lore.pop(event_key, None)
+            self._pending_revise.pop(event_key, None)
             return f"❌ 生成失败:{e}"
 
         # 拿到 final text(用于返回值 + 校验)
         text = (getattr(llm_resp, "completion_text", "") or "").strip()
         if not text:
             self._pending_lore.pop(event_key, None)
+            self._pending_revise.pop(event_key, None)
             return "❌ 模型未返回内容,请重试。"
 
         # 把整轮(user + 工具调用 + 最终回应)一次性转成 AstrBot 原生 Message dict 列表
@@ -710,7 +735,29 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             if k in staging:
                 session[k] = staging[k]
 
+        # 本轮是否调用过 life_sim_revise_narrative?若是,跳过 auto_record —
+        # revise 已经把正确内容写回老记录,本轮的 text 响应是修订后的副本,
+        # 再记一遍会出现内容几乎相同的重复记录。
+        revise_called = self._pending_revise.pop(event_key, False)
+
         await self._save_sim(event, session)
+
+        # ─── 自动记录剧情历史(独立存储,与 sim session 解耦)───
+        # 若本轮已调用 revise,跳过 — 老记录已被覆盖,无需再起新记录。
+        if revise_called:
+            record_id = None
+        else:
+            record_id = await self._auto_record_narrative(
+                session=session,
+                scope=event_key,
+                user_action=user_input,
+                narrative=text,
+            )
+        if record_id:
+            session["last_narrative_id"] = record_id
+            await self._save_sim(event, session)
+            text += f"\n\n📝 [剧情ID: `{record_id}`]"
+
         return text
 
     async def _llm_resp_to_messages(
@@ -942,6 +989,112 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             }
         )
 
+    async def _snapshot_narrative_history(
+        self, session: dict, turn: int, scope: str
+    ) -> None:
+        """快照剧情历史状态(供 /undo 回滚)。
+
+        每次 turn 开始时调用(LLM 调用前)抓取当前 scope 的所有记录。
+        存储的是轻量级 (id, narrative, revised_count, revised_at) 元组 —
+        不存世界设定 / 角色设定快照(那些与 lore 同步,lore 回滚已覆盖)。
+
+        限制:最多保留 25 个快照,与 lore / rpg 一致。
+        """
+        records = await self.narrative_store.list(scope)
+        light = [
+            {
+                "id": r["id"],
+                "narrative": r.get("narrative", ""),
+                "revised_count": int(r.get("revised_count", 0)),
+                "revised_at": r.get("revised_at", ""),
+            }
+            for r in records
+        ]
+        snapshots = session.setdefault("narrative_snapshots", [])
+        snapshots.append({"turn": turn, "scope": scope, "records": light})
+        if len(snapshots) > 25:
+            del snapshots[: len(snapshots) - 25]
+
+    async def _restore_narrative_history(self, scope: str, snap: dict) -> dict:
+        """从快照恢复剧情历史。返回 {"deleted": int, "restored": int}。"""
+        target_ids = {r["id"] for r in snap.get("records", [])}
+        target_map = {r["id"]: r for r in snap.get("records", [])}
+        current = await self.narrative_store.list(scope)
+
+        deleted = 0
+        for r in current:
+            if r["id"] not in target_ids and await self.narrative_store.delete(
+                scope, r["id"]
+            ):
+                deleted += 1
+
+        restored = 0
+        for tid, state in target_map.items():
+            ok = await self.narrative_store.restore(
+                scope,
+                {
+                    "id": tid,
+                    "narrative": state["narrative"],
+                    "revised_count": state["revised_count"],
+                    "revised_at": state["revised_at"],
+                },
+            )
+            if ok:
+                restored += 1
+
+        return {"deleted": deleted, "restored": restored}
+
+    # ─── 剧情历史自动记录 ─────────────────────────────────
+
+    def _make_narrative_summary(self, text: str) -> str:
+        """从剧情文本自动生成一行短摘要,用于 /历史 列表展示。"""
+        if not text:
+            return "(空)"
+        # 优先第一个 ## 标题;否则第一个非空段
+        for line in text.splitlines():
+            s = line.strip()
+            if s.startswith(("## ", "# ")):
+                return s.lstrip("# ").strip()[:60]
+        for line in text.splitlines():
+            s = line.strip()
+            if s:
+                return (s[:60] + "…") if len(s) > 60 else s
+        return text[:60]
+
+    async def _auto_record_narrative(
+        self,
+        session: dict,
+        scope: str,
+        user_action: str,
+        narrative: str,
+    ) -> str | None:
+        """把本轮成功输出的剧情写入独立存储。
+
+        返回写入的 record_id;异常(磁盘满等)静默吞掉并 log,不影响主流程。
+        """
+        try:
+            cleaned_action = _strip_xml_tags(user_action).strip()
+            char_lore = self._normalize_character_lore(session.get("character_lore"))
+            payload = {
+                "user_action": cleaned_action[:500],
+                "summary": self._make_narrative_summary(narrative),
+                "narrative": narrative,
+                "world_setting": session.get("world_setting", "") or "",
+                "character_lore": {
+                    name: [dict(e) for e in entries]
+                    for name, entries in char_lore.items()
+                },
+                "world_lore": [dict(e) for e in (session.get("world_lore") or [])],
+                "source_session_key": session.get("_session_key", scope),
+                "mode": session.get("mode", "A"),
+            }
+            return await self.narrative_store.append(scope, payload)
+        except (OSError, ValueError, TypeError) as e:
+            logger.warning(f"life-sim: 剧情历史记录失败: {e}")
+            return None
+
+    # ─── lore 渲染 ──────────────────────────────────────
+
     def _build_lore_addendum(self, session: dict) -> str:
         """构造注入到 system prompt 的 lore 附加段。
 
@@ -974,7 +1127,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                     continue
                 lines.append(f"### {char_name}")
                 lines.extend(
-                    self._render_lore_timeline(entries, indent="- ", hard_sections=HARD_SECTIONS)
+                    self._render_lore_timeline(
+                        entries, indent="- ", hard_sections=HARD_SECTIONS
+                    )
                 )
             parts.append("\n".join(lines))
         return "\n\n".join(parts)
@@ -1062,6 +1217,60 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         return await self._save_lore(
             event, "character_lore", section, content, character=character
         )
+
+    async def life_sim_revise_narrative(
+        self,
+        event,
+        narrative: str,
+        record_id: str = "",
+    ) -> str:
+        """
+        覆盖更新一条已记录的剧情(用于「用户反馈剧情不对 → 重写」场景)。
+
+        适用场景:
+        - 用户反馈"这段写得不对 / 走向有问题",你重新输出剧情后,应调本工具
+          用最新文本覆盖上一条记录,保持剧情历史与用户最终看到的版本一致
+        - 本工具**只覆盖 narrative 字段**;world_setting / character_lore / world_lore
+          等快照字段保留(它们记录的是写入时刻的世界观,不应被修改)
+        - revised_at 会被自动更新为当前时间
+
+        Args:
+            narrative(string): 新的剧情完整文本(整段替换,不是追加)
+            record_id(string, optional): 要覆盖的剧情记录 ID。
+                - 留空 / 不传 / 传 `"last"` / 传 `"prev"` / 传 `"latest"` → 自动取当前 scope 的最新一条
+                - 传具体 ID(如 `n_a1b2c3d4`) → 覆盖那一条
+                - 当前会话的最近 ID 已在 system prompt 「📌 最近剧情ID」段给出,直接复制即可
+        Returns:
+            成功 / 失败消息。
+        """
+        scope = self._sim_session_key(event)
+        if not narrative or not isinstance(narrative, str):
+            return "❌ narrative 不能为空"
+
+        # 解析 record_id:留空 / "last" / "latest" / "prev" 都取最新一条
+        # 用 session.last_narrative_id 精准定位 — list() 按 created_at 排序但只到秒,
+        # 同秒创建的记录顺序不稳定;session 里的字段由 append 时即时写入,永远指向真正的最后一条
+        resolved_id = (record_id or "").strip()
+        auto = False
+        if not resolved_id or resolved_id.lower() in {"last", "latest", "prev", "previous"}:
+            session = await self._load_sim(event)
+            resolved_id = (session or {}).get("last_narrative_id") or ""
+            auto = True
+            if not resolved_id:
+                return "❌ 当前 scope 暂无最近剧情 ID(从未记录过剧情),无法修订"
+
+        ok = await self.narrative_store.revise(scope, resolved_id, narrative)
+        if ok:
+            # 标记本轮已 revise — 避免 _auto_record_narrative 把修订后的
+            # 文本再次当成"新一轮"记录,造成内容几乎相同的重复记录
+            self._pending_revise[scope] = True
+            mode_note = "(自动取最近一条)" if auto else ""
+            return (
+                f"✅ 已覆盖剧情 `{resolved_id}` {mode_note}\n"
+                f"   narrative 字段已替换,revised_at 已更新;world_setting / lore 快照保留\n"
+                f"💡 本轮 text 响应不会再额外记录为新剧情,如需继续推进请用 /do"
+            )
+        return f"❌ 找不到记录 `{resolved_id}`(可能已被删除或 scope 不匹配)"
 
     # ════════════════════════════════════════════════════════════════
     # 指令
@@ -1414,6 +1623,26 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             s for s in rpg_snapshots if s["turn"] <= target_turn
         ]
 
+        # 回滚剧情历史(新增的删掉、被修订的还原)
+        narr_snapshots = session.get("narrative_snapshots") or []
+        target_narr_snap = next(
+            (s for s in reversed(narr_snapshots) if s.get("turn") == target_turn),
+            None,
+        )
+        narr_stats = None
+        scope = self._sim_session_key(event)
+        if target_narr_snap is not None:
+            narr_stats = await self._restore_narrative_history(scope, target_narr_snap)
+        session["narrative_snapshots"] = [
+            s for s in narr_snapshots if s.get("turn", 0) <= target_turn
+        ]
+        # last_narrative_id 若指向被删除的记录,清空(下次 /do 会重写)
+        if narr_stats and narr_stats.get("deleted", 0) > 0:
+            remaining = await self.narrative_store.list(scope)
+            last_id = remaining[-1]["id"] if remaining else None
+            if last_id != session.get("last_narrative_id"):
+                session["last_narrative_id"] = last_id
+
         session["messages"] = messages
         await self._save_sim(event, session)
 
@@ -1422,11 +1651,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         asst_n = sum(1 for m in removed if m.get("role") == "assistant")
         tool_n = sum(1 for m in removed if m.get("role") == "tool")
         summary_n = sum(1 for m in removed if m.get("_summary"))
+        # 同时显示消息数和剧情记录数,避免混淆(每轮 user+assistant 是 2 条消息,
+        # 但只对应 1 条剧情记录)
+        remaining_narr = len(await self.narrative_store.list(scope))
         lines = [
             f"⏪ 已撤销最近 {user_n} 轮对话(删 {len(removed)} 条消息)",
             f"   组成:user × {user_n}, assistant × {asst_n}, tool × {tool_n}"
             + (f", summary × {summary_n}" if summary_n else ""),
-            f"   剩余历史 {len(messages)} 条",
+            f"   剩余:{len(messages)} 条消息,{remaining_narr} 条剧情记录",
         ]
         if lore_restored:
             target_snap = next(
@@ -1468,6 +1700,20 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 lines.append("   🎮 RPG 数值已回滚(无变化)")
         elif session.get("mode") in ("B", "C"):
             lines.append("   ⚠️ 未找到该 turn 的 RPG 快照(数值未回滚),用 /删除 重建会话")
+        if narr_stats is not None:
+            restored = narr_stats["restored"]
+            deleted = narr_stats["deleted"]
+            if restored or deleted:
+                parts = []
+                if restored:
+                    parts.append(f"还原 ×{restored}")
+                if deleted:
+                    parts.append(f"删除 ×{deleted}")
+                lines.append(f"   📖 剧情历史已回滚:{', '.join(parts)}")
+            else:
+                lines.append("   📖 剧情历史已回滚(无变化)")
+        else:
+            lines.append("   ⚠️ 未找到该 turn 的剧情快照(剧情历史未回滚)")
         # 预览被撤销的最后一个 user 输入(去掉 <system_reminder>、<Quoted Message> 等标签)
         last_user = next(
             (m for m in reversed(removed) if m.get("role") == "user"), None
@@ -1479,6 +1725,232 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             more = "..." if len(stripped) > 60 else ""
             lines.append(f"   撤销的最后输入:`{preview}{more}`")
         yield event.plain_result("\n".join(lines))
+
+    # ════════════════════════════════════════════════════════════════
+    # 剧情历史:列表 / 上传 / 删除
+    # ════════════════════════════════════════════════════════════════
+
+    @filter.command("历史")
+    async def cmd_history(self, event: AstrMessageEvent):
+        """/历史 [N] - 列出当前会话最近的 N 条剧情记录(默认 10)"""
+        arg = self._extract_after_cmd(event, "历史").strip()
+        n = 10
+        if arg:
+            try:
+                n = int(arg.split()[0])
+            except ValueError:
+                yield event.plain_result("❌ 用法:`/历史 [N]`,N 为正整数")
+                return
+            if n < 1 or n > 200:
+                yield event.plain_result("❌ N 必须在 1-200 之间")
+                return
+
+        scope = self._sim_session_key(event)
+        records = await self.narrative_store.list(scope)
+        if not records:
+            yield event.plain_result("📭 当前会话暂无剧情历史(每轮 /do 输出会自动记录)")
+            return
+
+        recent = records[-n:]
+        lines = [
+            f"📜 当前 scope=`{scope}`,共 {len(records)} 条记录,展示最近 {len(recent)} 条:\n"
+        ]
+        for i, r in enumerate(recent, start=len(records) - len(recent) + 1):
+            rid = r.get("id", "?")
+            ts = r.get("created_at", "")
+            rs = r.get("revised_at", "")
+            revised_mark = " *(已修订)*" if rs and rs != ts else ""
+            summary = (r.get("summary") or "(无摘要)").replace("\n", " ")
+            action = (r.get("user_action") or "")[:40].replace("\n", " ")
+            lines.append(f"**{i}. `{rid}`**{revised_mark}  {ts}")
+            lines.append(f"   📝 {summary}")
+            if action:
+                lines.append(f"   💬 {action}")
+        lines.append(
+            "\n💡 导出文件:`/上传历史 [jsonl] [last N]` · 删除:`/删除历史 <id>|all`"
+        )
+        yield event.plain_result("\n".join(lines))
+
+    @filter.command("上传历史")
+    async def cmd_upload_history(self, event: AstrMessageEvent):
+        """/上传历史 [jsonl] [last N|all] - 把剧情历史导出为文件并发送。
+        默认导出当前 scope 全部记录,JSON 格式(含世界设定/角色设定快照)。
+        jsonl:每条记录一行,便于分批读取
+        last N:仅导出最近 N 条
+        all:导出所有 scope 的记录(本用户/本群能访问到的全部)
+        """
+        arg = self._extract_after_cmd(event, "上传历史").strip().lower()
+        use_jsonl = "jsonl" in arg
+        scope = self._sim_session_key(event)
+
+        # 解析 last N / all
+        want_all = "all" in arg.split() or "all" == arg
+        last_n = None
+        for tok in arg.split():
+            if tok.isdigit():
+                last_n = int(tok)
+                break
+
+        if want_all:
+            records = await self.narrative_store.list_all_for_owner(
+                str(event.get_sender_id() or ""),
+                current_scope=scope,
+            )
+            scope_label = "all"
+        else:
+            records = await self.narrative_store.list(scope)
+            scope_label = scope
+
+        if not records:
+            yield event.plain_result(
+                f"📭 scope=`{scope_label}` 暂无剧情历史,先 /创建 + 几轮 /do 再来。"
+            )
+            return
+
+        if last_n is not None and last_n > 0:
+            records = records[-last_n:]
+
+        # 取最近的 world_setting / lore 快照作为"当前生效设定"放在文件顶部
+        latest = records[-1]
+        world_setting = latest.get("world_setting", "")
+        character_lore = latest.get("character_lore", {}) or {}
+        world_lore = latest.get("world_lore", []) or []
+
+        ts_stamp = time.strftime("%Y%m%d_%H%M%S")
+        # 把 scope 中的非 ASCII / 路径不安全字符压成 ASCII,避免文件名解析问题
+        safe_scope = (
+            scope_label.encode("ascii", "replace").decode("ascii").replace("?", "_")
+            or "all"
+        )
+        filename = (
+            f"narrative_{safe_scope}_{ts_stamp}.{'jsonl' if use_jsonl else 'json'}"
+        )
+
+        out_path = os.path.join(self.data_dir, filename)
+
+        # 文件写入单独 try,失败时立即报错退出(不要让 file 组件去读半截文件)
+        try:
+            if use_jsonl:
+                preamble = {
+                    "_meta": {
+                        "format": "jsonl",
+                        "format_version": 1,
+                        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "scope": scope_label,
+                        "record_count": len(records),
+                    },
+                    "world_setting": world_setting,
+                    "character_lore": character_lore,
+                    "world_lore": world_lore,
+                }
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(json.dumps(preamble, ensure_ascii=False) + "\n")
+                    for r in records:
+                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            else:
+                payload = {
+                    "_meta": {
+                        "format": "json",
+                        "format_version": 1,
+                        "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "scope": scope_label,
+                        "record_count": len(records),
+                        "source_session_keys": sorted(
+                            {r.get("source_session_key", "") for r in records}
+                        ),
+                    },
+                    "world_setting": world_setting,
+                    "character_lore": character_lore,
+                    "world_lore": world_lore,
+                    "records": [
+                        {
+                            "id": r.get("id"),
+                            "seq": i + 1,
+                            "created_at": r.get("created_at"),
+                            "revised_at": r.get("revised_at"),
+                            "revised": int(r.get("revised_count", 0)) > 0,
+                            "scope": r.get("scope"),
+                            "source_session_key": r.get("source_session_key"),
+                            "user_action": r.get("user_action", ""),
+                            "summary": r.get("summary", ""),
+                            "narrative": r.get("narrative", ""),
+                        }
+                        for i, r in enumerate(records)
+                    ],
+                }
+                with open(out_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, ensure_ascii=False, indent=2)
+        except (OSError, TypeError, ValueError) as e:
+            logger.warning(f"life-sim: 写剧情历史文件失败: {e}")
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+            yield event.plain_result(f"❌ 导出文件失败:{e}")
+            return
+
+        # 防御性校验:确认文件确实有内容(之前的 anyio bug 会导致文件 0 字节)
+        size_bytes = os.path.getsize(out_path)
+        if size_bytes == 0:
+            logger.warning("life-sim: 写完文件大小为 0,异常")
+            yield event.plain_result("❌ 导出文件为空,请重试")
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
+            return
+        size_kb = size_bytes / 1024
+        try:
+            from astrbot.core.message.components import File
+
+            # 关键:用 framework 提供的临时文件跟踪机制,而不是手动 os.remove。
+            # chain_result 是异步发送的 — 我们 generator 退出后 AstrBot 才读文件,
+            # 此时若立刻删文件会竞态丢失。framework 在事件处理完后统一清理。
+            event.track_temporary_local_file(out_path)
+            chain = [File(name=filename, file=out_path)]
+            yield event.chain_result(chain)
+            yield event.plain_result(
+                f"📤 已导出 {len(records)} 条剧情记录 → `{filename}`({size_kb:.1f} KB)\n"
+                f"   格式:{'JSONL(每条一行,便于分批读取)' if use_jsonl else 'JSON(单文件)'}\n"
+                f"   scope:`{scope_label}`"
+            )
+        except ImportError:
+            logger.warning("life-sim: File 组件不可用,保留本地文件")
+            yield event.plain_result(
+                f"⚠️ File 组件不可用,文件已写到 `{out_path}`({len(records)} 条,{size_kb:.1f} KB)"
+            )
+
+    @filter.command("删除历史")
+    async def cmd_delete_history(self, event: AstrMessageEvent):
+        """/删除历史 <id|all> - 删除指定剧情记录,或 all 删除当前 scope 全部"""
+        arg = self._extract_after_cmd(event, "删除历史").strip()
+        if not arg:
+            yield event.plain_result(
+                "❌ 用法:\n"
+                "  `/删除历史 <id>`  — 删除指定 ID(如 `n_a1b2c3d4`)\n"
+                "  `/删除历史 all`  — 删除当前 scope 全部记录"
+            )
+            return
+
+        scope = self._sim_session_key(event)
+
+        if arg.lower() in ("all", "全部"):
+            n = await self.narrative_store.delete_scope(scope)
+            yield event.plain_result(f"🗑️ 已清空 scope=`{scope}` 全部剧情记录({n} 条)")
+            return
+
+        # 单条删除
+        target = arg.split()[0].strip()
+        if not target:
+            yield event.plain_result("❌ 请提供记录 ID")
+            return
+        ok = await self.narrative_store.delete(scope, target)
+        if ok:
+            yield event.plain_result(f"🗑️ 已删除剧情记录 `{target}`")
+        else:
+            yield event.plain_result(
+                f"❌ 找不到记录 `{target}`(可能 ID 输错,或不在当前 scope)"
+            )
 
     async def terminate(self):
         logger.info("life-sim: 插件已卸载")
