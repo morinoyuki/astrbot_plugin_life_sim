@@ -868,8 +868,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         else:
             # tool_loop_agent 最终响应有时 result_chain 为 None;
             # 兜底从 _completion_text + reasoning_content 重建(保留 thinking)
-            text = (getattr(llm_resp, "_completion_text", "") or "").strip()
-            think = (getattr(llm_resp, "reasoning_content", None) or "").strip()
+            text = getattr(llm_resp, "_completion_text", "").strip()
+            think = getattr(llm_resp, "reasoning_content", "").strip()
             think_sig = getattr(llm_resp, "reasoning_signature", None)
             final_content = []
             if think:
