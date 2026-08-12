@@ -74,6 +74,35 @@ def _content_to_text(content) -> str:
     return str(content)
 
 
+def _chain_to_content_parts(chain) -> list:
+    """把 AstrBot 的消息组件链(LLMResponse.result_chain.chain)转成 LLM content parts。
+
+    - Plain → TextPart(text=...)
+    - Image → 跳过(LLM 历史里 image 引用由 image_urls 通道单独走)
+    - At / Reply / 其它 → 跳过(LLM 上下文不需要)
+    - 已经是 TextPart / ThinkPart / ImageURLPart 的实例 → 原样保留
+    """
+    out: list = []
+    for comp in chain or []:
+        if comp is None:
+            continue
+        # 已是合法 content part
+        if isinstance(comp, (TextPart, ThinkPart, ImageURLPart)):
+            out.append(comp)
+            continue
+        # Plain → TextPart
+        text = getattr(comp, "text", None)
+        if isinstance(text, str):
+            if text:
+                out.append(TextPart(text=text))
+            continue
+        # 其它类型(Image / At / Reply 等)跳过,记录 debug
+        logger.debug(
+            f"life-sim: result_chain 含非 Plain 组件 {type(comp).__name__},已跳过"
+        )
+    return out
+
+
 def _strip_xml_tags(text: str) -> str:
     """去除 <xxx>...</xxx> 标签块(包括内部内容),只保留用户真实输入。
 
@@ -831,12 +860,16 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                         ).model_dump()
                     )
         if llm_resp.result_chain is not None and llm_resp.result_chain.chain:
-            final_content = llm_resp.result_chain.chain
+            # result_chain.chain 是 AstrBot 的消息组件列表(Plain / Image / At / Reply 等),
+            # 而 AssistantMessageSegment.content 需要 LLM content parts(TextPart / ThinkPart / ImageURLPart)。
+            # 直接传组件会触发 pydantic 校验失败(content.str 期望 string,拿到 list of Plain)。
+            # 这里把 Plain → TextPart,其它类型跳过(LLM 历史里不必要保留 @ / 回复结构)。
+            final_content = _chain_to_content_parts(llm_resp.result_chain.chain)
         else:
             # tool_loop_agent 最终响应有时 result_chain 为 None;
             # 兜底从 _completion_text + reasoning_content 重建(保留 thinking)
-            text = (getattr(llm_resp, "_completion_text", "") or "").strip()
-            think = (getattr(llm_resp, "reasoning_content", None) or "").strip()
+            text = getattr(llm_resp, "_completion_text", "").strip()
+            think = getattr(llm_resp, "reasoning_content", "").strip()
             think_sig = getattr(llm_resp, "reasoning_signature", None)
             final_content = []
             if think:
