@@ -49,6 +49,7 @@ from .prompts import (
     _parse_mode_prefix,
 )
 from .rpg_tools import RPGMixin
+from .storage_branch import BranchStore
 from .storage_narrative import NarrativeStore
 from .storage_rpg import RpgStore
 from .storage_sim import SimStore
@@ -316,10 +317,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.data_dir = StarTools.get_data_dir()
-        # 文件存储实例(sim 会话 + RPG 数据 + 剧情历史,各自独立模块)
+        # 文件存储实例(sim 会话 + RPG 数据 + 剧情历史 + 分支快照,各自独立模块)
         self.sim_store = SimStore(self.data_dir)
         self.rpg_store = RpgStore(self.data_dir)
         self.narrative_store = NarrativeStore(self.data_dir)
+        self.branch_store = BranchStore(self.data_dir)
         # AstrBot 在配置存在时传入,缺失时为 None
         self.config = config
         # 每个会话(group/user)一把 asyncio.Lock,防止同一会话并发触发 _generate 造成竞态
@@ -352,7 +354,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         """把叙事输出以文本或图片形式 yield(根据 output_as_image 开关)。
 
         转图失败自动回退纯文本,不影响主流程。图片走 framework 的临时文件
-        跟踪(event.track_temporary_local_file),事件处理完后统一清理。
+        跟踪(event.track_temporary_local_file),事件处理完后统一删除;
+        渲染/保存失败时 `md_render_to_path` 已自清理,不会残留空文件。
         """
         if self.md_should_render(text):
             try:
@@ -391,8 +394,16 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
     async def _save_sim(self, event: AstrMessageEvent, session: dict):
         await self.sim_store.save(self._sim_session_key(event), session)
 
-    async def _clear_sim(self, event: AstrMessageEvent):
-        await self.sim_store.delete(self._sim_session_key(event))
+    async def _clear_sim(self, event: AstrMessageEvent) -> int:
+        """删除当前会话文件,并同步清理该会话名下全部分支快照。
+
+        分支快照独立存储(见 BranchStore),不会随会话文件自动消失,
+        必须在删除/重建会话时显式清理,避免留下孤儿分支。
+        返回被清理的分支快照数量。
+        """
+        key = self._sim_session_key(event)
+        await self.sim_store.delete(key)
+        return await self.branch_store.delete_scope(key)
 
     def _busy_message(self) -> str:
         return "⏳ 上一条消息还在处理中,请稍候再试..."
@@ -434,7 +445,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
     @staticmethod
     def _is_my_tool(name: str) -> bool:
-        """过滤:只保留本插件的工具(rpg_*/roll_dice/life_sim_save_*/life_sim_revise_narrative/render_markdown_to_image)。"""
+        """过滤:只保留本插件的工具(rpg_*/roll_dice/life_sim_save_*/life_sim_revise_narrative)。"""
         return bool(name) and (
             name.startswith("rpg_")
             or name
@@ -1535,7 +1546,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             else:
                 mode = _keyword_detect_mode(setting)
 
-        await self._clear_sim(event)
+        n_branches = await self._clear_sim(event)
 
         session = {
             "world_setting": setting,
@@ -1573,6 +1584,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
         yield event.plain_result(
             f"🎬 命运开始转动 [模式 {mode} - {MODE_NAMES[mode]}],正在编织你的人生..."
+            + (f"\n⚠️ 已随旧会话清理 {n_branches} 个剧情分支存档。" if n_branches else "")
         )
         result = await self._generate(event, session, first_input, mode, imgs)
         async for _ in self._yield_narrative_result(event, result):
@@ -1741,7 +1753,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 logger.debug(f"life-sim: 清理 RPG 存档失败: {e}")
                 purge = {"deleted_chars": 0, "deleted_sessions": []}
 
-            await self._clear_sim(event)
+            n_branches = await self._clear_sim(event)
             char_note = (
                 f",{purge['deleted_chars']} 个 RPG 存档"
                 if purge["deleted_chars"]
@@ -1752,9 +1764,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 if purge["deleted_sessions"]
                 else ""
             )
+            branch_note = f",{n_branches} 个分支存档" if n_branches else ""
             yield event.plain_result(
                 "🗑️ 会话已删除"
-                f"{char_note}{sess_note}。\n"
+                f"{char_note}{sess_note}{branch_note}。\n"
                 "使用 /创建 <世界观> 可以开始一段新的人生。"
             )
             return
@@ -2186,9 +2199,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
     async def _branch_capture(self, session: dict, event) -> dict:
         """把当前会话状态完整快照为一个分支(含消息 / lore / RPG / 剧情历史)。
 
-        快照存 session["branches"] 下,切换分支时用 `_branch_restore` 整体还原。
-        刻意**不包含** branches 字段本身 — 分支列表永远以当前会话为准,切换时
-        原样带过去,避免老快照里携带过期分支列表。
+        快照由调用方写入 BranchStore(独立于会话存储),切换分支时用
+        `_branch_restore` 整体还原。
+        刻意**不包含**分支列表 / current_branch — 它们属于会话运行时状态,
+        分支快照只保存"从这一刻往后继续推进所需的全部状态"。
         """
         scope = self._sim_session_key(event)
         mode = session.get("mode", "A")
@@ -2216,7 +2230,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         }
 
     async def _branch_restore(self, branch: dict, event) -> dict:
-        """把会话还原到分支保存时的状态,返回新 session dict(不含 branches 字段)。"""
+        """把会话还原到分支保存时的状态,返回新 session dict。
+
+        current_branch 等运行时标记由调用方在还原后设置,不在这里处理。
+        """
         scope = self._sim_session_key(event)
         new_session = {
             "world_setting": branch.get("world_setting"),
@@ -2265,11 +2282,27 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             )
             return
 
+        scope = self._sim_session_key(event)
+
+        # 迁移旧数据:老版本把分支快照整体塞在 session["branches"] 里,随会话文件读写。
+        # 升级到独立存储后,首次进入分支命令时把它们搬到 BranchStore,并从会话中移除,
+        # 避免每次 /do 都带着整个分支树写盘(快照可能很大)。
+        legacy = session.pop("branches", None)
+        if isinstance(legacy, dict):
+            migrated = 0
+            for name, b in legacy.items():
+                if name and isinstance(b, dict):
+                    await self.branch_store.save(scope, name, b)
+                    migrated += 1
+            await self._save_sim(event, session)
+            logger.info(
+                f"life-sim: 已迁移 {migrated} 个旧分支到独立存储 scope={scope}"
+            )
+
         parts = arg.split(maxsplit=1)
         sub = (parts[0] if parts else "").lower()
         rest = parts[1] if len(parts) > 1 else ""
-        branches = session.setdefault("branches", {})
-        scope = self._sim_session_key(event)
+        branches = await self.branch_store.list(scope)
 
         # ── 列表(默认) ──
         if not sub or sub in ("列表", "list", "ls", "查看"):
@@ -2353,8 +2386,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             capture = await self._branch_capture(session, event)
             capture["label"] = desc
             overwritten = name in branches
-            branches[name] = capture
-            await self._save_sim(event, session)
+            await self.branch_store.save(scope, name, capture)
             turn = capture.get("lore_turn", 0)
             overwrite_note = "(已覆盖同名分支)" if overwritten else ""
             yield event.plain_result(
@@ -2378,17 +2410,30 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                     f"❌ 分支「{name}」不存在。用 /分支 列表 查看已有分支。"
                 )
                 return
-            # 切换前:把当前主线自动保留(仅当「主线」槽位为空,避免覆盖已保留的主线)
+            # 切换前:把当前进度自动保留到「主线」。
+            # - 「主线」槽位为空 → 首次切换,自动保存当前进度;
+            # - 当前正处「主线」延续线上且进度已超过存档点 → 刷新「主线」,
+            #   避免 主线→切换→再切回 时丢掉主线线上推进的进度。
+            #   若用户 /undo 回退到存档点之前,则不刷新(保留已存档的进度)。
             auto_saved = False
-            if "主线" not in branches:
+            refresh_main = "主线" not in branches
+            if not refresh_main:
+                main_b = branches.get("主线") or {}
+                refresh_main = (
+                    session.get("current_branch") == "主线"
+                    and session.get("lore_turn", 0) > main_b.get("lore_turn", 0)
+                )
+            if refresh_main:
                 auto = await self._branch_capture(session, event)
                 auto["label"] = "切换分支前的当前进度(自动保留)"
-                branches["主线"] = auto
+                await self.branch_store.save(scope, "主线", auto)
                 auto_saved = True
 
-            target = branches[name]
+            target = await self.branch_store.get(scope, name)
+            if not target:
+                yield event.plain_result(f"❌ 分支「{name}」数据读取失败,请重试。")
+                return
             new_session = await self._branch_restore(target, event)
-            new_session["branches"] = branches  # 分支列表随切换原样保留
             new_session["current_branch"] = name  # 标记当前所在分支
             await self._save_sim(event, new_session)
 
@@ -2426,11 +2471,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             if name not in branches:
                 yield event.plain_result(f"❌ 分支「{name}」不存在。")
                 return
-            del branches[name]
-            # 删除的正是当前分支时,回到「主线」标记
+            await self.branch_store.delete(scope, name)
+            # 删除的正是当前分支时,回到「主线」标记(仅此时才需要落盘会话)
             if session.get("current_branch") == name:
                 session["current_branch"] = None
-            await self._save_sim(event, session)
+                await self._save_sim(event, session)
             yield event.plain_result(f"🗑️ 分支「{name}」已删除。")
             return
 

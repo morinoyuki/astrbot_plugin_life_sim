@@ -86,13 +86,13 @@
   "output_image_style_path": {
     "description": "pillowmd 模板样式目录(可选)",
     "type": "string",
-    "hint": "指向 CustomMarkdownImage 风格的样式目录(含 setting.json + elements.json)。留空用 pillowmd 默认样式。https://github.com/Monody-S/CustomMarkdownImage/tree/main/styles 可下载模板",
+    "hint": "指向 CustomMarkdownImage 风格的样式目录(含 setting.json + elements.json)。留空用 pillowmd 默认样式。样式 elements.json 带 page>0 的多帧动画背景时,输出自动变为 GIF 动图(如 独角兽gif 风格)。https://github.com/Monody-S/CustomMarkdownImage/tree/main/styles 可下载模板",
     "default": ""
   },
   "output_image_auto_page": {
     "description": "自动分页(内容长时按黄金分割比拆分)",
     "type": "bool",
-    "hint": "渲染时启用 pillowmd 的 autoPage(尽可能接近黄金分割比,避免图片过长)。关闭后内容多时会生成超长单图",
+    "hint": "渲染时启用 pillowmd 的 autoPage(尽可能接近黄金分割比,避免图片过长)。关闭后内容多时会生成超长单图。GIF 样式下自动分页仍输出动图",
     "default": true
   }
 }
