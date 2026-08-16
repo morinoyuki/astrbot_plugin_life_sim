@@ -14,6 +14,7 @@ import os
 import random
 import re
 import time
+import hashlib
 
 from .storage_base import safe_remove
 from .storage_rpg import RpgStore
@@ -422,8 +423,14 @@ def _give_item_bonuses(
 
 
 def _roll_random_bonuses(item_name: str) -> tuple[int, int, int, int, dict]:
-    """基于装备名哈希生成稳定的随机词条。"""
-    rng = random.Random(hash(item_name))
+    """基于装备名生成稳定的随机词条(跨进程/跨重启一致)。
+
+    之前用 `hash(item_name)` — 但 Python 对 str 的 hash 每进程随机加盐
+    (受 PYTHONHASHSEED 影响),同一把「铁剑」重启后词条完全不同,
+    与「稳定随机」的注释意图相悖。改用 hashlib 的确定性摘要。
+    """
+    seed = int.from_bytes(hashlib.md5(item_name.encode("utf-8")).digest()[:8], "big")
+    rng = random.Random(seed)
     return (
         rng.randint(0, 5),  # b_atk
         rng.randint(0, 3),  # b_def

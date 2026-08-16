@@ -218,3 +218,38 @@ class NarrativeStore:
             return count
 
         return await asyncio.to_thread(_purge)
+
+    async def overwrite_all(self, scope: str, records: list[dict]) -> dict:
+        """把 scope 的剧情历史**整体覆盖**为 records(用于分支切换)。
+
+        - 目标记录(id 在 records 里)直接重写为最新内容(含所有快照字段)
+        - 磁盘上存在但不在 records 里的记录删除
+
+        返回 {"written": int, "deleted": int}。
+        """
+        target_ids = {r.get("id") for r in records if r.get("id")}
+        scope_dir = self._scope_dir(scope)
+
+        def _overwrite() -> tuple[int, int]:
+            deleted = 0
+            if os.path.exists(scope_dir):
+                for fname in os.listdir(scope_dir):
+                    if not fname.endswith(".json"):
+                        continue
+                    if fname[:-5] not in target_ids and safe_remove(
+                        os.path.join(scope_dir, fname)
+                    ):
+                        deleted += 1
+            written = 0
+            for r in records:
+                rid = r.get("id")
+                if not rid:
+                    continue
+                record = dict(r)
+                record["scope"] = scope
+                write_json_atomic(self._path(scope, rid), record)
+                written += 1
+            return written, deleted
+
+        written, deleted = await asyncio.to_thread(_overwrite)
+        return {"written": written, "deleted": deleted}

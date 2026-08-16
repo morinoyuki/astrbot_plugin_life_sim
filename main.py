@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -204,6 +205,25 @@ def _build_system_reminder(event: AstrMessageEvent) -> str:
     )
 
 
+def _build_narrative_ref_tag(last_nid: str) -> str:
+    """构造最近剧情 ID 的 tag(放在当轮 user 消息里,不进 system prompt)。
+
+    为什么放 user 消息而不是 system prompt:
+    - system prompt 是每轮请求的最长公共前缀,必须**字节级稳定**才能命中
+      提供商的前缀缓存(DeepSeek / Kimi / GLM / OpenAI 等)。剧情 ID 每轮都变,
+      一旦出现在 system prompt 里,会从该字节起让后面整段历史缓存全部失效。
+    - user 消息每轮本来就不同,把易变的 ID 放这里零额外成本。
+    - 标签用 <narrative_ref> 包裹,`_strip_xml_tags` 会自动剥掉,
+      不会污染剧情历史记录的 user_action 字段。
+    """
+    return (
+        f"<narrative_ref>最近剧情ID: `{last_nid}` — 这是你**上一段输出**对应的剧情记录 ID。"
+        f"用户反馈那段剧情需要修改时,直接调 "
+        f"life_sim_revise_narrative(record_id=\"{last_nid}\", narrative=\"<新剧情全文>\") 覆盖即可,"
+        f"不必让用户复制 ID(也可省略 record_id 自动修订最近一条)。</narrative_ref>"
+    )
+
+
 class _LifeSimToolHooks(BaseAgentRunHooks[AstrAgentContext]):
     """从 run_context.messages 中提取本轮 agent 新增的工具调用上下文。
 
@@ -303,6 +323,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         self.config = config
         # 每个会话(group/user)一把 asyncio.Lock,防止同一会话并发触发 _generate 造成竞态
         self._sim_locks: dict[str, asyncio.Lock] = {}
+        # 运行时工具集缓存(懒构建)— 工具集在运行期不变,避免每轮重建 + 重复解析 docstring
+        self._cached_tool_set = None
         # 工具调用期间的 lore 暂存:{event_key: {"world_lore": [...], "character_lore": {...}}}
         # 工具 handler 只写这里,_generate 结束时统一合并到 session 并落库,
         # 避免工具内 _load_sim 拿到新 dict B 后又被外层旧 dict A 全量覆写。
@@ -354,18 +376,36 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
     def _busy_message(self) -> str:
         return "⏳ 上一条消息还在处理中,请稍候再试..."
 
-    def _extract_after_cmd(self, event: AstrMessageEvent, cmd: str) -> str:
-        """提取 cmd 首次出现位置之后的所有内容。
+    def _extract_after_cmd(
+        self, event: AstrMessageEvent, cmds: str | tuple[str, ...] | list[str]
+    ) -> str:
+        """提取命令首次出现位置之后的所有内容。支持多个候选命令名(含 alias)。
+
         prefix 不再硬编码:AstrBot 的 @filter.command 会按系统配置识别 / ！ ~ 等
-        (私聊可能无 prefix),找到 cmd 字符串的位置之后的全部就是参数。
+        (私聊可能无 prefix),找到命令字符串的位置之后的全部就是参数。
+
+        必须支持 alias:如 /do 的命令别名有 input / 输入,用户发 `/输入 xxx` 时
+        文本里没有 "do",只按 "do" 找会把参数丢光。
         """
+        if isinstance(cmds, str):
+            cmds = (cmds,)
         text = (event.message_str or "").strip()
         if not text:
             return ""
-        idx = text.find(cmd)
-        if idx < 0:
+        best_idx, best_len = -1, 0
+        for cmd in cmds:
+            idx = text.find(cmd)
+            while idx >= 0:
+                # 命令必须出现在行首,或紧跟系统命令前缀(/ ！ ~ 等),
+                # 避免误匹配正文中恰好包含该词的文本(如 "redo" 里的 "do")。
+                if idx == 0 or (idx > 0 and text[idx - 1] in "/!～~"):
+                    if best_idx < 0 or idx < best_idx:
+                        best_idx, best_len = idx, len(cmd)
+                    break
+                idx = text.find(cmd, idx + 1)
+        if best_idx < 0:
             return ""
-        return text[idx + len(cmd) :].strip()
+        return text[best_idx + best_len :].strip()
 
     # ────────────────────────────────────────────────────────────────
     # 工具调用日志(hook 捕获 + 历史落盘)
@@ -395,8 +435,12 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         怎么调用),再 new 一个 FunctionTool(handler=bound,parameters=...) 装入 ToolSet。
         用 bound method 作为 handler 避免 unbound 调用时 event 变 self 的 bug。
 
-        缓存(运行时工具集不变)。
+        运行时工具集不变,结果懒缓存到 self._cached_tool_set,避免每轮重建
+        (重建要 dir(self) + 逐个 docstring_parser 解析 + 查 provider_manager)。
         """
+        if self._cached_tool_set is not None:
+            return self._cached_tool_set
+
         from astrbot.core.agent.tool import FunctionTool, ToolSet
 
         tool_set = ToolSet()
@@ -432,6 +476,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         if web_search and tavily_extract_web_page:
             tool_set.add_tool(web_search)
             tool_set.add_tool(tavily_extract_web_page)
+        self._cached_tool_set = tool_set
         return tool_set
 
     async def _compress_history(self, messages: list, event=None) -> list:
@@ -545,7 +590,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         # 世界观设定(找第一条非空 user 消息,通常就是 /创建 的输入)
         for m in head_msgs:
             if m.get("role") == "user":
-                ws = _content_to_text(m.get("content")).strip()
+                ws = _strip_xml_tags(_content_to_text(m.get("content"))).strip()
                 if ws and not ws.startswith("请"):
                     snippet = ws if len(ws) <= 500 else ws[:500] + "..."
                     lines.append(f"**世界观设定**:\n{snippet}\n")
@@ -582,10 +627,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             )
 
         # 早期用户决策(前 8 个非空 user 行动)
+        # 存库的 user 消息带 <system_reminder> / <narrative_ref> 等标签,先剥掉再收录
         user_actions = []
         for m in head_msgs:
             if m.get("role") == "user":
-                a = _content_to_text(m.get("content")).strip()
+                a = _strip_xml_tags(_content_to_text(m.get("content"))).strip()
                 if a and not a.startswith("请") and len(a) <= 80:
                     user_actions.append(a)
         if user_actions:
@@ -655,18 +701,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         if lore:
             system_prompt += "\n\n" + lore
 
-        # 注入 last_narrative_id — 让 LLM 知道如何调用 life_sim_revise_narrative
-        last_nid = session.get("last_narrative_id")
-        if last_nid:
-            system_prompt += (
-                f"\n\n## 📌 最近剧情ID\n"
-                f"`{last_nid}` — 这是你**上一段输出**对应的剧情记录 ID。\n"
-                f"用户反馈那段剧情需要修改时,直接调\n"
-                f"`life_sim_revise_narrative(record_id=\"{last_nid}\", narrative=\"<新剧情全文>\")`\n"
-                f"即可覆盖,不必让用户复制 ID。\n"
-                f"(也可以省略 record_id,会自动修订最近一条。)"
-            )
-
         # 输出前自检 — 放在 system prompt 最末尾,利用 recency bias 强化设定遵从度
         system_prompt += (
             "\n\n## ✅ 输出前自检清单(写正文前必须过一遍)\n"
@@ -708,8 +742,16 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         system_reminder = _build_system_reminder(event)
 
         user_input += system_reminder
+        # 最近剧情 ID 注入到当轮 user 消息而不是 system prompt:
+        # system prompt 必须字节级稳定才能命中前缀缓存(ID 每轮都变,放里面会把
+        # 后面整段历史缓存打爆);user 消息每轮本来就不同,放这里零额外成本。
+        # 模式 A 无工具可调 revise,不需要注入。
+        if mode in ("B", "C"):
+            last_nid = session.get("last_narrative_id")
+            if last_nid:
+                user_input += _build_narrative_ref_tag(last_nid)
 
-        image_urls = [(img.url or img.path) for img in imgs]
+        image_urls = [(img.url or img.path) for img in (imgs or [])]
         tool_hooks: _LifeSimToolHooks | None = None
         try:
             if mode == "A":
@@ -868,8 +910,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         else:
             # tool_loop_agent 最终响应有时 result_chain 为 None;
             # 兜底从 _completion_text + reasoning_content 重建(保留 thinking)
-            text = getattr(llm_resp, "_completion_text", "").strip()
-            think = getattr(llm_resp, "reasoning_content", "").strip()
+            text = (getattr(llm_resp, "_completion_text", "") or "").strip()
+            think = (getattr(llm_resp, "reasoning_content", "") or "").strip()
             think_sig = getattr(llm_resp, "reasoning_signature", None)
             final_content = []
             if think:
@@ -1021,6 +1063,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 "character_lore": char_lore_copy,
             }
         )
+        # 与 rpg / narrative 快照一致,限制最多保留 25 个,避免会话 KV 无限膨胀。
+        # undo 最大回滚 20 轮,25 个快照足够覆盖。
+        if len(snapshots) > 25:
+            del snapshots[: len(snapshots) - 25]
 
     async def _snapshot_narrative_history(
         self, session: dict, turn: int, scope: str
@@ -1154,7 +1200,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 "**⚠️ 以下角色设定为本局唯一权威事实。描写任何角色前必须先回扫本块,严格按字段值写。**",
                 "**外貌(发色/瞳色/发型/服装/配饰/体型等)为硬性约束 — 严禁凭训练印象脑补、换色或「合理化」,除非本块末尾有变更条目明确覆盖。**",
             ]
-            for char_name in sorted(char_lore_dict.keys()):
+            # 按首次出现顺序遍历角色(dict 天然保序),不用 sorted:
+            # 新角色追加在块末尾,已有角色/条目的字节位置不动 → 前缀缓存不被打断。
+            for char_name in char_lore_dict:
                 entries = char_lore_dict[char_name]
                 if not entries:
                     continue
@@ -1173,32 +1221,41 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
     ) -> list[str]:
         """把 (角色 / 世界观) 的 entries 列表渲染成时间轴字符串列表。
 
-        按 section 分组,组内按 seq 升序,每条标注 `[#seq | timestamp]`。
+        section 按**首次出现顺序**分组,组内按 seq 升序,每条标注 `[#seq | timestamp]`。
         返回每行已加好 `indent` 前缀的字符串,直接 extend 进块。
 
         `hard_sections` 指定的 section(如 appearance / forms)在首条前会插入
         一行「禁止脑补」警告,强化模型对这些字段的遵从度。
+
+        为什么按首次出现顺序而不是字典序:
+        - 新 entry 永远是**追加**到对应 section 组末尾,老条目的字节位置不动;
+        - 新 section 追加在块末尾 —— 不会像字典序那样插到中间、把整块后续文本
+          全部移位,从而保住前缀缓存命中率。
         """
         hard_sections = hard_sections or set()
-        sorted_entries = sorted(
-            entries,
-            key=lambda e: (
-                str(e.get("section", "")),
-                int(e.get("seq", 0)),
-            ),
-        )
+        # section 首次出现顺序
+        section_order: dict[str, int] = {}
+        for e in entries:
+            sec = str(e.get("section", ""))
+            if sec not in section_order:
+                section_order[sec] = len(section_order)
+        groups: dict[str, list] = {}
+        for e in entries:
+            groups.setdefault(str(e.get("section", "")), []).append(e)
+
         lines: list[str] = []
         prev_section: str | None = None
-        for e in sorted_entries:
-            sec = e.get("section", "")
-            seq = e.get("seq", "?")
-            ts = e.get("updated_at", "")
-            content = e.get("content", "")
-            if sec != prev_section and sec in hard_sections:
-                lines.append(
-                    f"{indent}> 🔒 **「{sec}」为硬性约束 — 发色/瞳色/服装/配饰等严禁凭印象脑补,叙事必须照写。**"
-                )
-            lines.append(f"{indent}[#{seq} | {ts}] **{sec}** — {content}")
+        for sec in sorted(groups, key=lambda s: section_order.get(s, 0)):
+            group = sorted(groups[sec], key=lambda e: int(e.get("seq", 0)))
+            for e in group:
+                seq = e.get("seq", "?")
+                ts = e.get("updated_at", "")
+                content = e.get("content", "")
+                if sec != prev_section and sec in hard_sections:
+                    lines.append(
+                        f"{indent}> 🔒 **「{sec}」为硬性约束 — 发色/瞳色/服装/配饰等严禁凭印象脑补,叙事必须照写。**"
+                    )
+                lines.append(f"{indent}[#{seq} | {ts}] **{sec}** — {content}")
             prev_section = sec
         return lines
 
@@ -1272,7 +1329,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             record_id(string, optional): 要覆盖的剧情记录 ID。
                 - 留空 / 不传 / 传 `"last"` / 传 `"prev"` / 传 `"latest"` → 自动取当前 scope 的最新一条
                 - 传具体 ID(如 `n_a1b2c3d4`) → 覆盖那一条
-                - 当前会话的最近 ID 已在 system prompt 「📌 最近剧情ID」段给出,直接复制即可
+                - 当前会话的最近 ID 已在当轮用户消息的 <narrative_ref> 标签中给出,直接复制即可
         Returns:
             成功 / 失败消息。
         """
@@ -1410,7 +1467,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 yield _
 
     async def _cmd_input_body(self, event: AstrMessageEvent):
-        action = self._extract_after_cmd(event, "do")
+        action = self._extract_after_cmd(event, ("do", "input", "输入"))
         extractor = QuotedMessageExtractor(event=event)
         quoted = await extractor.text()
         if quoted:
@@ -1984,6 +2041,353 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             yield event.plain_result(
                 f"❌ 找不到记录 `{target}`(可能 ID 输错,或不在当前 scope)"
             )
+
+    # ════════════════════════════════════════════════════════════════
+    # 剧情分支:保存 / 切换 / 列表 / 删除
+    # ════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _parse_branch_name_desc(rest: str) -> tuple[str, str]:
+        """把 `/分支 保存 <名称> [说明]` 的剩余参数拆成 (名称, 说明)。"""
+        rest = (rest or "").strip()
+        if not rest:
+            return "", ""
+        name, _, desc = rest.partition(" ")
+        name = name.strip()
+        return name[:30], desc.strip()
+
+    async def _branch_capture(self, session: dict, event) -> dict:
+        """把当前会话状态完整快照为一个分支(含消息 / lore / RPG / 剧情历史)。
+
+        快照存 session["branches"] 下,切换分支时用 `_branch_restore` 整体还原。
+        刻意**不包含** branches 字段本身 — 分支列表永远以当前会话为准,切换时
+        原样带过去,避免老快照里携带过期分支列表。
+        """
+        scope = self._sim_session_key(event)
+        mode = session.get("mode", "A")
+        return {
+            "world_setting": session.get("world_setting"),
+            "mode": mode,
+            "owner_id": session.get("owner_id"),
+            "owner_name": session.get("owner_name"),
+            "created_at": session.get("created_at"),
+            "messages": copy.deepcopy(session.get("messages", [])),
+            "world_lore": copy.deepcopy(session.get("world_lore") or []),
+            "character_lore": copy.deepcopy(
+                self._normalize_character_lore(session.get("character_lore"))
+            ),
+            "last_narrative_id": session.get("last_narrative_id"),
+            "lore_turn": session.get("lore_turn", 0),
+            "lore_snapshots": copy.deepcopy(session.get("lore_snapshots") or []),
+            "rpg_snapshots": copy.deepcopy(session.get("rpg_snapshots") or []),
+            "narrative_snapshots": copy.deepcopy(
+                session.get("narrative_snapshots") or []
+            ),
+            # RPG 存档/会话的磁盘快照 + 剧情历史全量 — 还原时整体回滚
+            "rpg_state": self._rpg_snapshot(event, mode),
+            "narrative_records": await self.narrative_store.list(scope),
+        }
+
+    async def _branch_restore(self, branch: dict, event) -> dict:
+        """把会话还原到分支保存时的状态,返回新 session dict(不含 branches 字段)。"""
+        scope = self._sim_session_key(event)
+        new_session = {
+            "world_setting": branch.get("world_setting"),
+            "mode": branch.get("mode", "A"),
+            "owner_id": branch.get("owner_id"),
+            "owner_name": branch.get("owner_name"),
+            "created_at": branch.get("created_at"),
+            "messages": copy.deepcopy(branch.get("messages") or []),
+            "world_lore": copy.deepcopy(branch.get("world_lore") or []),
+            "character_lore": copy.deepcopy(branch.get("character_lore") or {}),
+            "last_narrative_id": branch.get("last_narrative_id"),
+            "lore_turn": branch.get("lore_turn", 0),
+            "lore_snapshots": copy.deepcopy(branch.get("lore_snapshots") or []),
+            "rpg_snapshots": copy.deepcopy(branch.get("rpg_snapshots") or []),
+            "narrative_snapshots": copy.deepcopy(
+                branch.get("narrative_snapshots") or []
+            ),
+        }
+        # RPG 数值回滚到分支点(含新建角色/会话的清理)
+        rpg_state = branch.get("rpg_state")
+        if rpg_state:
+            self._rpg_restore(rpg_state)
+        # 剧情历史整体覆盖为分支点状态
+        records = branch.get("narrative_records") or []
+        await self.narrative_store.overwrite_all(scope, records)
+        return new_session
+
+    @filter.command("分支", alias={"branch"})
+    async def cmd_branch(self, event: AstrMessageEvent):
+        """/分支 [保存|切换|列表|删除] - 剧情分支管理(TE/BE/HE 多结局存档)"""
+        lock = self._get_sim_lock(self._sim_session_key(event))
+        if lock.locked():
+            yield event.plain_result(self._busy_message())
+            return
+
+        async with lock:
+            async for _ in self._cmd_branch_body(event):
+                yield _
+
+    async def _cmd_branch_body(self, event: AstrMessageEvent):
+        arg = self._extract_after_cmd(event, ("分支", "branch")).strip()
+        session = await self._load_sim(event)
+        if not session:
+            yield event.plain_result(
+                "❌ 当前没有进行中的转生模拟,请先使用 /创建 <世界观> 开始。"
+            )
+            return
+
+        parts = arg.split(maxsplit=1)
+        sub = (parts[0] if parts else "").lower()
+        rest = parts[1] if len(parts) > 1 else ""
+        branches = session.setdefault("branches", {})
+        scope = self._sim_session_key(event)
+
+        # ── 列表(默认) ──
+        if not sub or sub in ("列表", "list", "ls", "查看"):
+            current = session.get("current_branch")
+            lines = ["🌿 剧情分支管理"]
+            if not branches:
+                lines.append("  (暂无分支 — 当前进度尚未保存为分支)")
+            else:
+                for name, b in branches.items():
+                    turn = b.get("lore_turn", 0)
+                    label = (b.get("label") or "").strip()
+                    tag = "  [自动]" if name == "主线" else ""
+                    desc = f" — {label}" if label else ""
+                    marker = "  ← 当前" if name == current else ""
+                    lines.append(f"  · {name}(第 {turn} 轮){tag}{desc}{marker}")
+            lines += [
+                "",
+                "用法:",
+                "  /分支 当前 — 查看当前所在分支与进度",
+                "  /分支 保存 <名称> [说明] — 保存当前进度为分支(如 TE线 / BE线)",
+                "  /分支 切换 <名称> — 回到该分支(切换前的主线自动保留为「主线」)",
+                "  /分支 删除 <名称> — 删除分支",
+            ]
+            yield event.plain_result("\n".join(lines))
+            return
+
+        # ── 当前 ──
+        if sub in ("当前", "now", "current", "info", "详情"):
+            name = session.get("current_branch")
+            turn_now = session.get("lore_turn", 0)
+            n_records = len(await self.narrative_store.list(scope))
+            position = ""
+            for m in reversed(session.get("messages") or []):
+                if m.get("role") == "assistant":
+                    for ln in _content_to_text(m.get("content")).split("\n"):
+                        s = ln.strip()
+                        if s.startswith(("## ", "# ")):
+                            position = s.lstrip("# ").strip()[:40]
+                            break
+                    if position:
+                        break
+            lines = ["🌿 当前分支"]
+            if name and name in branches:
+                b = branches[name]
+                b_turn = b.get("lore_turn", 0)
+                label = (b.get("label") or "").strip()
+                lines.append(f"  · {name}")
+                if label:
+                    lines.append(f"    📍 说明:{label}")
+                lines.append(f"    📏 分支存档点:第 {b_turn} 轮")
+                if turn_now > b_turn:
+                    lines.append(f"    🎯 当前进度:第 {turn_now} 轮(已从分支点推进 {turn_now - b_turn} 轮)")
+                else:
+                    lines.append(f"    🎯 当前进度:第 {turn_now} 轮(正好在分支点)")
+            elif name:
+                lines.append(f"  · {name}(该分支已被删除,现在处于其延续线上)")
+                lines.append(f"    🎯 当前进度:第 {turn_now} 轮")
+            else:
+                lines.append("  · 主线(进行中,尚未从任何保存的分支继续)")
+                lines.append(f"    🎯 当前进度:第 {turn_now} 轮")
+            if position:
+                lines.append(f"    📌 当前位置:{position}")
+            lines.append(f"    📝 剧情记录:{n_records} 条")
+            lines.append("    💡 /分支 列表 查看全部分支 · /分支 切换 <名称> 切换路线")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        # ── 保存 ──
+        if sub in ("保存", "save", "set", "存档"):
+            name, desc = self._parse_branch_name_desc(rest)
+            if not name:
+                yield event.plain_result("❌ 用法:`/分支 保存 <名称> [说明]`(如 `/分支 保存 TE线 王都线结局`)")
+                return
+            if name == "主线":
+                yield event.plain_result("❌ 「主线」是自动保留分支名,请换一个名字。")
+                return
+            capture = await self._branch_capture(session, event)
+            capture["label"] = desc
+            overwritten = name in branches
+            branches[name] = capture
+            await self._save_sim(event, session)
+            turn = capture.get("lore_turn", 0)
+            overwrite_note = "(已覆盖同名分支)" if overwritten else ""
+            yield event.plain_result(
+                f"🌿 分支「{name}」已保存 {overwrite_note}\n"
+                f"   位置:第 {turn} 轮"
+                + (f" | 说明: {desc}" if desc else "")
+                + "\n💡 继续推进后随时可用 /分支 切换 回到这里体验另一条路线。"
+            )
+            return
+
+        # ── 切换 ──
+        if sub in ("切换", "switch", "to", "回", "load"):
+            name = rest.strip()
+            if not name:
+                yield event.plain_result("❌ 用法:`/分支 切换 <名称>`(先 /分支 列表 查看)")
+                return
+            if name not in branches:
+                yield event.plain_result(f"❌ 分支「{name}」不存在。用 /分支 列表 查看已有分支。")
+                return
+            # 切换前:把当前主线自动保留(仅当「主线」槽位为空,避免覆盖已保留的主线)
+            auto_saved = False
+            if "主线" not in branches:
+                auto = await self._branch_capture(session, event)
+                auto["label"] = "切换分支前的当前进度(自动保留)"
+                branches["主线"] = auto
+                auto_saved = True
+
+            target = branches[name]
+            new_session = await self._branch_restore(target, event)
+            new_session["branches"] = branches  # 分支列表随切换原样保留
+            new_session["current_branch"] = name  # 标记当前所在分支
+            await self._save_sim(event, new_session)
+
+            # 回显目标分支最后一段剧情位置
+            position = ""
+            for m in reversed(target.get("messages") or []):
+                if m.get("role") == "assistant":
+                    for ln in _content_to_text(m.get("content")).split("\n"):
+                        s = ln.strip()
+                        if s.startswith(("## ", "# ")):
+                            position = s.lstrip("# ").strip()[:40]
+                            break
+                    if position:
+                        break
+            lines = [
+                f"🌿 已切换到分支「{name}」(第 {target.get('lore_turn', 0)} 轮)"
+            ]
+            if position:
+                lines.append(f"   📍 当前进度:{position}")
+            if auto_saved:
+                lines.append("   💾 切换前的主线已自动保存为「主线」,可随时切回。")
+            lines.append("   直接 /do 继续推进即可。")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        # ── 删除 ──
+        if sub in ("删除", "del", "delete", "remove"):
+            name = rest.strip()
+            if not name:
+                yield event.plain_result("❌ 用法:`/分支 删除 <名称>`")
+                return
+            if name == "主线":
+                yield event.plain_result("❌ 「主线」是自动保留分支,不能用此命令删除(它每次切换前自动更新)。")
+                return
+            if name not in branches:
+                yield event.plain_result(f"❌ 分支「{name}」不存在。")
+                return
+            del branches[name]
+            # 删除的正是当前分支时,回到「主线」标记
+            if session.get("current_branch") == name:
+                session["current_branch"] = None
+            await self._save_sim(event, session)
+            yield event.plain_result(f"🗑️ 分支「{name}」已删除。")
+            return
+
+        yield event.plain_result(
+            "❌ 未知子命令。支持:当前 / 保存 / 切换 / 列表 / 删除\n"
+            "   例:/分支 当前 · /分支 保存 TE线 结局线 · /分支 切换 TE线 · /分支 列表"
+        )
+
+    # ════════════════════════════════════════════════════════════════
+    # 角色 lore 查看
+    # ════════════════════════════════════════════════════════════════
+
+    @filter.command("lore", alias={"设定", "角色设定", "人物设定"})
+    async def cmd_lore(self, event: AstrMessageEvent):
+        """/lore [角色名|世界观] - 查看角色/世界观持久化设定"""
+        session = await self._load_sim(event)
+        if not session:
+            yield event.plain_result(
+                "❌ 当前没有进行中的转生模拟,请先使用 /创建 <世界观> 开始。"
+            )
+            return
+
+        arg = self._extract_after_cmd(
+            event, ("lore", "设定", "角色设定", "人物设定")
+        ).strip()
+        char_lore = self._normalize_character_lore(session.get("character_lore"))
+        world_lore = session.get("world_lore") or []
+
+        # ── 总览 ──
+        if not arg:
+            lines = ["📖 当前设定总览"]
+            if world_lore:
+                lines.append(f"  🌍 世界观设定: {len(world_lore)} 条")
+            chars = [(n, es) for n, es in char_lore.items() if es]
+            if chars:
+                for n, es in chars:
+                    lines.append(f"  👤 {n}: {len(es)} 条")
+            else:
+                lines.append("  👤 暂无角色设定(life_sim_save_character_lore 后自动累积)")
+            lines += [
+                "",
+                "💡 /lore <角色名> 查看该角色全部设定 · /lore 世界观 查看世界设定",
+            ]
+            yield event.plain_result("\n".join(lines))
+            return
+
+        # ── 世界观 ──
+        if arg in ("世界观", "world", "world_lore"):
+            if not world_lore:
+                yield event.plain_result("🌍 暂无世界观设定。")
+                return
+            lines = ["🌍 持久化世界观(时间轴):"]
+            lines.extend(self._render_lore_timeline(world_lore, indent="  "))
+            yield event.plain_result("\n".join(lines))
+            return
+
+        # ── 角色名匹配:精确 → 大小写不敏感 → 子串 ──
+        target = arg.strip()
+        matched = None
+        if target in char_lore:
+            matched = target
+        else:
+            low = target.lower()
+            for name in char_lore:
+                if name.lower() == low:
+                    matched = name
+                    break
+            if matched is None:
+                for name in char_lore:
+                    if low in name.lower() or name.lower() in low:
+                        matched = name
+                        break
+        if matched is None:
+            available = "、".join(n for n in char_lore if char_lore[n])
+            yield event.plain_result(
+                f"❌ 未找到角色「{target}」。"
+                + (f"现有角色:{available}" if available else "暂无角色设定")
+                + "\n💡 /lore 查看总览 · /lore 世界观 查看世界设定"
+            )
+            return
+
+        entries = char_lore[matched]
+        if not entries:
+            yield event.plain_result(f"👤 {matched}:暂无设定条目。")
+            return
+        lines = [f"👤 {matched} 设定(时间轴):"]
+        lines.extend(
+            self._render_lore_timeline(
+                entries, indent="  ", hard_sections={"appearance", "forms"}
+            )
+        )
+        yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
         logger.info("life-sim: 插件已卸载")
