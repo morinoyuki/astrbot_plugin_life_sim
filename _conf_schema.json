@@ -76,5 +76,23 @@
     "_special": "select_provider",
     "hint": "可选。模式识别只是简单分类,可路由到便宜快速模型。留空用 provider_id(再留空用主 provider 或会话默认)",
     "default": ""
+  },
+  "output_as_image": {
+    "description": "叙事输出转图片(默认关)",
+    "type": "bool",
+    "hint": "开启后 /创建、/do 的叙事输出自动渲染为图片(基于 pillowmd,无浏览器)。关闭则保持纯文本。转图失败自动回退纯文本",
+    "default": false
+  },
+  "output_image_style_path": {
+    "description": "pillowmd 模板样式目录(可选)",
+    "type": "string",
+    "hint": "指向 CustomMarkdownImage 风格的样式目录(含 setting.json + elements.json)。留空用 pillowmd 默认样式。https://github.com/Monody-S/CustomMarkdownImage/tree/main/styles 可下载模板",
+    "default": ""
+  },
+  "output_image_auto_page": {
+    "description": "自动分页(内容长时按黄金分割比拆分)",
+    "type": "bool",
+    "hint": "渲染时启用 pillowmd 的 autoPage(尽可能接近黄金分割比,避免图片过长)。关闭后内容多时会生成超长单图",
+    "default": true
   }
 }

@@ -38,6 +38,7 @@ from astrbot.core.star.star_tools import StarTools
 from astrbot.core.utils.quoted_message.extractor import QuotedMessageExtractor
 
 from .dice import DiceMixin
+from .md_to_image import MdToImageMixin
 from .prompts import (
     HELP_TEXT,
     MODE_DETECT_SYSTEM_PROMPT,
@@ -219,7 +220,7 @@ def _build_narrative_ref_tag(last_nid: str) -> str:
     return (
         f"<narrative_ref>最近剧情ID: `{last_nid}` — 这是你**上一段输出**对应的剧情记录 ID。"
         f"用户反馈那段剧情需要修改时,直接调 "
-        f"life_sim_revise_narrative(record_id=\"{last_nid}\", narrative=\"<新剧情全文>\") 覆盖即可,"
+        f'life_sim_revise_narrative(record_id="{last_nid}", narrative="<新剧情全文>") 覆盖即可,'
         f"不必让用户复制 ID(也可省略 record_id 自动修订最近一条)。</narrative_ref>"
     )
 
@@ -311,7 +312,7 @@ class _LifeSimToolHooks(BaseAgentRunHooks[AstrAgentContext]):
                 )
 
 
-class LifeSimPlugin(DiceMixin, RPGMixin, Star):
+class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.data_dir = StarTools.get_data_dir()
@@ -329,10 +330,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         # 工具 handler 只写这里,_generate 结束时统一合并到 session 并落库,
         # 避免工具内 _load_sim 拿到新 dict B 后又被外层旧 dict A 全量覆写。
         self._pending_lore: dict[str, dict] = {}
-        # 本轮 revise 标记:{event_key: bool} — 本轮 LLM 是否调用过
-        # life_sim_revise_narrative?若是,跳过本轮的 _auto_record_narrative
-        # (避免修订后的剧情被同时当成"新记录"再存一份)
-        self._pending_revise: dict[str, bool] = {}
+        # 本轮 revise 暂存:{event_key: [修订前记录状态, ...]} — 本轮 LLM 是否调用过
+        # life_sim_revise_narrative(列表非空即有);兼作 /undo 回滚修订的 pre-revision 数据
+        self._pending_revise: dict[str, list] = {}
+        # Markdown → 图片渲染引擎(config 驱动,惰性加载样式)
+        self._md_init()
 
     # ─── 配置读取助手 ────────────────────────────────────────
 
@@ -345,6 +347,25 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         except (AttributeError, TypeError):
             return default
         return val if val is not None else default
+
+    async def _yield_narrative_result(self, event, text: str):
+        """把叙事输出以文本或图片形式 yield(根据 output_as_image 开关)。
+
+        转图失败自动回退纯文本,不影响主流程。图片走 framework 的临时文件
+        跟踪(event.track_temporary_local_file),事件处理完后统一清理。
+        """
+        if self.md_should_render(text):
+            try:
+                path = await self.md_render_to_path(
+                    text,
+                    autoPage=bool(self._cfg("output_image_auto_page", True)),
+                )
+                event.track_temporary_local_file(path)
+                yield event.image_result(path)
+                return
+            except Exception as e:
+                logger.warning(f"life-sim: 叙事转图失败,回退纯文本: {e}")
+        yield event.plain_result(text)
 
     # ════════════════════════════════════════════════════════════════
     # 转生模拟:独立文件会话(叙事历史)
@@ -413,7 +434,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
     @staticmethod
     def _is_my_tool(name: str) -> bool:
-        """过滤:只保留本插件的工具(rpg_*/roll_dice/life_sim_save_*/life_sim_revise_narrative)。"""
+        """过滤:只保留本插件的工具(rpg_*/roll_dice/life_sim_save_*/life_sim_revise_narrative/render_markdown_to_image)。"""
         return bool(name) and (
             name.startswith("rpg_")
             or name
@@ -422,6 +443,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 "life_sim_save_character_lore",
                 "life_sim_save_world_lore",
                 "life_sim_revise_narrative",
+                "render_markdown_to_image",
             }
         )
 
@@ -685,7 +707,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         # 本函数末尾统一合并到 session 并落库(成功路径)。失败路径在 finally 释放。
         event_key = self._sim_session_key(event)
         self._pending_lore[event_key] = {}
-        self._pending_revise[event_key] = False
+        self._pending_revise[event_key] = []
 
         world_setting = session.get("world_setting")
         system_prompt_tpl = SYSTEM_PROMPTS.get(mode, SYSTEM_PROMPTS["A"])
@@ -809,7 +831,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         # 本轮是否调用过 life_sim_revise_narrative?若是,跳过 auto_record —
         # revise 已经把正确内容写回老记录,本轮的 text 响应是修订后的副本,
         # 再记一遍会出现内容几乎相同的重复记录。
-        revise_called = self._pending_revise.pop(event_key, False)
+        # 同时把各次修订前的记录状态并入本轮快照(供 /undo 回滚,快照本身不存全文)。
+        revise_states = self._pending_revise.pop(event_key, [])
+        revise_called = bool(revise_states)
+        if revise_states:
+            for s in reversed(session.get("narrative_snapshots") or []):
+                if s.get("turn") == turn:
+                    s.setdefault("revised", []).extend(revise_states)
+                    break
 
         await self._save_sim(event, session)
 
@@ -908,21 +937,74 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             # 这里把 Plain → TextPart,其它类型跳过(LLM 历史里不必要保留 @ / 回复结构)。
             final_content = _chain_to_content_parts(llm_resp.result_chain.chain)
         else:
-            # tool_loop_agent 最终响应有时 result_chain 为 None;
-            # 兜底从 _completion_text + reasoning_content 重建(保留 thinking)
+            # tool_loop_agent 最终响应有时 result_chain 为 None;从 _completion_text 重建
             text = (getattr(llm_resp, "_completion_text", "") or "").strip()
-            think = (getattr(llm_resp, "reasoning_content", "") or "").strip()
-            think_sig = getattr(llm_resp, "reasoning_signature", None)
-            final_content = []
-            if think:
-                final_content.append(ThinkPart(think=think, encrypted=think_sig))
-            if text:
-                final_content.append(TextPart(text=text))
-            if not final_content:
-                final_content = [TextPart(text="(模型未输出文本)")]
+            final_content = [TextPart(text=text)] if text else []
+
+        # 思考部分统一前置(不管 result_chain 是否为空):从 reasoning_content 或
+        # raw_completion 提取(OpenRouter 的 message.reasoning 块数组等不同格式),
+        # 保证思考被存进历史、下一轮能回传给推理模型(否则 OpenAI 系 API 会用不到)。
+        think, think_sig = self._extract_thinking(llm_resp)
+        if think:
+            final_content.insert(0, ThinkPart(think=think, encrypted=think_sig))
+
+        if not final_content:
+            final_content = [TextPart(text="(模型未输出文本)")]
         msgs.append(AssistantMessageSegment(content=final_content).model_dump())
         logger.debug(f"life-sim resp: {msgs[-1]}")
         return msgs
+
+    @staticmethod
+    def _extract_thinking(llm_resp: LLMResponse) -> tuple[str, str | None]:
+        """从 LLMResponse 提取思考内容,兼容不同提供商格式。
+
+        优先级:
+        1. `llm_resp.reasoning_content` — DeepSeek / Kimi 等原生 reasoning_content 字段
+        2. raw_completion 的 `message.reasoning` — **OpenRouter 格式**(内容块数组,
+           `[{"type": "reasoning", "reasoning": "..."}]`,也可能有 nested reasoning block)
+        3. raw_completion 的 `message.reasoning_content` / model_extra — 部分网关的兼容字段
+
+        返回 (think_text, signature);无思考时返回 ("", None)。
+        """
+        think = (getattr(llm_resp, "reasoning_content", "") or "").strip()
+        if think:
+            return think, getattr(llm_resp, "reasoning_signature", None)
+
+        raw = getattr(llm_resp, "raw_completion", None)
+        if raw is None:
+            return "", None
+        try:
+            choices = getattr(raw, "choices", None) or []
+            if not choices:
+                return "", None
+            msg = getattr(choices[0], "message", None)
+            if msg is None:
+                return "", None
+            extra = getattr(msg, "model_extra", None) or {}
+            for key in ("reasoning", "reasoning_content"):
+                val = getattr(msg, key, None)
+                if val is None:
+                    val = extra.get(key)
+                if isinstance(val, list):
+                    # OpenRouter:内容块数组
+                    texts = []
+                    for part in val:
+                        if not isinstance(part, dict):
+                            continue
+                        if part.get("type") == "reasoning":
+                            texts.append(str(part.get("reasoning", "")))
+                        else:
+                            # 兼容某些实现直接把文本放 content 字段
+                            t = str(part.get("content", "") or "").strip()
+                            if t:
+                                texts.append(t)
+                    if texts:
+                        return "\n".join(t.strip() for t in texts if t.strip()), None
+                elif isinstance(val, str) and val.strip():
+                    return val.strip(), None
+        except (AttributeError, IndexError, TypeError):
+            pass
+        return "", None
 
     # ════════════════════════════════════════════════════════════════
     # 持久化 lore(角色设定 + 世界观,直到 /删除 或 /创建)
@@ -1074,30 +1156,60 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         """快照剧情历史状态(供 /undo 回滚)。
 
         每次 turn 开始时调用(LLM 调用前)抓取当前 scope 的所有记录。
-        存储的是轻量级 (id, narrative, revised_count, revised_at) 元组 —
-        不存世界设定 / 角色设定快照(那些与 lore 同步,lore 回滚已覆盖)。
+
+        **只存记录 ID 列表,不再复制 narrative 全文** — 旧的实现每轮把全部记录
+        的完整剧情文本再存一份(25 个快照 × 每轮增长的记录数 = O(n²) 重复数据,
+        一次 /do 就能膨胀几十 KB)。
+        - `ids`:全部记录 ID(轻量,用于回滚时判断哪些是快照点后新增、要删除)
+        - `revised`:修订前的记录状态,由 `life_sim_revise_narrative` 在修订时
+          暂存到本轮快照(只有修订发生的轮次才非空)
 
         限制:最多保留 25 个快照,与 lore / rpg 一致。
         """
         records = await self.narrative_store.list(scope)
-        light = [
-            {
-                "id": r["id"],
-                "narrative": r.get("narrative", ""),
-                "revised_count": int(r.get("revised_count", 0)),
-                "revised_at": r.get("revised_at", ""),
-            }
-            for r in records
-        ]
         snapshots = session.setdefault("narrative_snapshots", [])
-        snapshots.append({"turn": turn, "scope": scope, "records": light})
+        snapshots.append(
+            {
+                "turn": turn,
+                "scope": scope,
+                "ids": [r["id"] for r in records],
+                "revised": [],
+            }
+        )
         if len(snapshots) > 25:
             del snapshots[: len(snapshots) - 25]
 
-    async def _restore_narrative_history(self, scope: str, snap: dict) -> dict:
-        """从快照恢复剧情历史。返回 {"deleted": int, "restored": int}。"""
-        target_ids = {r["id"] for r in snap.get("records", [])}
-        target_map = {r["id"]: r for r in snap.get("records", [])}
+    async def _restore_narrative_history(
+        self, scope: str, snap: dict, all_snaps: list | None = None
+    ) -> dict:
+        """从快照恢复剧情历史。返回 {"deleted": int, "restored": int}。
+
+        删除:当前存在但快照点不存在(快照点后新增)的记录。
+        回滚修订:
+        - 旧格式快照(含 records 全量副本):全部写回;
+        - 新格式快照:收集 **target_turn 及之后所有快照**的 `revised` 状态,
+          按新→旧顺序取每个记录的最终 pre-revision 值(同一记录多次修订时
+          链式回退才能回到快照点状态)。
+        """
+        old_records = snap.get("records")
+        if old_records is not None:
+            target_ids = {r["id"] for r in old_records}
+            target_map = {r["id"]: r for r in old_records}
+        else:
+            target_ids = set(snap.get("ids") or [])
+            target_map: dict = {}
+            target_turn = snap.get("turn", 0)
+            for s in reversed(all_snaps or []):
+                if s.get("turn", 0) < target_turn:
+                    break
+                for state in s.get("revised") or []:
+                    # 新→旧遍历,后写覆盖 → 同 id 最终保留最旧的 pre-revision 值,
+                    # 即快照点的真实状态
+                    target_map[state["id"]] = state
+                # 兼容:跨版本混合的旧格式快照,records 本身是全量 light 副本,直接采入
+                for state in s.get("records") or []:
+                    target_map[state["id"]] = state
+
         current = await self.narrative_store.list(scope)
 
         deleted = 0
@@ -1342,18 +1454,36 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         # 同秒创建的记录顺序不稳定;session 里的字段由 append 时即时写入,永远指向真正的最后一条
         resolved_id = (record_id or "").strip()
         auto = False
-        if not resolved_id or resolved_id.lower() in {"last", "latest", "prev", "previous"}:
+        if not resolved_id or resolved_id.lower() in {
+            "last",
+            "latest",
+            "prev",
+            "previous",
+        }:
             session = await self._load_sim(event)
             resolved_id = (session or {}).get("last_narrative_id") or ""
             auto = True
             if not resolved_id:
                 return "❌ 当前 scope 暂无最近剧情 ID(从未记录过剧情),无法修订"
 
+        # 修订前先抓旧状态,暂存到 staging(供 /undo 回滚;快照本身不存全文,
+        # 只有修订发生时才记录 pre-revision 状态,避免每轮重复数据)
+        pre_state = None
+        existing = await self.narrative_store.get(scope, resolved_id)
+        if existing is not None:
+            pre_state = {
+                "id": resolved_id,
+                "narrative": existing.get("narrative", ""),
+                "revised_count": int(existing.get("revised_count", 0)),
+                "revised_at": existing.get("revised_at", ""),
+            }
+
         ok = await self.narrative_store.revise(scope, resolved_id, narrative)
         if ok:
             # 标记本轮已 revise — 避免 _auto_record_narrative 把修订后的
             # 文本再次当成"新一轮"记录,造成内容几乎相同的重复记录
-            self._pending_revise[scope] = True
+            if pre_state is not None:
+                self._pending_revise.setdefault(scope, []).append(pre_state)
             mode_note = "(自动取最近一条)" if auto else ""
             return (
                 f"✅ 已覆盖剧情 `{resolved_id}` {mode_note}\n"
@@ -1365,12 +1495,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
     # ════════════════════════════════════════════════════════════════
     # 指令
     # ════════════════════════════════════════════════════════════════
-
-    @filter.command("测试")
-    async def cmd_test(self, event: AstrMessageEvent):
-        """/测试 - 测试插件是否可用"""
-        imgs = await _extract_image(event)
-        yield event.plain_result("data: " + json.dumps(imgs))
 
     @filter.command("创建")
     async def cmd_create(self, event: AstrMessageEvent):
@@ -1452,7 +1576,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             f"🎬 命运开始转动 [模式 {mode} - {MODE_NAMES[mode]}],正在编织你的人生..."
         )
         result = await self._generate(event, session, first_input, mode, imgs)
-        yield event.plain_result(result)
+        async for _ in self._yield_narrative_result(event, result):
+            yield _
 
     @filter.command("do", alias={"input", "输入"})
     async def cmd_input(self, event: AstrMessageEvent):
@@ -1500,7 +1625,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
 
         yield event.plain_result(f"⏳ 命运的齿轮转动中... [模式 {mode}]")
         result = await self._generate(event, session, action, mode, imgs)
-        yield event.plain_result(result)
+        async for _ in self._yield_narrative_result(event, result):
+            yield _
 
     @filter.command("进度")
     async def cmd_progress(self, event: AstrMessageEvent):
@@ -1722,7 +1848,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         narr_stats = None
         scope = self._sim_session_key(event)
         if target_narr_snap is not None:
-            narr_stats = await self._restore_narrative_history(scope, target_narr_snap)
+            narr_stats = await self._restore_narrative_history(
+                scope, target_narr_snap, narr_snapshots
+            )
         session["narrative_snapshots"] = [
             s for s in narr_snapshots if s.get("turn", 0) <= target_turn
         ]
@@ -2194,7 +2322,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                     lines.append(f"    📍 说明:{label}")
                 lines.append(f"    📏 分支存档点:第 {b_turn} 轮")
                 if turn_now > b_turn:
-                    lines.append(f"    🎯 当前进度:第 {turn_now} 轮(已从分支点推进 {turn_now - b_turn} 轮)")
+                    lines.append(
+                        f"    🎯 当前进度:第 {turn_now} 轮(已从分支点推进 {turn_now - b_turn} 轮)"
+                    )
                 else:
                     lines.append(f"    🎯 当前进度:第 {turn_now} 轮(正好在分支点)")
             elif name:
@@ -2214,7 +2344,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         if sub in ("保存", "save", "set", "存档"):
             name, desc = self._parse_branch_name_desc(rest)
             if not name:
-                yield event.plain_result("❌ 用法:`/分支 保存 <名称> [说明]`(如 `/分支 保存 TE线 王都线结局`)")
+                yield event.plain_result(
+                    "❌ 用法:`/分支 保存 <名称> [说明]`(如 `/分支 保存 TE线 王都线结局`)"
+                )
                 return
             if name == "主线":
                 yield event.plain_result("❌ 「主线」是自动保留分支名,请换一个名字。")
@@ -2238,10 +2370,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
         if sub in ("切换", "switch", "to", "回", "load"):
             name = rest.strip()
             if not name:
-                yield event.plain_result("❌ 用法:`/分支 切换 <名称>`(先 /分支 列表 查看)")
+                yield event.plain_result(
+                    "❌ 用法:`/分支 切换 <名称>`(先 /分支 列表 查看)"
+                )
                 return
             if name not in branches:
-                yield event.plain_result(f"❌ 分支「{name}」不存在。用 /分支 列表 查看已有分支。")
+                yield event.plain_result(
+                    f"❌ 分支「{name}」不存在。用 /分支 列表 查看已有分支。"
+                )
                 return
             # 切换前:把当前主线自动保留(仅当「主线」槽位为空,避免覆盖已保留的主线)
             auto_saved = False
@@ -2268,9 +2404,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                             break
                     if position:
                         break
-            lines = [
-                f"🌿 已切换到分支「{name}」(第 {target.get('lore_turn', 0)} 轮)"
-            ]
+            lines = [f"🌿 已切换到分支「{name}」(第 {target.get('lore_turn', 0)} 轮)"]
             if position:
                 lines.append(f"   📍 当前进度:{position}")
             if auto_saved:
@@ -2286,7 +2420,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 yield event.plain_result("❌ 用法:`/分支 删除 <名称>`")
                 return
             if name == "主线":
-                yield event.plain_result("❌ 「主线」是自动保留分支,不能用此命令删除(它每次切换前自动更新)。")
+                yield event.plain_result(
+                    "❌ 「主线」是自动保留分支,不能用此命令删除(它每次切换前自动更新)。"
+                )
                 return
             if name not in branches:
                 yield event.plain_result(f"❌ 分支「{name}」不存在。")
@@ -2334,7 +2470,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
                 for n, es in chars:
                     lines.append(f"  👤 {n}: {len(es)} 条")
             else:
-                lines.append("  👤 暂无角色设定(life_sim_save_character_lore 后自动累积)")
+                lines.append(
+                    "  👤 暂无角色设定(life_sim_save_character_lore 后自动累积)"
+                )
             lines += [
                 "",
                 "💡 /lore <角色名> 查看该角色全部设定 · /lore 世界观 查看世界设定",
