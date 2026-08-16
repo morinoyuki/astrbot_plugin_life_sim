@@ -47,9 +47,7 @@ class MdToImageMixin:
     def _md_init(self) -> None:
         """初始化渲染引擎(样式惰性加载,首次渲染时读取模板目录)。"""
         self._md_style = None
-        self._md_style_path = (
-            self._cfg("output_image_style_path", "") or ""
-        ).strip()
+        self._md_style_path = (self._cfg("output_image_style_path", "") or "").strip()
 
     async def _md_load_style(self) -> None:
         """惰性加载模板目录样式(LoadMarkdownStyles,含 setting.json + elements.json)。"""
@@ -102,9 +100,11 @@ class MdToImageMixin:
 
         # 模板样式渲染器(LoadMarkdownStyles 的同步 Render):
         #     style.Render(md, autoPage=True).image
-        if self._md_style is not None and not dataclasses.is_dataclass(
-            self._md_style
-        ) and hasattr(self._md_style, "Render"):
+        if (
+            self._md_style is not None
+            and not dataclasses.is_dataclass(self._md_style)
+            and hasattr(self._md_style, "Render")
+        ):
             loop = asyncio.get_running_loop()
             img = await loop.run_in_executor(
                 None,
@@ -134,41 +134,3 @@ class MdToImageMixin:
             return tmp_path
 
         return await loop.run_in_executor(None, _save)
-
-    # ─── LLM 工具(模型主动渲染富文本) ─────────────────────────
-
-    async def render_markdown_to_image(
-        self,
-        event,
-        markdown: str = "",
-        title: str = "",
-        auto_page: bool = False,
-        transparent_bg: bool = False,
-    ) -> str:
-        """将 Markdown 文本渲染为图片并发送给用户。当回复包含表格、代码块、标题、列表、公式、引用等富文本排版,文本形式难以清晰展示时调用本工具。
-
-        Args:
-            markdown(string): 要渲染的完整 Markdown 文本,支持标题、列表、表格、代码块、公式等语法
-            title(string): 可选,图片顶部的标题文字,留空则不显示标题
-            auto_page(boolean): 可选,是否自动分页排版(内容很长时可设为 true)
-            transparent_bg(boolean): 可选,是否使用透明背景、去除装饰,默认 false
-        Returns:
-            确认消息。
-        """
-        md = (markdown or "").strip()
-        if not md:
-            return "❌ markdown 内容不能为空。"
-        try:
-            path = await self.md_render_to_path(
-                md,
-                title=title,
-                # 配置开关 output_image_auto_page 作为全局默认,模型显式传 true 也会开启
-                autoPage=auto_page or bool(self._cfg("output_image_auto_page", True)),
-                noDecoration=transparent_bg,
-            )
-            event.track_temporary_local_file(path)
-            await event.send(event.image_result(path))
-            return "✅ Markdown 已渲染为图片并发送给用户。"
-        except Exception as e:
-            logger.error(f"life-sim: render_markdown_to_image 失败: {e}")
-            return f"❌ 渲染失败: {e}"

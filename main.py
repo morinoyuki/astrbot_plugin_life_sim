@@ -443,7 +443,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 "life_sim_save_character_lore",
                 "life_sim_save_world_lore",
                 "life_sim_revise_narrative",
-                "render_markdown_to_image",
             }
         )
 
