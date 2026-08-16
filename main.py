@@ -7,6 +7,7 @@
 """
 
 import asyncio
+import copy
 import json
 import os
 import re
@@ -2040,6 +2041,353 @@ class LifeSimPlugin(DiceMixin, RPGMixin, Star):
             yield event.plain_result(
                 f"❌ 找不到记录 `{target}`(可能 ID 输错,或不在当前 scope)"
             )
+
+    # ════════════════════════════════════════════════════════════════
+    # 剧情分支:保存 / 切换 / 列表 / 删除
+    # ════════════════════════════════════════════════════════════════
+
+    @staticmethod
+    def _parse_branch_name_desc(rest: str) -> tuple[str, str]:
+        """把 `/分支 保存 <名称> [说明]` 的剩余参数拆成 (名称, 说明)。"""
+        rest = (rest or "").strip()
+        if not rest:
+            return "", ""
+        name, _, desc = rest.partition(" ")
+        name = name.strip()
+        return name[:30], desc.strip()
+
+    async def _branch_capture(self, session: dict, event) -> dict:
+        """把当前会话状态完整快照为一个分支(含消息 / lore / RPG / 剧情历史)。
+
+        快照存 session["branches"] 下,切换分支时用 `_branch_restore` 整体还原。
+        刻意**不包含** branches 字段本身 — 分支列表永远以当前会话为准,切换时
+        原样带过去,避免老快照里携带过期分支列表。
+        """
+        scope = self._sim_session_key(event)
+        mode = session.get("mode", "A")
+        return {
+            "world_setting": session.get("world_setting"),
+            "mode": mode,
+            "owner_id": session.get("owner_id"),
+            "owner_name": session.get("owner_name"),
+            "created_at": session.get("created_at"),
+            "messages": copy.deepcopy(session.get("messages", [])),
+            "world_lore": copy.deepcopy(session.get("world_lore") or []),
+            "character_lore": copy.deepcopy(
+                self._normalize_character_lore(session.get("character_lore"))
+            ),
+            "last_narrative_id": session.get("last_narrative_id"),
+            "lore_turn": session.get("lore_turn", 0),
+            "lore_snapshots": copy.deepcopy(session.get("lore_snapshots") or []),
+            "rpg_snapshots": copy.deepcopy(session.get("rpg_snapshots") or []),
+            "narrative_snapshots": copy.deepcopy(
+                session.get("narrative_snapshots") or []
+            ),
+            # RPG 存档/会话的磁盘快照 + 剧情历史全量 — 还原时整体回滚
+            "rpg_state": self._rpg_snapshot(event, mode),
+            "narrative_records": await self.narrative_store.list(scope),
+        }
+
+    async def _branch_restore(self, branch: dict, event) -> dict:
+        """把会话还原到分支保存时的状态,返回新 session dict(不含 branches 字段)。"""
+        scope = self._sim_session_key(event)
+        new_session = {
+            "world_setting": branch.get("world_setting"),
+            "mode": branch.get("mode", "A"),
+            "owner_id": branch.get("owner_id"),
+            "owner_name": branch.get("owner_name"),
+            "created_at": branch.get("created_at"),
+            "messages": copy.deepcopy(branch.get("messages") or []),
+            "world_lore": copy.deepcopy(branch.get("world_lore") or []),
+            "character_lore": copy.deepcopy(branch.get("character_lore") or {}),
+            "last_narrative_id": branch.get("last_narrative_id"),
+            "lore_turn": branch.get("lore_turn", 0),
+            "lore_snapshots": copy.deepcopy(branch.get("lore_snapshots") or []),
+            "rpg_snapshots": copy.deepcopy(branch.get("rpg_snapshots") or []),
+            "narrative_snapshots": copy.deepcopy(
+                branch.get("narrative_snapshots") or []
+            ),
+        }
+        # RPG 数值回滚到分支点(含新建角色/会话的清理)
+        rpg_state = branch.get("rpg_state")
+        if rpg_state:
+            self._rpg_restore(rpg_state)
+        # 剧情历史整体覆盖为分支点状态
+        records = branch.get("narrative_records") or []
+        await self.narrative_store.overwrite_all(scope, records)
+        return new_session
+
+    @filter.command("分支", alias={"branch"})
+    async def cmd_branch(self, event: AstrMessageEvent):
+        """/分支 [保存|切换|列表|删除] - 剧情分支管理(TE/BE/HE 多结局存档)"""
+        lock = self._get_sim_lock(self._sim_session_key(event))
+        if lock.locked():
+            yield event.plain_result(self._busy_message())
+            return
+
+        async with lock:
+            async for _ in self._cmd_branch_body(event):
+                yield _
+
+    async def _cmd_branch_body(self, event: AstrMessageEvent):
+        arg = self._extract_after_cmd(event, ("分支", "branch")).strip()
+        session = await self._load_sim(event)
+        if not session:
+            yield event.plain_result(
+                "❌ 当前没有进行中的转生模拟,请先使用 /创建 <世界观> 开始。"
+            )
+            return
+
+        parts = arg.split(maxsplit=1)
+        sub = (parts[0] if parts else "").lower()
+        rest = parts[1] if len(parts) > 1 else ""
+        branches = session.setdefault("branches", {})
+        scope = self._sim_session_key(event)
+
+        # ── 列表(默认) ──
+        if not sub or sub in ("列表", "list", "ls", "查看"):
+            current = session.get("current_branch")
+            lines = ["🌿 剧情分支管理"]
+            if not branches:
+                lines.append("  (暂无分支 — 当前进度尚未保存为分支)")
+            else:
+                for name, b in branches.items():
+                    turn = b.get("lore_turn", 0)
+                    label = (b.get("label") or "").strip()
+                    tag = "  [自动]" if name == "主线" else ""
+                    desc = f" — {label}" if label else ""
+                    marker = "  ← 当前" if name == current else ""
+                    lines.append(f"  · {name}(第 {turn} 轮){tag}{desc}{marker}")
+            lines += [
+                "",
+                "用法:",
+                "  /分支 当前 — 查看当前所在分支与进度",
+                "  /分支 保存 <名称> [说明] — 保存当前进度为分支(如 TE线 / BE线)",
+                "  /分支 切换 <名称> — 回到该分支(切换前的主线自动保留为「主线」)",
+                "  /分支 删除 <名称> — 删除分支",
+            ]
+            yield event.plain_result("\n".join(lines))
+            return
+
+        # ── 当前 ──
+        if sub in ("当前", "now", "current", "info", "详情"):
+            name = session.get("current_branch")
+            turn_now = session.get("lore_turn", 0)
+            n_records = len(await self.narrative_store.list(scope))
+            position = ""
+            for m in reversed(session.get("messages") or []):
+                if m.get("role") == "assistant":
+                    for ln in _content_to_text(m.get("content")).split("\n"):
+                        s = ln.strip()
+                        if s.startswith(("## ", "# ")):
+                            position = s.lstrip("# ").strip()[:40]
+                            break
+                    if position:
+                        break
+            lines = ["🌿 当前分支"]
+            if name and name in branches:
+                b = branches[name]
+                b_turn = b.get("lore_turn", 0)
+                label = (b.get("label") or "").strip()
+                lines.append(f"  · {name}")
+                if label:
+                    lines.append(f"    📍 说明:{label}")
+                lines.append(f"    📏 分支存档点:第 {b_turn} 轮")
+                if turn_now > b_turn:
+                    lines.append(f"    🎯 当前进度:第 {turn_now} 轮(已从分支点推进 {turn_now - b_turn} 轮)")
+                else:
+                    lines.append(f"    🎯 当前进度:第 {turn_now} 轮(正好在分支点)")
+            elif name:
+                lines.append(f"  · {name}(该分支已被删除,现在处于其延续线上)")
+                lines.append(f"    🎯 当前进度:第 {turn_now} 轮")
+            else:
+                lines.append("  · 主线(进行中,尚未从任何保存的分支继续)")
+                lines.append(f"    🎯 当前进度:第 {turn_now} 轮")
+            if position:
+                lines.append(f"    📌 当前位置:{position}")
+            lines.append(f"    📝 剧情记录:{n_records} 条")
+            lines.append("    💡 /分支 列表 查看全部分支 · /分支 切换 <名称> 切换路线")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        # ── 保存 ──
+        if sub in ("保存", "save", "set", "存档"):
+            name, desc = self._parse_branch_name_desc(rest)
+            if not name:
+                yield event.plain_result("❌ 用法:`/分支 保存 <名称> [说明]`(如 `/分支 保存 TE线 王都线结局`)")
+                return
+            if name == "主线":
+                yield event.plain_result("❌ 「主线」是自动保留分支名,请换一个名字。")
+                return
+            capture = await self._branch_capture(session, event)
+            capture["label"] = desc
+            overwritten = name in branches
+            branches[name] = capture
+            await self._save_sim(event, session)
+            turn = capture.get("lore_turn", 0)
+            overwrite_note = "(已覆盖同名分支)" if overwritten else ""
+            yield event.plain_result(
+                f"🌿 分支「{name}」已保存 {overwrite_note}\n"
+                f"   位置:第 {turn} 轮"
+                + (f" | 说明: {desc}" if desc else "")
+                + "\n💡 继续推进后随时可用 /分支 切换 回到这里体验另一条路线。"
+            )
+            return
+
+        # ── 切换 ──
+        if sub in ("切换", "switch", "to", "回", "load"):
+            name = rest.strip()
+            if not name:
+                yield event.plain_result("❌ 用法:`/分支 切换 <名称>`(先 /分支 列表 查看)")
+                return
+            if name not in branches:
+                yield event.plain_result(f"❌ 分支「{name}」不存在。用 /分支 列表 查看已有分支。")
+                return
+            # 切换前:把当前主线自动保留(仅当「主线」槽位为空,避免覆盖已保留的主线)
+            auto_saved = False
+            if "主线" not in branches:
+                auto = await self._branch_capture(session, event)
+                auto["label"] = "切换分支前的当前进度(自动保留)"
+                branches["主线"] = auto
+                auto_saved = True
+
+            target = branches[name]
+            new_session = await self._branch_restore(target, event)
+            new_session["branches"] = branches  # 分支列表随切换原样保留
+            new_session["current_branch"] = name  # 标记当前所在分支
+            await self._save_sim(event, new_session)
+
+            # 回显目标分支最后一段剧情位置
+            position = ""
+            for m in reversed(target.get("messages") or []):
+                if m.get("role") == "assistant":
+                    for ln in _content_to_text(m.get("content")).split("\n"):
+                        s = ln.strip()
+                        if s.startswith(("## ", "# ")):
+                            position = s.lstrip("# ").strip()[:40]
+                            break
+                    if position:
+                        break
+            lines = [
+                f"🌿 已切换到分支「{name}」(第 {target.get('lore_turn', 0)} 轮)"
+            ]
+            if position:
+                lines.append(f"   📍 当前进度:{position}")
+            if auto_saved:
+                lines.append("   💾 切换前的主线已自动保存为「主线」,可随时切回。")
+            lines.append("   直接 /do 继续推进即可。")
+            yield event.plain_result("\n".join(lines))
+            return
+
+        # ── 删除 ──
+        if sub in ("删除", "del", "delete", "remove"):
+            name = rest.strip()
+            if not name:
+                yield event.plain_result("❌ 用法:`/分支 删除 <名称>`")
+                return
+            if name == "主线":
+                yield event.plain_result("❌ 「主线」是自动保留分支,不能用此命令删除(它每次切换前自动更新)。")
+                return
+            if name not in branches:
+                yield event.plain_result(f"❌ 分支「{name}」不存在。")
+                return
+            del branches[name]
+            # 删除的正是当前分支时,回到「主线」标记
+            if session.get("current_branch") == name:
+                session["current_branch"] = None
+            await self._save_sim(event, session)
+            yield event.plain_result(f"🗑️ 分支「{name}」已删除。")
+            return
+
+        yield event.plain_result(
+            "❌ 未知子命令。支持:当前 / 保存 / 切换 / 列表 / 删除\n"
+            "   例:/分支 当前 · /分支 保存 TE线 结局线 · /分支 切换 TE线 · /分支 列表"
+        )
+
+    # ════════════════════════════════════════════════════════════════
+    # 角色 lore 查看
+    # ════════════════════════════════════════════════════════════════
+
+    @filter.command("lore", alias={"设定", "角色设定", "人物设定"})
+    async def cmd_lore(self, event: AstrMessageEvent):
+        """/lore [角色名|世界观] - 查看角色/世界观持久化设定"""
+        session = await self._load_sim(event)
+        if not session:
+            yield event.plain_result(
+                "❌ 当前没有进行中的转生模拟,请先使用 /创建 <世界观> 开始。"
+            )
+            return
+
+        arg = self._extract_after_cmd(
+            event, ("lore", "设定", "角色设定", "人物设定")
+        ).strip()
+        char_lore = self._normalize_character_lore(session.get("character_lore"))
+        world_lore = session.get("world_lore") or []
+
+        # ── 总览 ──
+        if not arg:
+            lines = ["📖 当前设定总览"]
+            if world_lore:
+                lines.append(f"  🌍 世界观设定: {len(world_lore)} 条")
+            chars = [(n, es) for n, es in char_lore.items() if es]
+            if chars:
+                for n, es in chars:
+                    lines.append(f"  👤 {n}: {len(es)} 条")
+            else:
+                lines.append("  👤 暂无角色设定(life_sim_save_character_lore 后自动累积)")
+            lines += [
+                "",
+                "💡 /lore <角色名> 查看该角色全部设定 · /lore 世界观 查看世界设定",
+            ]
+            yield event.plain_result("\n".join(lines))
+            return
+
+        # ── 世界观 ──
+        if arg in ("世界观", "world", "world_lore"):
+            if not world_lore:
+                yield event.plain_result("🌍 暂无世界观设定。")
+                return
+            lines = ["🌍 持久化世界观(时间轴):"]
+            lines.extend(self._render_lore_timeline(world_lore, indent="  "))
+            yield event.plain_result("\n".join(lines))
+            return
+
+        # ── 角色名匹配:精确 → 大小写不敏感 → 子串 ──
+        target = arg.strip()
+        matched = None
+        if target in char_lore:
+            matched = target
+        else:
+            low = target.lower()
+            for name in char_lore:
+                if name.lower() == low:
+                    matched = name
+                    break
+            if matched is None:
+                for name in char_lore:
+                    if low in name.lower() or name.lower() in low:
+                        matched = name
+                        break
+        if matched is None:
+            available = "、".join(n for n in char_lore if char_lore[n])
+            yield event.plain_result(
+                f"❌ 未找到角色「{target}」。"
+                + (f"现有角色:{available}" if available else "暂无角色设定")
+                + "\n💡 /lore 查看总览 · /lore 世界观 查看世界设定"
+            )
+            return
+
+        entries = char_lore[matched]
+        if not entries:
+            yield event.plain_result(f"👤 {matched}:暂无设定条目。")
+            return
+        lines = [f"👤 {matched} 设定(时间轴):"]
+        lines.extend(
+            self._render_lore_timeline(
+                entries, indent="  ", hard_sections={"appearance", "forms"}
+            )
+        )
+        yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
         logger.info("life-sim: 插件已卸载")
