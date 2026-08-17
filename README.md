@@ -73,10 +73,10 @@
 
 /创建 dnd 我是一名半精灵游侠,被遗忘的国度,灰鹰冒险
 
-/继续 1                    # 选第 1 项
-/继续 2                    # 选第 2 项
-/继续 我决定先去跟久久打招呼    # 自定义行动
-/继续 上一段写得太惨了,重新写  # 反馈修正
+/do 1                    # 选第 1 项
+/do 2      do              # 选第 2 项
+/do 我决定先去跟久久打招呼    # 自定义行动
+/do 上一段写得太惨了,重新写  # 反馈修正
 
 /进度                       # 查看进度
 /undo 2                     # 撤销最近 2 轮(含 lore 与 RPG 状态回滚)
@@ -257,21 +257,3 @@ LLM 调用时通过 `contexts=[...]` 显式传入,完全不走主对话的 `conv
 - **依赖**:无第三方依赖,使用 AstrBot 自带能力
 - **最低 AstrBot 版本**: `>=4.5.7`(用到 `llm_generate` 的 `system_prompt` / `contexts` 参数;老版本会自动回退)
 - **上下文窗口**:大部分模型支持 32k-128k,设置 `max_history_chars` 在 30k-100k 之间比较合理
-
-## 更新日志
-
-- v1.0 — 模式 A(纯叙事)初始版本
-- v2.0 — 模式 B(集成 rpg_calc 全部 27 个工具)+ 模式 C(集成 roll_dice 骰子)
-- v2.1 — 配置 schema(模型选择 + 调参)
-- v2.2 — 历史压缩改用 LLM(规则抽取降级为 fallback)
-- v2.3 — 模式识别改用 LLM(关键词降级为 fallback)
-- v2.4 — 指令前缀不硬编码(text.find 自适应)
-- v2.5 — 禁止 LLM 输出 UI/菜单式提示语
-- v3.0 — **存储重构**:
-  - KV 存储迁出,改为 `storage_sim.py` / `storage_rpg.py` + `storage_base.py` 公共原语层,sim/rpg 各自独立模块
-  - 写盘走 `tmp + os.replace` 原子替换;私聊/非数字平台 group_id 兼容
-  - `/undo` 引入 lore 快照 + RPG 数值快照,按 turn 计数完整回滚
-  - 工具 lore 调用改为 `self._pending_lore` 实例暂存 + 统一落库,修复"工具保存被外层覆写"竞态
-  - 多角色 `character_lore`:`{角色名: [{section,...}]}` 结构,旧 list 自动迁移到"主角"
-  - 每会话一把 `asyncio.Lock`,`/创建` `/do` `/undo` `/删除` 各自在命令入口互斥
-  - 修复 `rpg_set_attribute` 大小写 bypass、`rpg_change_class` respec 重复加点、`rpg_define_class` 非 DND 误判 hit_die、`cmd_dump` 大 payload 静默吞输出 等多项 bug
