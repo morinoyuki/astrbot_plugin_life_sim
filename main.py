@@ -124,6 +124,18 @@ def _strip_xml_tags(text: str) -> str:
     return cleaned.strip()
 
 
+def _strip_meta_tags(text: str) -> str:
+    """只剥掉系统注入标签(<system_reminder> / <narrative_ref>),保留用户真实输入。
+
+    用于 /redo 恢复上一轮的原始输入:system_reminder 是运行时注入的(重新生成会
+    再注入),narrative_ref 里的剧情 ID 已随回滚失效;而 <Quoted Message> 是用户
+    引用的上下文,重新生成时应当保留。
+    """
+    for tag in ("system_reminder", "narrative_ref"):
+        text = re.sub(rf"<{tag}>[\s\S]*?</{tag}>", "", text, flags=re.DOTALL)
+    return text.strip()
+
+
 def _parse_tool_from_docstring(docstring: str) -> tuple[str, dict]:
     """从 llm_tool 风格的 docstring 一次解析出 (description, parameters schema)。
 
@@ -191,6 +203,33 @@ async def _extract_image(event: AstrMessageEvent) -> list[Image]:
         comp for comp in event.get_messages() if isinstance(comp, Image)
     ]
     return images
+
+
+def _restore_images_from_content(content) -> list[Image]:
+    """从已存储的 user 消息 content 里恢复图片(Image 组件列表)。
+
+    /redo 时上一轮事件的图片已经过去了,但 `_llm_resp_to_messages` 会把图片
+    以 `data:image/<fmt>;base64,...` 的 ImageURLPart 存进消息历史,这里反序列化回来。
+    自适应任意 MIME(jpeg / png / webp / gif):
+    - url 保留原 data URL(带正确的 MIME 声明,供 `_generate` 的 image_urls 直接传 LLM)
+    - file 设为 base64://(供 MediaResolver 嗅探字节重写历史时解析)
+    """
+    from astrbot.core.message.components import Image
+
+    imgs: list[Image] = []
+    for part in content or []:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") != "image_url":
+            continue
+        url = ((part.get("image_url") or {}).get("url") or "").strip()
+        if not url.startswith("data:image"):
+            continue
+        b64 = url.split(",", 1)[1] if "," in url else ""
+        if not b64:
+            continue
+        imgs.append(Image(file=f"base64://{b64}", url=url))
+    return imgs
 
 
 def _build_quoted_tag(text: str):
@@ -890,14 +929,18 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         content: list[TextPart | ImageURLPart] = [TextPart(text=user_input)]
 
         if images:
-            content += [
-                ImageURLPart(
-                    image_url=ImageURLPart.ImageURL(
-                        url="data:image/png;base64," + await img.convert_to_base64()
+            from astrbot.core.utils.media_utils import MediaResolver
+
+            for img in images:
+                # 自适应图片 MIME:由 MediaResolver 嗅探字节,生成正确的
+                # data:image/jpeg|png|webp|gif;base64,...(不再硬编码 png)。
+                data_url = await MediaResolver(
+                    img.url or img.file or img.path, media_type="image"
+                ).to_data_url()
+                if data_url:
+                    content.append(
+                        ImageURLPart(image_url=ImageURLPart.ImageURL(url=data_url))
                     )
-                )
-                for img in images
-            ]
 
         msgs = [UserMessageSegment(content=content).model_dump()]
 
@@ -1784,37 +1827,21 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             async for _ in self._cmd_undo_body(event):
                 yield _
 
-    async def _cmd_undo_body(self, event: AstrMessageEvent):
-        arg = self._extract_after_cmd(event, "undo").strip()
-        n = 1
-        if arg:
-            try:
-                n = int(arg)
-            except ValueError:
-                yield event.plain_result("❌ 用法:`/undo [N]`,N 为 1-20 的整数")
-                return
-            if n < 1 or n > 20:
-                yield event.plain_result("❌ N 必须在 1-20 之间")
-                return
+    async def _apply_rollback(self, session: dict, scope: str, n: int) -> dict | None:
+        """回滚最近 n 轮对话(就地修改 session),供 /undo 与 /redo 共用。
 
-        session = await self._load_sim(event)
-        if not session:
-            yield event.plain_result("❌ 当前没有活动会话")
-            return
+        回滚范围:消息截断 + 持久化 lore / RPG 数值 / 剧情历史 + 各快照数组 + lore_turn。
+        不落盘 —— 由调用方决定是否 `_save_sim`(/undo 立即存,/redo 交给 _generate 存)。
 
+        返回展示统计 dict;没有可回滚的 user 消息时返回 None。
+        """
         messages = session.get("messages", [])
-        # 找最近 N 个 user 消息的索引
         user_indices = [i for i, m in enumerate(messages) if m.get("role") == "user"]
         if not user_indices:
-            yield event.plain_result("❌ 没有可撤销的轮次")
-            return
+            return None
 
-        # 取最近的 N 个 user 位置作为截断点
-        # user_indices 严格按 enumerate 顺序(时间升序),[-take] = 倒数第 N 个 = 第 N 新的 user
         take = min(n, len(user_indices))
         cut_idx = user_indices[-take]
-
-        # 截断
         removed = messages[cut_idx:]
         messages = messages[:cut_idx]
 
@@ -1858,7 +1885,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             None,
         )
         narr_stats = None
-        scope = self._sim_session_key(event)
         if target_narr_snap is not None:
             narr_stats = await self._restore_narrative_history(
                 scope, target_narr_snap, narr_snapshots
@@ -1874,42 +1900,77 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 session["last_narrative_id"] = last_id
 
         session["messages"] = messages
+
+        # 统计(给展示用)
+        char_dict = (target_snapshot or {}).get("character_lore") or {}
+        return {
+            "turns": take,
+            "removed": removed,
+            "user_n": sum(1 for m in removed if m.get("role") == "user"),
+            "asst_n": sum(1 for m in removed if m.get("role") == "assistant"),
+            "tool_n": sum(1 for m in removed if m.get("role") == "tool"),
+            "summary_n": sum(1 for m in removed if m.get("_summary")),
+            "lore_restored": lore_restored,
+            "lore": {
+                "w_n": len((target_snapshot or {}).get("world_lore") or []),
+                "c_n": sum(
+                    len(v) for v in char_dict.values() if isinstance(v, list)
+                ),
+                "c_chars": sum(1 for v in char_dict.values() if v),
+            },
+            "rpg_stats": rpg_stats,
+            "narr_stats": narr_stats,
+            "remaining_narr": len(await self.narrative_store.list(scope)),
+        }
+
+    async def _cmd_undo_body(self, event: AstrMessageEvent):
+        arg = self._extract_after_cmd(event, "undo").strip()
+        n = 1
+        if arg:
+            try:
+                n = int(arg)
+            except ValueError:
+                yield event.plain_result("❌ 用法:`/undo [N]`,N 为 1-20 的整数")
+                return
+            if n < 1 or n > 20:
+                yield event.plain_result("❌ N 必须在 1-20 之间")
+                return
+
+        session = await self._load_sim(event)
+        if not session:
+            yield event.plain_result("❌ 当前没有活动会话")
+            return
+
+        scope = self._sim_session_key(event)
+        stats = await self._apply_rollback(session, scope, n)
+        if stats is None:
+            yield event.plain_result("❌ 没有可撤销的轮次")
+            return
         await self._save_sim(event, session)
 
         # 统计
-        user_n = sum(1 for m in removed if m.get("role") == "user")
-        asst_n = sum(1 for m in removed if m.get("role") == "assistant")
-        tool_n = sum(1 for m in removed if m.get("role") == "tool")
-        summary_n = sum(1 for m in removed if m.get("_summary"))
-        # 同时显示消息数和剧情记录数,避免混淆(每轮 user+assistant 是 2 条消息,
-        # 但只对应 1 条剧情记录)
-        remaining_narr = len(await self.narrative_store.list(scope))
+        removed = stats["removed"]
+        messages = session.get("messages", [])
         lines = [
-            f"⏪ 已撤销最近 {user_n} 轮对话(删 {len(removed)} 条消息)",
-            f"   组成:user × {user_n}, assistant × {asst_n}, tool × {tool_n}"
-            + (f", summary × {summary_n}" if summary_n else ""),
-            f"   剩余:{len(messages)} 条消息,{remaining_narr} 条剧情记录",
+            f"⏪ 已撤销最近 {stats['user_n']} 轮对话(删 {len(removed)} 条消息)",
+            f"   组成:user × {stats['user_n']}, assistant × {stats['asst_n']}, tool × {stats['tool_n']}"
+            + (f", summary × {stats['summary_n']}" if stats["summary_n"] else ""),
+            f"   剩余:{len(messages)} 条消息,{stats['remaining_narr']} 条剧情记录",
         ]
-        if lore_restored:
-            target_snap = next(
-                (s for s in reversed(snapshots) if s["turn"] == target_turn), None
-            )
-            if target_snap is not None:
-                w_n = len(target_snap["world_lore"])
-                char_dict = target_snap["character_lore"] or {}
-                c_n = sum(len(v) for v in char_dict.values() if isinstance(v, list))
-                c_chars = sum(1 for v in char_dict.values() if v)
-                if w_n or c_n:
-                    parts = []
-                    if w_n:
-                        parts.append(f"世界观 {w_n} 条")
-                    if c_n:
-                        parts.append(f"角色 {c_n} 条(共 {c_chars} 名)")
-                    lines.append(f"   📜 持久化设定回滚:{' + '.join(parts)}")
-                else:
-                    lines.append("   📜 持久化设定回滚(本次 turn 无 lore 变更)")
+        if stats["lore_restored"]:
+            w_n = stats["lore"]["w_n"]
+            c_n = stats["lore"]["c_n"]
+            c_chars = stats["lore"]["c_chars"]
+            if w_n or c_n:
+                parts = []
+                if w_n:
+                    parts.append(f"世界观 {w_n} 条")
+                if c_n:
+                    parts.append(f"角色 {c_n} 条(共 {c_chars} 名)")
+                lines.append(f"   📜 持久化设定回滚:{' + '.join(parts)}")
             else:
-                lines.append("   📜 持久化设定回滚")
+                lines.append("   📜 持久化设定回滚(本次 turn 无 lore 变更)")
+        rpg_stats = stats["rpg_stats"]
         if rpg_stats is not None:
             rc = rpg_stats["restored_chars"]
             rs = rpg_stats["restored_sessions"]
@@ -1930,6 +1991,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 lines.append("   🎮 RPG 数值已回滚(无变化)")
         elif session.get("mode") in ("B", "C"):
             lines.append("   ⚠️ 未找到该 turn 的 RPG 快照(数值未回滚),用 /删除 重建会话")
+        narr_stats = stats["narr_stats"]
         if narr_stats is not None:
             restored = narr_stats["restored"]
             deleted = narr_stats["deleted"]
@@ -1955,6 +2017,61 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             more = "..." if len(stripped) > 60 else ""
             lines.append(f"   撤销的最后输入:`{preview}{more}`")
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("redo", alias={"重试", "retry"})
+    async def cmd_redo(self, event: AstrMessageEvent):
+        """/redo - 重试上一轮:回滚最近一轮并用相同输入重新生成(不必手动 /undo + /do)"""
+        lock = self._get_sim_lock(self._sim_session_key(event))
+        if lock.locked():
+            yield event.plain_result(self._busy_message())
+            return
+
+        async with lock:
+            async for _ in self._cmd_redo_body(event):
+                yield _
+
+    async def _cmd_redo_body(self, event: AstrMessageEvent):
+        session = await self._load_sim(event)
+        if not session:
+            yield event.plain_result("❌ 当前没有进行中的转生模拟,请先使用 /创建 <世界观> 开始。")
+            return
+
+        messages = session.get("messages", [])
+        # 找最后一个真实的 user 输入(跳过历史压缩生成的摘要消息)
+        last_user = next(
+            (
+                m
+                for m in reversed(messages)
+                if m.get("role") == "user" and not m.get("_summary")
+            ),
+            None,
+        )
+        if last_user is None:
+            yield event.plain_result("❌ 没有可重试的轮次(至少需要一轮 /do)。")
+            return
+
+        # 回滚前先提取上一轮的原始输入:文本(剥系统标签、保留引用)+ 图片
+        content = last_user.get("content")
+        user_input = _strip_meta_tags(_content_to_text(content))
+        if not user_input:
+            user_input = "请继续推进剧情(重新生成上一轮输出)"
+        imgs = _restore_images_from_content(content)
+
+        scope = self._sim_session_key(event)
+        stats = await self._apply_rollback(session, scope, 1)
+        if stats is None:
+            yield event.plain_result("❌ 没有可重试的轮次")
+            return
+        # 注意:回滚后不立即落盘 —— _generate 成功时会统一 save;
+        # 若生成失败,磁盘仍保留上一轮原样,可继续 /redo。
+
+        mode = session.get("mode", "A")
+        yield event.plain_result(
+            f"🔄 正在重新生成上一轮 [模式 {mode}]" + ("(含图片)" if imgs else "") + "..."
+        )
+        result = await self._generate(event, session, user_input, mode, imgs)
+        async for _ in self._yield_narrative_result(event, result):
+            yield _
 
     # ════════════════════════════════════════════════════════════════
     # 剧情历史:列表 / 上传 / 删除
