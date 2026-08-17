@@ -227,3 +227,5 @@ $RECYCLE.BIN/
 *.zip
 data/
 .vscode/
+tests/
+

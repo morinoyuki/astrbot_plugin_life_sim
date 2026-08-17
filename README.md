@@ -117,10 +117,13 @@ WebUI → 插件管理 → 转生模拟器 → 配置,共 12 项:
 
 ### 开关
 
-| 字段                  | 默认   | 说明                                   |
-| --------------------- | ------ | -------------------------------------- |
-| `use_llm_compress`    | `true` | 关闭则用纯规则抽取标题与世界观(快但粗) |
-| `use_llm_mode_detect` | `true` | 关闭则只用关键词匹配(快但简陋)         |
+| 字段                     | 默认    | 说明                                                                       |
+| ------------------------ | ------- | -------------------------------------------------------------------------- |
+| `use_llm_compress`       | `true`  | 关闭则用纯规则抽取标题与世界观(快但粗)                                     |
+| `use_llm_mode_detect`    | `true`  | 关闭则只用关键词匹配(快但简陋)                                             |
+| `output_as_image`        | `false` | 开启后 `/创建` `/do` 的叙事输出自动渲染为图片(失败自动回退纯文本)           |
+| `output_image_style_path`| `""`     | pillowmd 模板样式目录;样式带 `page>0` 多帧动画背景时输出 GIF(如独角兽gif)  |
+| `output_image_auto_page` | `true`  | 渲染时自动分页(黄金分割比),避免超长单图                                   |
 
 **模型路由推荐配置:**
 
@@ -163,6 +166,10 @@ astrbot_plugin_life_sim/
 ├── storage_sim.py        # SimStore:sim 会话存储
 │                         #   - <data>/sim_sessions/<key>.json
 │                         #   - asyncio.to_thread 包装同步 IO
+├── storage_narrative.py  # NarrativeStore:剧情历史存储(独立于会话)
+│                         #   - <data>/narrative_history/<scope>/<id>.json
+├── storage_branch.py     # BranchStore:剧情分支快照存储(独立于会话)
+│                         #   - <data>/sim_branches/<scope>/<name>.json
 └── storage_rpg.py        # RpgStore:RPG 角色 + 会话存储
                           #   - <data>/rpg_saves/<uid>.json
                           #   - <data>/sessions/<sid>.json
@@ -176,6 +183,25 @@ astrbot_plugin_life_sim/
 叙事历史存到 `<data>/sim_sessions/<key>.json`,key 形如 `group_<gid>` / `user_<uid>`。
 文件层不依赖 AstrBot 的 KV(原 KV 实现因并发工具调用存在"工具保存被外层覆写"的竞态,见更新日志 v3.0)。
 LLM 调用时通过 `contexts=[...]` 显式传入,完全不走主对话的 `conversation_manager`。
+
+### 剧情分支(独立快照存储)
+
+- 分支快照存 `<data>/sim_branches/<scope>/<urlencoded_name>.json`,**不**随 sim 会话文件读写;
+  分支名用 `quote_plus` 编码成安全文件名(兼容 `/ \ : *` 等非法字符),真实名存在快照的 `name` 字段。
+- 每个分支是自包含的完整快照(messages / lore / RPG 数值 / 剧情历史全量),切换时整体还原,
+  并覆盖 `narrative_history` 与 RPG 存档到分支点。
+- 生命周期与会话绑定:`/创建`(覆盖重开)与 `/删除` 会同时清理该 scope 的全部分支快照;
+  老版本存在 `session["branches"]` 里的数据会在首次使用 `/分支` 时自动迁移到独立存储。
+
+### Markdown → 图片渲染(含 GIF)
+
+- 渲染基于 pillowmd(无浏览器),`md_to_image.py` 统一处理 PNG / GIF 保存:
+  - 样式 `elements.json` 带多帧动画背景(`page` > 0)时,渲染结果 `imageType == "gif"`,
+    按逐帧保存为 `.gif`(`save_all` + `append_images` + 帧时长 + 无限循环);
+    其余保存为 `.png`(多图分页取首张)。
+  - 帧时长用 Pillow 正确的 `duration` 参数(pillowmd 库自带 `Save` 错写为 `duratio` 会被忽略)。
+- 临时文件:渲染成功交给 `event.track_temporary_local_file`,由框架在事件处理完统一删除;
+  渲染/保存失败时 `md_render_to_path` 先删临时文件再抛错,不残留空文件。
 
 ### 持久化 lore
 
