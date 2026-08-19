@@ -141,11 +141,58 @@ _CHAR_ALIAS_PATTERN = re.compile(r"[（(【]\s*([^）)】]+?)\s*[）)】]")
 # 常见末字:跳过 "小X" 昵称变体,避免 "小时/小花/小王" 等高频词误伤
 _NICKNAME_PREFIX_SKIP = {
     # 末字常见(小时/小花/小王/小天…)与首字常见(小明/小美/小红/小龙…)
-    "时", "花", "王", "小", "大", "天", "日", "月", "中", "上", "下",
-    "一", "二", "三", "十", "子", "人", "生", "心", "头", "年", "里",
-    "东", "西", "南", "北", "前", "后", "春", "夏", "秋", "冬",
-    "明", "美", "丽", "红", "白", "黑", "刚", "强", "龙", "虎",
-    "燕", "兰", "梅", "霞", "芳", "玲", "翠", "秀", "英", "杰",
+    "时",
+    "花",
+    "王",
+    "小",
+    "大",
+    "天",
+    "日",
+    "月",
+    "中",
+    "上",
+    "下",
+    "一",
+    "二",
+    "三",
+    "十",
+    "子",
+    "人",
+    "生",
+    "心",
+    "头",
+    "年",
+    "里",
+    "东",
+    "西",
+    "南",
+    "北",
+    "前",
+    "后",
+    "春",
+    "夏",
+    "秋",
+    "冬",
+    "明",
+    "美",
+    "丽",
+    "红",
+    "白",
+    "黑",
+    "刚",
+    "强",
+    "龙",
+    "虎",
+    "燕",
+    "兰",
+    "梅",
+    "霞",
+    "芳",
+    "玲",
+    "翠",
+    "秀",
+    "英",
+    "杰",
 }
 
 
@@ -187,12 +234,16 @@ def _char_aliases(name: str) -> list[str]:
             aliases.append(tail2)
     # 昵称变体(小/阿/酱 × 首字/末字):有括号别名时以括号内容为名,
     # 不用姓的主干首末字(如 "花原（小花）" → 小花)
-    name_part = (bracket_aliases[-1] if bracket_aliases else clean)
+    name_part = bracket_aliases[-1] if bracket_aliases else clean
     if name_part:
         first, last = name_part[0], name_part[-1]
         for variant in (
-            f"小{first}", f"阿{first}", f"{first}酱",
-            f"小{last}", f"阿{last}", f"{last}酱",
+            f"小{first}",
+            f"阿{first}",
+            f"{first}酱",
+            f"小{last}",
+            f"阿{last}",
+            f"{last}酱",
         ):
             # 常见高频「小X」保护:小+首字 用首字黑名单(小明/小美…),
             # 小+末字 用末字黑名单(小时/小花…);方向错开,互不连坐
@@ -610,7 +661,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 "life_sim_save_character_lore",
                 "life_sim_save_world_lore",
                 "life_sim_get_character_lore",
-                "life_sim_get_world_lore",
                 "life_sim_revise_narrative",
             }
         )
@@ -1530,29 +1580,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 "## 持久化世界观(自动注入每次对话)",
                 "**⚠️ 以下世界观设定为本局唯一权威事实,叙事必须严格遵循,严禁凭印象修改、补充或「修正」。**",
             ]
-            if selective:
-                # 每个 section 只注入最新一条(世界状态以最新为准),历史按需读取
-                latest: dict[str, dict] = {}
-                counts: dict[str, int] = {}
-                order: list[str] = []
-                for e in world_lore:
-                    sec = str(e.get("section", "general"))
-                    if sec not in counts:
-                        counts[sec] = 0
-                        order.append(sec)
-                    counts[sec] += 1
-                    latest[sec] = e
-                for sec in order:
-                    e = latest[sec]
-                    extra = ""
-                    if counts[sec] > 1:
-                        extra = (
-                            f"(另有 {counts[sec] - 1} 条历史,可调 "
-                            f'life_sim_get_world_lore(section="{sec}") 查看)'
-                        )
-                    lines.append(f"- **[{sec}]** {e.get('content', '')} {extra}".rstrip())
-            else:
-                lines.extend(self._render_lore_timeline(world_lore))
+            # 世界观条目通常不多(几个 section 累积),一律**完整注入**,不做按需裁剪:
+            # 按需加载依赖 LLM 主动调用读取工具,弱模型可能不读就凭印象写,
+            # 直接违反设定权威性;且世界观历史条目的来龙去脉本身就有参考价值。
+            # (`lore_selective_load` 只裁剪角色设定段)
+            lines.extend(self._render_lore_timeline(world_lore))
             parts.append("\n".join(lines))
 
         char_lore_dict = self._normalize_character_lore(session.get("character_lore"))
@@ -1578,7 +1610,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             if selective:
                 lines.append(
                     "**选择性加载:以下仅完整列出最近出场过的角色;未出场角色只显示名字。"
-                    "需要刻画未出场角色时,先调 `life_sim_get_character_lore(character=\"角色名\")` "
+                    '需要刻画未出场角色时,先调 `life_sim_get_character_lore(character="角色名")` '
                     "拿到完整设定再写,不要凭空发挥。**"
                 )
             # 按首次出现顺序遍历角色(dict 天然保序),新角色追加在块末尾,
@@ -1600,12 +1632,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             if inactive:
                 # 未出场角色合并为紧凑列表(名字 + 条数),提示只写一次
                 summary = "、".join(f"{n}({c}条)" for n, c in inactive)
-                lines.append(
-                    f"⏸️ **未出场角色**({len(inactive)} 名):{summary}"
-                )
+                lines.append(f"⏸️ **未出场角色**({len(inactive)} 名):{summary}")
                 lines.append(
                     "- 💡 刻画其中任何角色前,调 "
-                    "`life_sim_get_character_lore(character=\"角色名\")` "
+                    '`life_sim_get_character_lore(character="角色名")` '
                     "获取完整设定后再写;忘记角色名时可传空值让工具列出全部。"
                 )
             parts.append("\n".join(lines))
@@ -1707,9 +1737,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             event, "character_lore", section, content, character=character
         )
 
-    async def life_sim_get_character_lore(
-        self, event, character: str = "主角"
-    ) -> str:
+    async def life_sim_get_character_lore(self, event, character: str = "主角") -> str:
         """
         按需读取某个角色的完整持久化设定(剧情需要时调用)
 
@@ -1776,50 +1804,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 f"ℹ️ 共匹配到 {len(matched_keys)} 个角色 key(可能含同一角色的不同称呼),以下全部列出:",
             )
         return "\n\n".join(blocks)
-
-    async def life_sim_get_world_lore(
-        self, event, section: str = ""
-    ) -> str:
-        """
-        按需读取世界观设定(剧情需要时调用)
-
-        适用场景:
-        - 系统默认**选择性加载**:世界观每个 section 只注入最新一条,
-          历史条目 / 被裁剪的细节需要确认时,调本工具拿完整时间轴。
-        - 需要确认某个设定(魔法体系 / 势力分布 / 地理 / 历史等)的完整来龙去脉时。
-
-        Args:
-            section(string): 要读取的世界观分类标签(如 "魔法体系" / "factions"),默认="",省略时返回全部世界观设定
-        Returns:
-            该 section(或全部)的世界观完整设定文本。
-        """
-        event_key = self._sim_session_key(event)
-        session = await self._load_sim(event)
-        if not session:
-            return "❌ 当前没有进行中的转生模拟,请先 /创建。"
-        staging = self._pending_lore.get(event_key) or {}
-        world_lore = staging.get("world_lore") or session.get("world_lore") or []
-        sec = (section or "").strip()
-        if sec:
-            filtered = [
-                e for e in world_lore if str(e.get("section", "")).strip() == sec
-            ]
-            if not filtered:
-                secs = "、".join(
-                    dict.fromkeys(str(e.get("section", "")) for e in world_lore)
-                )
-                return (
-                    f"❌ 世界观 section「{sec}」暂无记录。"
-                    f"已有 section:{secs or '(暂无)'}"
-                )
-            lines = [f"# 世界观「{sec}」(完整时间轴)"]
-            lines.extend(self._render_lore_timeline(filtered))
-            return "\n".join(lines)
-        if not world_lore:
-            return "📭 世界观暂无持久化设定。"
-        lines = ["# 世界观持久化设定(完整)"]
-        lines.extend(self._render_lore_timeline(world_lore))
-        return "\n".join(lines)
 
     async def life_sim_revise_narrative(
         self,
@@ -1975,7 +1959,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
         yield event.plain_result(
             f"🎬 命运开始转动 [模式 {mode} - {MODE_NAMES[mode]}],正在编织你的人生..."
-            + (f"\n⚠️ 已随旧会话清理 {n_branches} 个剧情分支存档。" if n_branches else "")
+            + (
+                f"\n⚠️ 已随旧会话清理 {n_branches} 个剧情分支存档。"
+                if n_branches
+                else ""
+            )
         )
         result = await self._generate(event, session, first_input, mode, imgs)
         async for _ in self._yield_narrative_result(event, result):
@@ -2261,9 +2249,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             "lore_restored": lore_restored,
             "lore": {
                 "w_n": len((target_snapshot or {}).get("world_lore") or []),
-                "c_n": sum(
-                    len(v) for v in char_dict.values() if isinstance(v, list)
-                ),
+                "c_n": sum(len(v) for v in char_dict.values() if isinstance(v, list)),
                 "c_chars": sum(1 for v in char_dict.values() if v),
             },
             "rpg_stats": rpg_stats,
@@ -2381,7 +2367,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
     async def _cmd_redo_body(self, event: AstrMessageEvent):
         session = await self._load_sim(event)
         if not session:
-            yield event.plain_result("❌ 当前没有进行中的转生模拟,请先使用 /创建 <世界观> 开始。")
+            yield event.plain_result(
+                "❌ 当前没有进行中的转生模拟,请先使用 /创建 <世界观> 开始。"
+            )
             return
 
         messages = session.get("messages", [])
@@ -2415,7 +2403,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
         mode = session.get("mode", "A")
         yield event.plain_result(
-            f"🔄 正在重新生成上一轮 [模式 {mode}]" + ("(含图片)" if imgs else "") + "..."
+            f"🔄 正在重新生成上一轮 [模式 {mode}]"
+            + ("(含图片)" if imgs else "")
+            + "..."
         )
         result = await self._generate(event, session, user_input, mode, imgs)
         async for _ in self._yield_narrative_result(event, result):
@@ -2760,9 +2750,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                     await self.branch_store.save(scope, name, b)
                     migrated += 1
             await self._save_sim(event, session)
-            logger.info(
-                f"life-sim: 已迁移 {migrated} 个旧分支到独立存储 scope={scope}"
-            )
+            logger.info(f"life-sim: 已迁移 {migrated} 个旧分支到独立存储 scope={scope}")
 
         parts = arg.split(maxsplit=1)
         sub = (parts[0] if parts else "").lower()
@@ -2884,10 +2872,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             refresh_main = "主线" not in branches
             if not refresh_main:
                 main_b = branches.get("主线") or {}
-                refresh_main = (
-                    session.get("current_branch") == "主线"
-                    and session.get("lore_turn", 0) > main_b.get("lore_turn", 0)
-                )
+                refresh_main = session.get("current_branch") == "主线" and session.get(
+                    "lore_turn", 0
+                ) > main_b.get("lore_turn", 0)
             if refresh_main:
                 auto = await self._branch_capture(session, event)
                 auto["label"] = "切换分支前的当前进度(自动保留)"
