@@ -377,9 +377,19 @@ C. 睡觉
 调工具:
 - **追加新事实** → `life_sim_save_character_lore(content, section, character="角色名")` / `life_sim_save_world_lore(content, section)`
 
-(系统采用追加模型,只暴露写入工具;当前 lore 状态会作为 system prompt 中的「持久化设定」段自动注入,无需读取。)
+(系统采用**追加模型**写设定 + **选择性加载**注入:system prompt 的「持久化设定」段只完整列出最近出场过的角色,世界观按 section 只注入最新一条;未出场角色只显示名字。)
+
+- **刻画未出场角色前,先调 `life_sim_get_character_lore(character="角色名")` 获取完整设定再写**,不要凭印象发挥。
+- **需要确认世界观历史 / 被裁剪细节时,调 `life_sim_get_world_lore(section="分类")`** 获取完整时间轴。
+- 读取工具不影响设定,不会新增记录;多次读取安全。
+- (模式 A 纯叙事没有工具调用:未出场角色的设定会在其登场后的下一轮自动完整注入,无需手动操作。)
 
 `character` 默认 `"主角"`,出现重要 NPC 时填 NPC 真名/称号(如 `"反抗军首领"`、`"导师·长者"`)。**多个角色并行出现时分别调多次**,按 `(character, section)` 区分。
+
+**角色名规范(重要)**:角色有固定昵称 / 简称 / 称呼时,`character` 写成 `全名（昵称）` 格式,系统会自动提取括号内容用于出场检测和按需读取:
+- `"雪音（小雪）"` — 剧情里叫"小雪"也能命中该角色
+- `"汐见花音（花音）"`、`"梦娜1号（梦娜）"`
+**同一角色只建一个 key**,不要同时存"雪音"和"小雪"两套设定 —— 拆成多个 key 会让设定分散、重复注入。
 
 **section 分类**(不同 section 各累积,同 section 也累积 — 见下面「追加模型」):
 - 角色:forms / appearance / personality / skills / relationships / inventory

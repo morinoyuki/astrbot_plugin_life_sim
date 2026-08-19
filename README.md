@@ -210,11 +210,22 @@ LLM 调用时通过 `contexts=[...]` 显式传入,完全不走主对话的 `conv
   旧 list 结构自动迁移到"主角"桶。工具签名:
   ```
   life_sim_save_character_lore(content, section, character="主角")
+  life_sim_get_character_lore(character)   # 按需读取完整角色设定(不写入)
   ```
 - `world_lore`:list 结构 `[{section, content, updated_at}]`,同 section 覆盖。工具签名:
   ```
   life_sim_save_world_lore(content, section)
+  life_sim_get_world_lore(section="")     # 按需读取世界观(留空返回全部)
   ```
+- **选择性加载**(`lore_selective_load` 默认开,`lore_active_rounds` 默认 6):
+  角色多 / 轮数多时,system prompt 不再被整棵角色树撑爆 ——
+  - 角色:最近 N 轮出场过的角色**完整**注入;未出场角色只注入一行提示(名字 + 条目数),
+    刻画前由 LLM 调 `life_sim_get_character_lore` 按需读取完整设定。
+  - 世界观:每个 section 只注入最新一条,历史条目提示可用 `life_sim_get_world_lore` 查询。
+  - 关闭开关(`lore_selective_load=false`)则全部完整注入(旧行为)。
+- **角色名与昵称**:角色有固定昵称/简称时,保存时 `character` 写成 `全名（昵称）`
+  (如 `雪音（小雪）`、`梦娜1号（梦娜）`),系统自动提取括号昵称用于活跃检测、按需读取与 `/lore` 查询;
+  自动昵称推导(小X/阿X/X酱、末 2 字称呼、去编号后缀)作为兜底,宁多勿漏。
 - 工具调用写入 `self._pending_lore` 实例暂存,**不立即落库**;`_generate_locked` 末尾与消息一起一次性 `_save_sim`,消除"工具内 save vs 外层 save"的竞态。
 - `/undo` 用 turn 计数回滚 lore(每 turn 开始时拍快照),不受消息压缩/增删影响。
 
