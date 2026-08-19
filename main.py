@@ -136,6 +136,105 @@ def _strip_meta_tags(text: str) -> str:
     return text.strip()
 
 
+_CHAR_ALIAS_PATTERN = re.compile(r"[（(【]\s*([^）)】]+?)\s*[）)】]")
+
+# 常见末字:跳过 "小X" 昵称变体,避免 "小时/小花/小王" 等高频词误伤
+_NICKNAME_PREFIX_SKIP_LAST = {
+    "时", "花", "王", "小", "大", "天", "日", "月", "中", "上", "下",
+    "一", "二", "三", "十", "子", "人", "生", "心", "头", "年", "里",
+    "东", "西", "南", "北", "前", "后", "春", "夏", "秋", "冬",
+}
+
+
+def _char_aliases(name: str) -> list[str]:
+    """从角色名提取活跃检测用的候选匹配词。
+
+    覆盖昵称/简称场景:
+    - 全名本身:"花原（小花）"、"坂田银时"
+    - 括号内别名:"花原（小花）" → "小花"
+    - 去括号主干:"花原（小花）" → "花原"
+    - 中文称呼截取(去分隔符后取末尾 2 字):"坂田银时" → "银时"、
+      "导师·长者" → "长者"、"江户川柯南" → "柯南"、"孙悟空" → "悟空"
+    - 昵称变体(基于末字):"汐见花音" → 小音 / 阿音 / 音酱
+
+    长度 < 2 的词不参与(避免单字昵称如 "香" 命中 "香气/香蕉" 等误伤)。
+    """
+    aliases = [name]
+    bracket_aliases: list[str] = []
+    for m in _CHAR_ALIAS_PATTERN.finditer(name):
+        a = m.group(1).strip()
+        if a and a not in aliases:
+            aliases.append(a)
+            bracket_aliases.append(a)
+    stem = _CHAR_ALIAS_PATTERN.sub("", name).strip()
+    if stem and stem not in aliases:
+        aliases.append(stem)
+    # 中文称呼常取「名」/尾字组合:去掉分隔符标点后,名字 ≥ 3 字时取末尾 2 字
+    clean = re.sub(r"[·・\-—_\s]", "", stem)
+    if len(clean) >= 3:
+        tail2 = clean[-2:]
+        if tail2 not in aliases:
+            aliases.append(tail2)
+    # 昵称变体(基于「名」的末字):"汐见花音" → 小音 / 阿音 / 音酱;
+    # 有括号别名时以括号内容为名(如 "花原（小花）" → 小花),不用姓的主干末字
+    name_part = (bracket_aliases[-1] if bracket_aliases else clean)
+    if name_part:
+        last = name_part[-1]
+        for variant in (f"小{last}", f"阿{last}", f"{last}酱"):
+            # 常见末字的 "小X" 昵称(小时/小花/小王…)高频出现在普通句子里,
+            # 会误判角色长期活跃、失去裁剪意义;阿X / X酱 特异性高,保留
+            if variant.startswith("小") and last in _NICKNAME_PREFIX_SKIP_LAST:
+                continue
+            if len(variant) >= 2 and variant not in aliases:
+                aliases.append(variant)
+    return [a for a in aliases if len(a) >= 2]
+
+
+def _match_lore_characters(char_lore: dict, query: str) -> list[str]:
+    """按查询词找到匹配的角色 key 列表(用于按需读取)。
+
+    匹配优先级(宁多勿漏):
+    1. 精确 key;
+    2. 查询词是某角色的候选词(全名 / 括号别名 / 末 2 字称呼 / 昵称变体);
+    3. 名称互相包含(查询词 ⊂ 角色名 或反之)。
+
+    同一个人被拆成多个 key(如 "汐见花音" 与 "花音")时,传 "花音"
+    会同时匹配到两个 → 读取工具返回它们的全部 lore。
+    单字查询(len < 2)只走候选词匹配,不做名称包含,避免 "花" 误匹配所有含花角色。
+    """
+    q = (query or "").strip()
+    if not q:
+        return []
+    matches: list[str] = []
+    for name in char_lore:
+        if not name:
+            continue
+        if q in _char_aliases(name):
+            matches.append(name)
+        elif len(q) >= 2 and (name in q or q in name):
+            matches.append(name)
+    return matches
+
+
+def _normalize_character_query(character) -> list[str]:
+    """把工具的 character 参数(单个字符串 / 字符串数组 / None)归一化为非空查询词列表。
+
+    - None / 空串 / 空数组 → []
+    - "花音" → ["花音"]
+    - ["花音", "银时"] → ["花音", "银时"](去空白、去空项)
+    """
+    if isinstance(character, str):
+        q = character.strip()
+        return [q] if q else []
+    if isinstance(character, (list, tuple)):
+        out: list[str] = []
+        for c in character:
+            if isinstance(c, str) and c.strip():
+                out.append(c.strip())
+        return out
+    return []
+
+
 def _parse_tool_from_docstring(docstring: str) -> tuple[str, dict]:
     """从 llm_tool 风格的 docstring 一次解析出 (description, parameters schema)。
 
@@ -484,7 +583,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
     @staticmethod
     def _is_my_tool(name: str) -> bool:
-        """过滤:只保留本插件的工具(rpg_*/roll_dice/life_sim_save_*/life_sim_revise_narrative)。"""
+        """过滤:只保留本插件的工具(rpg_*/roll_dice/life_sim_save_*/life_sim_get_*/life_sim_revise_narrative)。"""
         return bool(name) and (
             name.startswith("rpg_")
             or name
@@ -492,6 +591,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 "roll_dice",
                 "life_sim_save_character_lore",
                 "life_sim_save_world_lore",
+                "life_sim_get_character_lore",
+                "life_sim_get_world_lore",
                 "life_sim_revise_narrative",
             }
         )
@@ -768,7 +869,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             )
 
         # 注入持久化 lore(角色设定 + 世界观信息,直到 /删除 或 /创建)
-        lore = self._build_lore_addendum(session)
+        lore = self._build_lore_addendum(session, user_input)
         if lore:
             system_prompt += "\n\n" + lore
 
@@ -1339,43 +1440,155 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
     # ─── lore 渲染 ──────────────────────────────────────
 
-    def _build_lore_addendum(self, session: dict) -> str:
+    def _detect_active_characters(
+        self, session: dict, rounds: int, extra_text: str = ""
+    ) -> set[str]:
+        """从最近 `rounds` 轮对话的文本 + 当前输入中检测出场过的角色名(启发式)。
+
+        用于选择性加载:最近出场过的角色完整注入 system prompt,
+        其余角色只保留一行提示。
+
+        `extra_text` 传入**当前轮用户输入**(尚未写入历史):用户当场点名
+        "主角见到了汐见花音" 时,该角色也能立即判活跃并完整注入,避免被裁剪。
+
+        匹配策略:角色名的任一候选词(全名 / 括号内昵称 / 末 2 字称呼 / 昵称变体,长度≥2)
+        在最近文本中(含当前输入)出现即判活跃 —— 例:"花原（小花）" 在上下文只提 "小花"
+        也能命中;同一个人被分成多个 key(如 "花原（小花）" 与 "小花")时
+        会一起判活跃,避免同一人设定被部分裁剪。
+
+        启发式偏保守(**宁多勿漏**):活跃误判只是多注入一点 token,
+        而漏判会导致该角色设定被裁剪、LLM 刻画时没有依据而抽风。
+        """
+        messages = session.get("messages", [])
+        user_pos = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+        if user_pos:
+            start = user_pos[-rounds] if len(user_pos) >= rounds else 0
+            recent = messages[start:]
+        else:
+            recent = messages[-rounds * 2 - 2 :]
+        text = "\n".join(
+            _content_to_text(m.get("content"))
+            for m in recent
+            if m.get("role") in ("user", "assistant")
+        )
+        if extra_text:
+            text += "\n" + extra_text
+        char_lore = self._normalize_character_lore(session.get("character_lore"))
+        active: set[str] = set()
+        for name in char_lore:
+            if any(alias in text for alias in _char_aliases(name)):
+                active.add(name)
+        return active
+
+    def _build_lore_addendum(self, session: dict, current_input: str = "") -> str:
         """构造注入到 system prompt 的 lore 附加段。
 
         按 (角色 / section) 分组,每组的条目按 seq 升序排列成时间轴,
         每条标注 `[#seq | timestamp]`。新条目永远追加,旧细节永不被覆盖。
 
+        `current_input` 为当前轮用户输入(尚未写入历史):活跃检测把它并入,
+        用户当场点名某角色时会立即完整注入该角色设定。
+
+        选择性加载(`lore_selective_load` 默认开,`lore_active_rounds` 默认 6):
+        - 角色:最近 N 轮出场过的角色完整注入;其余角色只注入一行提示
+          (名字 + 条目数 + 按需读取工具),刻画前由 LLM 调
+          `life_sim_get_character_lore` 获取完整设定 → 角色多、轮数多时
+          system prompt 不再被整棵角色树撑爆。
+        - 世界观:每个 section 只注入最新一条(世界状态以最新为准),
+          历史条目提示可用 `life_sim_get_world_lore` 查询。
+        关闭开关则与旧行为一致:全部完整注入。
+
         在块顶部加粗体权威性声明,`appearance` 等硬约束 section 前面插入
         「禁止脑补」警告,强化模型对这些字段的遵从度。
         """
         HARD_SECTIONS = {"appearance", "forms"}
+        selective = bool(self._cfg("lore_selective_load", True))
+        rounds = max(1, int(self._cfg("lore_active_rounds", 6)))
         parts = []
+
         world_lore = session.get("world_lore") or []
         if world_lore:
             lines = [
-                "## 持久化世界观(按时间轴排列,自动注入每次对话)",
+                "## 持久化世界观(自动注入每次对话)",
                 "**⚠️ 以下世界观设定为本局唯一权威事实,叙事必须严格遵循,严禁凭印象修改、补充或「修正」。**",
             ]
-            lines.extend(self._render_lore_timeline(world_lore))
+            if selective:
+                # 每个 section 只注入最新一条(世界状态以最新为准),历史按需读取
+                latest: dict[str, dict] = {}
+                counts: dict[str, int] = {}
+                order: list[str] = []
+                for e in world_lore:
+                    sec = str(e.get("section", "general"))
+                    if sec not in counts:
+                        counts[sec] = 0
+                        order.append(sec)
+                    counts[sec] += 1
+                    latest[sec] = e
+                for sec in order:
+                    e = latest[sec]
+                    extra = ""
+                    if counts[sec] > 1:
+                        extra = (
+                            f"(另有 {counts[sec] - 1} 条历史,可调 "
+                            f'life_sim_get_world_lore(section="{sec}") 查看)'
+                        )
+                    lines.append(f"- **[{sec}]** {e.get('content', '')} {extra}".rstrip())
+            else:
+                lines.extend(self._render_lore_timeline(world_lore))
             parts.append("\n".join(lines))
+
         char_lore_dict = self._normalize_character_lore(session.get("character_lore"))
         if any(char_lore_dict.values()):
+            active = (
+                self._detect_active_characters(session, rounds, current_input)
+                if selective
+                else None
+            )
+            # 活跃检测为空时,主角默认视为在场(避免整块只剩摘要提示)
+            if (
+                selective
+                and active is not None
+                and not active
+                and "主角" in char_lore_dict
+            ):
+                active = {"主角"}
             lines = [
-                "## 持久化角色设定(按时间轴排列,自动注入每次对话)",
+                "## 持久化角色设定(自动注入每次对话)",
                 "**⚠️ 以下角色设定为本局唯一权威事实。描写任何角色前必须先回扫本块,严格按字段值写。**",
                 "**外貌(发色/瞳色/发型/服装/配饰/体型等)为硬性约束 — 严禁凭训练印象脑补、换色或「合理化」,除非本块末尾有变更条目明确覆盖。**",
             ]
-            # 按首次出现顺序遍历角色(dict 天然保序),不用 sorted:
-            # 新角色追加在块末尾,已有角色/条目的字节位置不动 → 前缀缓存不被打断。
+            if selective:
+                lines.append(
+                    "**选择性加载:以下仅完整列出最近出场过的角色;未出场角色只显示名字。"
+                    "需要刻画未出场角色时,先调 `life_sim_get_character_lore(character=\"角色名\")` "
+                    "拿到完整设定再写,不要凭空发挥。**"
+                )
+            # 按首次出现顺序遍历角色(dict 天然保序),新角色追加在块末尾,
+            # 已有角色/条目的字节位置不动 → 前缀缓存不被打断。
+            inactive: list[tuple[str, int]] = []
             for char_name in char_lore_dict:
                 entries = char_lore_dict[char_name]
                 if not entries:
+                    continue
+                if selective and char_name not in (active or set()):
+                    inactive.append((char_name, len(entries)))
                     continue
                 lines.append(f"### {char_name}")
                 lines.extend(
                     self._render_lore_timeline(
                         entries, indent="- ", hard_sections=HARD_SECTIONS
                     )
+                )
+            if inactive:
+                # 未出场角色合并为紧凑列表(名字 + 条数),提示只写一次
+                summary = "、".join(f"{n}({c}条)" for n, c in inactive)
+                lines.append(
+                    f"⏸️ **未出场角色**({len(inactive)} 名):{summary}"
+                )
+                lines.append(
+                    "- 💡 刻画其中任何角色前,调 "
+                    "`life_sim_get_character_lore(character=\"角色名\")` "
+                    "获取完整设定后再写;忘记角色名时可传空值让工具列出全部。"
                 )
             parts.append("\n".join(lines))
         return "\n\n".join(parts)
@@ -1472,6 +1685,120 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         return await self._save_lore(
             event, "character_lore", section, content, character=character
         )
+
+    async def life_sim_get_character_lore(
+        self, event, character: str = "主角"
+    ) -> str:
+        """
+        按需读取某个角色的完整持久化设定(剧情需要时调用)
+
+        适用场景:
+        - 系统默认**选择性加载**:system prompt 里只完整列出最近出场过的角色,
+          未出场角色只显示名字。当某个未出场角色即将登场 / 需要详细刻画时,
+          先调本工具拿到它的完整设定(含外貌 / 形态 / 性格 / 关系 / 技能等全部时间轴),再照设定写。
+        - 已出场角色的设定可能被选择性加载裁剪时,同样用本工具补全。
+
+        Args:
+            character(list[str]): 要读取的角色名,默认="主角",可传字符串数组一次查多个
+                (如 ["花音", "银时", "汐见花音"]),也可传单个字符串(如 "花音")。
+                每个查询词支持精确名 / 昵称 / 简称;同一个人被拆成多个 key 时会一起返回。
+                省略或传空时列出当前已收录角色。
+        Returns:
+            所有匹配角色的完整设定文本(按 section 分组的时间轴,含 seq 与时间戳);
+            多个角色命中时按收录顺序分块返回。
+        """
+        event_key = self._sim_session_key(event)
+        session = await self._load_sim(event)
+        if not session:
+            return "❌ 当前没有进行中的转生模拟,请先 /创建。"
+        # 合并本轮 staging(同轮内可能刚 save 过新条目)
+        staging = self._pending_lore.get(event_key) or {}
+        char_lore = self._normalize_character_lore(
+            staging.get("character_lore") or session.get("character_lore")
+        )
+        querys = _normalize_character_query(character)
+        if not querys:
+            candidates = "、".join(c for c in char_lore if char_lore.get(c))
+            return f"📋 已收录角色:{candidates or '(暂无)'}。请指定要读取的角色名。"
+
+        # 收集所有查询词的匹配 key(保序去重)
+        matched_keys: list[str] = []
+        seen: set[str] = set()
+        for q in querys:
+            for mn in _match_lore_characters(char_lore, q):
+                if mn not in seen:
+                    seen.add(mn)
+                    matched_keys.append(mn)
+        if not matched_keys:
+            candidates = "、".join(c for c in char_lore if char_lore.get(c))
+            return (
+                f"❌ 没有匹配到「{'、'.join(querys)}」对应的角色。"
+                f"已收录角色:{candidates or '(暂无)'}"
+            )
+
+        blocks = []
+        for mn in matched_keys:
+            entries = char_lore.get(mn) or []
+            lines = [f"# 「{mn}」持久化设定(完整时间轴)"]
+            lines.append(
+                "**⚠️ 以上为唯一权威设定,描写该角色前必须严格按字段值写,禁止脑补。**"
+            )
+            lines.extend(
+                self._render_lore_timeline(
+                    entries, hard_sections={"appearance", "forms"}
+                )
+            )
+            blocks.append("\n".join(lines))
+        if len(matched_keys) > 1:
+            blocks.insert(
+                0,
+                f"ℹ️ 共匹配到 {len(matched_keys)} 个角色 key(可能含同一角色的不同称呼),以下全部列出:",
+            )
+        return "\n\n".join(blocks)
+
+    async def life_sim_get_world_lore(
+        self, event, section: str = ""
+    ) -> str:
+        """
+        按需读取世界观设定(剧情需要时调用)
+
+        适用场景:
+        - 系统默认**选择性加载**:世界观每个 section 只注入最新一条,
+          历史条目 / 被裁剪的细节需要确认时,调本工具拿完整时间轴。
+        - 需要确认某个设定(魔法体系 / 势力分布 / 地理 / 历史等)的完整来龙去脉时。
+
+        Args:
+            section(string): 要读取的世界观分类标签(如 "魔法体系" / "factions"),默认="",省略时返回全部世界观设定
+        Returns:
+            该 section(或全部)的世界观完整设定文本。
+        """
+        event_key = self._sim_session_key(event)
+        session = await self._load_sim(event)
+        if not session:
+            return "❌ 当前没有进行中的转生模拟,请先 /创建。"
+        staging = self._pending_lore.get(event_key) or {}
+        world_lore = staging.get("world_lore") or session.get("world_lore") or []
+        sec = (section or "").strip()
+        if sec:
+            filtered = [
+                e for e in world_lore if str(e.get("section", "")).strip() == sec
+            ]
+            if not filtered:
+                secs = "、".join(
+                    dict.fromkeys(str(e.get("section", "")) for e in world_lore)
+                )
+                return (
+                    f"❌ 世界观 section「{sec}」暂无记录。"
+                    f"已有 section:{secs or '(暂无)'}"
+                )
+            lines = [f"# 世界观「{sec}」(完整时间轴)"]
+            lines.extend(self._render_lore_timeline(filtered))
+            return "\n".join(lines)
+        if not world_lore:
+            return "📭 世界观暂无持久化设定。"
+        lines = ["# 世界观持久化设定(完整)"]
+        lines.extend(self._render_lore_timeline(world_lore))
+        return "\n".join(lines)
 
     async def life_sim_revise_narrative(
         self,
