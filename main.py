@@ -139,10 +139,13 @@ def _strip_meta_tags(text: str) -> str:
 _CHAR_ALIAS_PATTERN = re.compile(r"[（(【]\s*([^）)】]+?)\s*[）)】]")
 
 # 常见末字:跳过 "小X" 昵称变体,避免 "小时/小花/小王" 等高频词误伤
-_NICKNAME_PREFIX_SKIP_LAST = {
+_NICKNAME_PREFIX_SKIP = {
+    # 末字常见(小时/小花/小王/小天…)与首字常见(小明/小美/小红/小龙…)
     "时", "花", "王", "小", "大", "天", "日", "月", "中", "上", "下",
     "一", "二", "三", "十", "子", "人", "生", "心", "头", "年", "里",
     "东", "西", "南", "北", "前", "后", "春", "夏", "秋", "冬",
+    "明", "美", "丽", "红", "白", "黑", "刚", "强", "龙", "虎",
+    "燕", "兰", "梅", "霞", "芳", "玲", "翠", "秀", "英", "杰",
 }
 
 
@@ -150,12 +153,14 @@ def _char_aliases(name: str) -> list[str]:
     """从角色名提取活跃检测用的候选匹配词。
 
     覆盖昵称/简称场景:
-    - 全名本身:"花原（小花）"、"坂田银时"
+    - 全名本身:"花原（小花）"、"坂田银时"、"梦娜1号"
     - 括号内别名:"花原（小花）" → "小花"
     - 去括号主干:"花原（小花）" → "花原"
+    - 去编号后缀:"梦娜1号" → "梦娜"、"小兰2世" → "小兰"
     - 中文称呼截取(去分隔符后取末尾 2 字):"坂田银时" → "银时"、
       "导师·长者" → "长者"、"江户川柯南" → "柯南"、"孙悟空" → "悟空"
-    - 昵称变体(基于末字):"汐见花音" → 小音 / 阿音 / 音酱
+    - 昵称变体(小/阿/酱 × 首字/末字):"汐见花音" → 小音/阿音/音酱,
+      "雪音" → 小雪/阿雪/雪酱
 
     长度 < 2 的词不参与(避免单字昵称如 "香" 命中 "香气/香蕉" 等误伤)。
     """
@@ -169,22 +174,33 @@ def _char_aliases(name: str) -> list[str]:
     stem = _CHAR_ALIAS_PATTERN.sub("", name).strip()
     if stem and stem not in aliases:
         aliases.append(stem)
-    # 中文称呼常取「名」/尾字组合:去掉分隔符标点后,名字 ≥ 3 字时取末尾 2 字
-    clean = re.sub(r"[·・\-—_\s]", "", stem)
+    # 去分隔符标点 + 编号后缀:"梦娜1号" → "梦娜"、"L2" → "L"
+    clean = re.sub(r"[·・\-_—\s]", "", stem)
+    clean = re.sub(r"\d+[号世代替型卷尾]", "", clean)
+    clean = re.sub(r"\d+$", "", clean)
+    if clean and clean not in aliases:
+        aliases.append(clean)
+    # 中文称呼常取「名」/尾字组合:干净名 ≥ 3 字时取末尾 2 字
     if len(clean) >= 3:
         tail2 = clean[-2:]
         if tail2 not in aliases:
             aliases.append(tail2)
-    # 昵称变体(基于「名」的末字):"汐见花音" → 小音 / 阿音 / 音酱;
-    # 有括号别名时以括号内容为名(如 "花原（小花）" → 小花),不用姓的主干末字
+    # 昵称变体(小/阿/酱 × 首字/末字):有括号别名时以括号内容为名,
+    # 不用姓的主干首末字(如 "花原（小花）" → 小花)
     name_part = (bracket_aliases[-1] if bracket_aliases else clean)
     if name_part:
-        last = name_part[-1]
-        for variant in (f"小{last}", f"阿{last}", f"{last}酱"):
-            # 常见末字的 "小X" 昵称(小时/小花/小王…)高频出现在普通句子里,
-            # 会误判角色长期活跃、失去裁剪意义;阿X / X酱 特异性高,保留
-            if variant.startswith("小") and last in _NICKNAME_PREFIX_SKIP_LAST:
+        first, last = name_part[0], name_part[-1]
+        for variant in (
+            f"小{first}", f"阿{first}", f"{first}酱",
+            f"小{last}", f"阿{last}", f"{last}酱",
+        ):
+            # 常见高频「小X」保护:小+首字 用首字黑名单(小明/小美…),
+            # 小+末字 用末字黑名单(小时/小花…);方向错开,互不连坐
+            if variant == f"小{first}" and first in _NICKNAME_PREFIX_SKIP:
                 continue
+            if variant == f"小{last}" and last in _NICKNAME_PREFIX_SKIP:
+                continue
+            # 阿X / X酱 特异性高,不设黑名单
             if len(variant) >= 2 and variant not in aliases:
                 aliases.append(variant)
     return [a for a in aliases if len(a) >= 2]
@@ -205,13 +221,15 @@ def _match_lore_characters(char_lore: dict, query: str) -> list[str]:
     q = (query or "").strip()
     if not q:
         return []
+    q_low = q.lower()
     matches: list[str] = []
     for name in char_lore:
         if not name:
             continue
-        if q in _char_aliases(name):
+        # 候选词匹配(全名/括号别名/昵称变体),大小写不敏感
+        if any(a.lower() == q_low for a in _char_aliases(name)):
             matches.append(name)
-        elif len(q) >= 2 and (name in q or q in name):
+        elif len(q) >= 2 and (name.lower() in q_low or q_low in name.lower()):
             matches.append(name)
     return matches
 
@@ -1678,7 +1696,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         Args:
             content(string): 角色设定内容(详细描述)
             section(string): 分类标签,如 "forms"、"appearance"、"personality"、"relationships"、"skills"。默认 "general"。每次调用追加一条带 seq + 时间戳的新记录,永不覆盖已有条目;同一 (character, section) 多次调用会累积成时间轴。
-            character(string): 角色名。默认 "主角"。可用 NPC 真名 / 称号区分。
+            character(string): 角色名,默认="主角"。可用 NPC 真名 / 称号区分。
+                角色有固定昵称/简称时,写成 `全名（昵称）` 格式(如 "雪音（小雪）"、
+                "汐见花音（花音）"、"梦娜1号（梦娜）"),系统自动提取括号昵称用于
+                出场检测;同一角色只建一个 key,不要全名/昵称各存一套。
         Returns:
             确认消息。
         """
@@ -2978,23 +2999,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             yield event.plain_result("\n".join(lines))
             return
 
-        # ── 角色名匹配:精确 → 大小写不敏感 → 子串 ──
+        # ── 角色名匹配:复用 _match_lore_characters(精确 / 括号别名 / 昵称 / 简称 / 互相包含)──
         target = arg.strip()
-        matched = None
-        if target in char_lore:
-            matched = target
-        else:
-            low = target.lower()
-            for name in char_lore:
-                if name.lower() == low:
-                    matched = name
-                    break
-            if matched is None:
-                for name in char_lore:
-                    if low in name.lower() or name.lower() in low:
-                        matched = name
-                        break
-        if matched is None:
+        matched_keys = _match_lore_characters(char_lore, target)
+        if not matched_keys:
             available = "、".join(n for n in char_lore if char_lore[n])
             yield event.plain_result(
                 f"❌ 未找到角色「{target}」。"
@@ -3003,17 +3011,22 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             )
             return
 
-        entries = char_lore[matched]
-        if not entries:
-            yield event.plain_result(f"👤 {matched}:暂无设定条目。")
-            return
-        lines = [f"👤 {matched} 设定(时间轴):"]
-        lines.extend(
-            self._render_lore_timeline(
-                entries, indent="  ", hard_sections={"appearance", "forms"}
+        if len(matched_keys) > 1:
+            yield event.plain_result(
+                f"📎 匹配到 {len(matched_keys)} 个角色 key(可能为同一角色不同称呼),以下全部列出:"
             )
-        )
-        yield event.plain_result("\n".join(lines))
+        for mn in matched_keys:
+            entries = char_lore[mn] or []
+            if not entries:
+                yield event.plain_result(f"👤 {mn}:暂无设定条目。")
+                continue
+            lines = [f"👤 {mn} 设定(时间轴):"]
+            lines.extend(
+                self._render_lore_timeline(
+                    entries, indent="  ", hard_sections={"appearance", "forms"}
+                )
+            )
+            yield event.plain_result("\n".join(lines))
 
     async def terminate(self):
         logger.info("life-sim: 插件已卸载")

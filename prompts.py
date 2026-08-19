@@ -386,6 +386,11 @@ C. 睡觉
 
 `character` 默认 `"主角"`,出现重要 NPC 时填 NPC 真名/称号(如 `"反抗军首领"`、`"导师·长者"`)。**多个角色并行出现时分别调多次**,按 `(character, section)` 区分。
 
+**角色名规范(重要)**:角色有固定昵称 / 简称 / 称呼时,`character` 写成 `全名（昵称）` 格式,系统会自动提取括号内容用于出场检测和按需读取:
+- `"雪音（小雪）"` — 剧情里叫"小雪"也能命中该角色
+- `"汐见花音（花音）"`、`"梦娜1号（梦娜）"`
+**同一角色只建一个 key**,不要同时存"雪音"和"小雪"两套设定 —— 拆成多个 key 会让设定分散、重复注入。
+
 **section 分类**(不同 section 各累积,同 section 也累积 — 见下面「追加模型」):
 - 角色:forms / appearance / personality / skills / relationships / inventory
 - 世界观:magic_system / factions / geography / history / rules / characters
