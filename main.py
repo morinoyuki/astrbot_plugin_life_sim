@@ -1632,6 +1632,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             if inactive:
                 # 未出场角色合并为紧凑列表(名字 + 条数),提示只写一次
                 summary = "、".join(f"{n}({c}条)" for n, c in inactive)
+                lines.append("")
                 lines.append(f"⏸️ **未出场角色**({len(inactive)} 名):{summary}")
                 lines.append(
                     "- 💡 刻画其中任何角色前,调 "
@@ -1881,7 +1882,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
     # 指令
     # ════════════════════════════════════════════════════════════════
 
-    @filter.command("创建")
+    @filter.command("创建", alias={"create"})
     async def cmd_create(self, event: AstrMessageEvent):
         """/创建 [rpg|dnd] <世界观设定> - 创建转生模拟会话(覆盖已有)"""
         lock = self._get_sim_lock(self._sim_session_key(event))
@@ -1894,7 +1895,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 yield _
 
     async def _cmd_create_body(self, event: AstrMessageEvent):
-        setting = self._extract_after_cmd(event, "创建")
+        setting = self._extract_after_cmd(event, ("创建", "create"))
         extractor = QuotedMessageExtractor(event=event)
         quoted = await extractor.text()
         if quoted:
@@ -2018,7 +2019,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         async for _ in self._yield_narrative_result(event, result):
             yield _
 
-    @filter.command("进度")
+    @filter.command("进度", alias={"progress"})
     async def cmd_progress(self, event: AstrMessageEvent):
         """/进度 - 查看当前模拟进度"""
         session = await self._load_sim(event)
@@ -2110,7 +2111,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         # 头部 + 内容,避免太长看不到 key
         yield event.plain_result(f"{header}\n{text}")
 
-    @filter.command("删除")
+    @filter.command("删除", alias={"delete", "del"})
     async def cmd_delete(self, event: AstrMessageEvent):
         """/删除 - 删除当前会话(同时清理对应 RPG 存档)"""
         lock = self._get_sim_lock(self._sim_session_key(event))
@@ -2415,10 +2416,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
     # 剧情历史:列表 / 上传 / 删除
     # ════════════════════════════════════════════════════════════════
 
-    @filter.command("历史")
+    @filter.command("历史", alias={"history"})
     async def cmd_history(self, event: AstrMessageEvent):
         """/历史 [N] - 列出当前会话最近的 N 条剧情记录(默认 10)"""
-        arg = self._extract_after_cmd(event, "历史").strip()
+        arg = self._extract_after_cmd(event, ("历史", "history")).strip()
         n = 10
         if arg:
             try:
@@ -2456,7 +2457,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         )
         yield event.plain_result("\n".join(lines))
 
-    @filter.command("上传历史")
+    @filter.command("上传历史", alias={"upload_history"})
     async def cmd_upload_history(self, event: AstrMessageEvent):
         """/上传历史 [jsonl] [last N|all] - 把剧情历史导出为文件并发送。
         默认导出当前 scope 全部记录,JSON 格式(含世界设定/角色设定快照)。
@@ -2464,7 +2465,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         last N:仅导出最近 N 条
         all:导出所有 scope 的记录(本用户/本群能访问到的全部)
         """
-        arg = self._extract_after_cmd(event, "上传历史").strip().lower()
+        arg = (
+            self._extract_after_cmd(event, ("上传历史", "upload_history"))
+            .strip()
+            .lower()
+        )
         use_jsonl = "jsonl" in arg
         scope = self._sim_session_key(event)
 
@@ -2605,10 +2610,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 f"⚠️ File 组件不可用,文件已写到 `{out_path}`({len(records)} 条,{size_kb:.1f} KB)"
             )
 
-    @filter.command("删除历史")
+    @filter.command("删除历史", alias={"delete_history"})
     async def cmd_delete_history(self, event: AstrMessageEvent):
         """/删除历史 <id|all> - 删除指定剧情记录,或 all 删除当前 scope 全部"""
-        arg = self._extract_after_cmd(event, "删除历史").strip()
+        arg = self._extract_after_cmd(event, ("删除历史", "delete_history")).strip()
         if not arg:
             yield event.plain_result(
                 "❌ 用法:\n"

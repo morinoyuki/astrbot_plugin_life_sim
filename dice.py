@@ -1,4 +1,7 @@
-"""骰子工具 — 模式 C(DND 跑团)专用"""
+"""骰子工具 — 模式 C(DND 跑团)专用
+
+整合自 astrbot_plugin_dnd_dice
+"""
 
 import random
 import re
