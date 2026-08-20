@@ -1,4 +1,4 @@
-"""RPG 工具(从 astrbot_plugin_rpg_calc 整合而来)
+"""RPG 工具
 
 代码组织:
     1. 配置常量      ── 世界成长规则、槽位 / 属性名翻译
@@ -648,7 +648,11 @@ class RPGMixin:
         私聊 scope = 当前 sender 的存档 + 该存档引用的 session(避免误删别人的私聊存档)。
         """
         if mode not in ("B", "C"):
-            return {"scope": {"group_id": "", "sender_uid": ""}, "chars": {}, "sessions": {}}
+            return {
+                "scope": {"group_id": "", "sender_uid": ""},
+                "chars": {},
+                "sessions": {},
+            }
 
         store = self.rpg_store
         group_id = self._get_group_id(event)
@@ -1313,9 +1317,7 @@ class RPGMixin:
             )
             # respec:把所有本应通过升级获得的属性点全部退还为未分配点。
             # 用 = 而非 += 是关键,避免旧的未分配点叠加导致重复计数。
-            char["unspent_points"] = int(
-                (char["level"] - 1) * avg_points(attr_pts_raw)
-            )
+            char["unspent_points"] = int((char["level"] - 1) * avg_points(attr_pts_raw))
             for attr in old_cb.get("custom", {}):
                 char.pop(attr, None)
             for attr, val in new_cb.get("custom", {}).items():
@@ -1747,10 +1749,7 @@ class RPGMixin:
             normalized_attribute = normalized_attribute[6:]
         # 始终用规范化后的 key 读写 — 避免 LLM 传 "base_STR" 时绕过 DND 保护
         attr_key = normalized_attribute
-        if (
-            char.get("game_system") == "dnd5e"
-            and attr_key in DND5E_ABILITIES
-        ):
+        if char.get("game_system") == "dnd5e" and attr_key in DND5E_ABILITIES:
             return "❌ DND 5E 六维属性不能直接修改,请使用 rpg_allocate_point 分配已获得的 ASI。"
         old_val = char.get(attr_key, 0)
         if mode == "add":

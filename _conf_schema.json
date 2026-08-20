@@ -98,7 +98,7 @@
   "lore_selective_load": {
     "description": "选择性加载 lore(默认开,减少 system prompt 占用)",
     "type": "bool",
-    "hint": "开启后:最近 N 轮出场过的角色完整注入设定,未出场角色只保留一行提示,需要刻画时由 LLM 调 life_sim_get_character_lore 按需读取;世界观每个 section 只注入最新一条。角色多/轮数多时显著省 token。关闭则全部完整注入(旧行为,可能撑爆上下文)",
+    "hint": "开启后:最近 N 轮出场过的角色完整注入设定,未出场角色只保留一行提示,需要刻画时由 LLM 调 life_sim_get_character_lore 按需读取。世界观设定条目通常不多,**始终完整注入**(不做按需裁剪,避免模型不读取历史就凭印象写)。角色多/轮数多时显著省 token。关闭则角色也全部完整注入(旧行为)",
     "default": true
   },
   "lore_active_rounds": {
