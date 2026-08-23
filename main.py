@@ -38,8 +38,8 @@ from astrbot.core.star.star_tools import StarTools
 from astrbot.core.utils.quoted_message.extractor import QuotedMessageExtractor
 
 from .avatar_store import AvatarStore
-from .im_render.engine import render_narrative
 from .dice import DiceMixin
+from .im_render.engine import render_narrative
 from .md_to_image import MdToImageMixin
 from .prompts import (
     CHAT_CARD_PROMPT,
@@ -281,9 +281,11 @@ def _match_lore_characters(char_lore: dict, query: str) -> list[str]:
         if not name:
             continue
         # 候选词匹配(全名/括号别名/昵称变体),大小写不敏感
-        if any(a.lower() == q_low for a in _char_aliases(name)):
-            matches.append(name)
-        elif len(q) >= 2 and (name.lower() in q_low or q_low in name.lower()):
+        if (
+            any(a.lower() == q_low for a in _char_aliases(name))
+            or len(q) >= 2
+            and (name.lower() in q_low or q_low in name.lower())
+        ):
             matches.append(name)
     return matches
 
@@ -415,6 +417,12 @@ def _build_system_reminder(event: AstrMessageEvent) -> str:
     return (
         f"<system_reminder>User ID: {user_id}, Nickname: {user_nick}</system_reminder>"
     )
+
+
+def _read_all_bytes(path: str) -> bytes:
+    """同步读取文件全部字节(供 asyncio.to_thread 在线程池中调用)。"""
+    with open(path, "rb") as f:
+        return f.read()
 
 
 def _build_narrative_ref_tag(last_nid: str) -> str:
@@ -624,8 +632,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             "\n   格式 `角色名@头像名: 台词`,例如 `阴影少女@汐见小亚: 你是谁?`"
             "  —— 气泡显示「阴影少女」,头像用「汐见小亚」;"
             "\n3. 不写 `@` 时,系统默认按角色名对列表做模糊匹配。"
-            "\n可用头像名单："
-            + lines + "\n"
+            "\n可用头像名单：" + lines + "\n"
         )
 
     def _chat_card_avatars(self) -> dict:
@@ -676,7 +683,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             theme = "light"
         self_names = [
             s.strip()
-            for s in str(self._cfg("chat_card_self_names", "我,自己,你,玩家")).split(",")
+            for s in str(self._cfg("chat_card_self_names", "我,自己,你,玩家")).split(
+                ","
+            )
             if s.strip()
         ]
         avatars = self._chat_card_avatars()
@@ -2022,7 +2031,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
     async def cmd_set_avatar(self, event: AstrMessageEvent):
         """/头像 <角色名> <图片> - 设置角色头像(用于聊天卡片);/头像 列表 查看已设置"""
         # 提取参数(去掉命令本身)
-        arg = self._extract_after_cmd(event, ("头像", "set_avatar", "设置头像", "头像设置"))
+        arg = self._extract_after_cmd(
+            event, ("头像", "set_avatar", "设置头像", "头像设置")
+        )
 
         # 列表操作优先(不需要图片)
         if arg.strip() in ("列表", "list", "-l", "查看"):
@@ -2030,7 +2041,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             if not names:
                 yield event.plain_result("📭 还没有设置任何头像")
             else:
-                yield event.plain_result("已设置头像:\n" + "\n".join(f"• {n}" for n in names))
+                yield event.plain_result(
+                    "已设置头像:\n" + "\n".join(f"• {n}" for n in names)
+                )
             return
 
         # 提取图片
@@ -2055,8 +2068,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         name = arg.strip()
         # 重新从文件读字节(convert_to_file_path 已处理网络/本地)
         try:
-            with open(path, "rb") as f:
-                data = f.read()
+            data = await asyncio.to_thread(_read_all_bytes, path)
         except Exception as e:
             yield event.plain_result(f"❌ 读取图片失败:{e}")
             return
@@ -2724,7 +2736,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         out_path = os.path.join(self.data_dir, filename)
 
         # 文件写入单独 try,失败时立即报错退出(不要让 file 组件去读半截文件)
-        try:
+        def _write_export() -> None:
+            # 阻塞文件 IO 放到线程池,避免卡住事件循环
             if use_jsonl:
                 preamble = {
                     "_meta": {
@@ -2740,8 +2753,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 }
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(json.dumps(preamble, ensure_ascii=False) + "\n")
-                    for r in records:
-                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                    f.writelines(
+                        json.dumps(r, ensure_ascii=False) + "\n" for r in records
+                    )
             else:
                 payload = {
                     "_meta": {
@@ -2775,6 +2789,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 }
                 with open(out_path, "w", encoding="utf-8") as f:
                     json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        try:
+            await asyncio.to_thread(_write_export)
         except (OSError, TypeError, ValueError) as e:
             logger.warning(f"life-sim: 写剧情历史文件失败: {e}")
             try:

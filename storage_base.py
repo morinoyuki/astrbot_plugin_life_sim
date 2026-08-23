@@ -35,7 +35,7 @@ def write_json_atomic(path: str, data: dict) -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False)
         os.replace(tmp, path)
-    except Exception as e:
+    except (OSError, TypeError, ValueError) as e:
         logger.warning("存档写入失败 %s: %s", path, e)
         try:
             os.remove(tmp)

@@ -6,13 +6,12 @@ VerticalStack 负责把多行垂直拼接到画布;每行内部可以自由布�
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from collections.abc import Sequence
 
 from PIL import Image, ImageDraw, ImageFont
 
 from . import markdown as md
-from .style import Theme, font_for_char, load_font
+from .style import font_for_char, load_font
 
 try:  # noqa: E129
     from .engine import AvatarSource  # noqa: F401
@@ -47,13 +46,13 @@ def make_canvas(width: int, height: int, rgb: tuple = (0, 0, 0, 0)):
 class Row:
     """行基类。所有子类必须实现 :meth:`_render_impl`,在 (0,0) 处绘制。"""
 
-    def __init__(self, r: "object"):
+    def __init__(self, r: object):
         from .engine import ChatRenderer
 
         self.r: ChatRenderer = r
         self.height: int = 10
 
-    def measure(self) -> "Row":
+    def measure(self) -> Row:
         """计算高度(子类可覆盖)。返回 self。"""
         return self
 
@@ -88,7 +87,9 @@ class Row:
                 cw = draw.textlength(ch, font=f)
                 if sp.strike:
                     mid = y + f.getmetrics()[0] // 2
-                    draw.line([(cx, mid), (cx + cw, mid)], fill=color, width=max(1, fs // 20))
+                    draw.line(
+                        [(cx, mid), (cx + cw, mid)], fill=color, width=max(1, fs // 20)
+                    )
                 cx += cw
         return cx
 
@@ -108,12 +109,12 @@ class Row:
         spans: Sequence[md.Span],
         max_width: int,
         font_size: int,
-    ) -> List[List[md.Span]]:
+    ) -> list[list[md.Span]]:
         """把 spans 按最大宽度换行,返回多行。"""
         if not spans:
             return [[]]
-        lines: List[List[md.Span]] = []
-        cur: List[md.Span] = []
+        lines: list[list[md.Span]] = []
+        cur: list[md.Span] = []
         cur_w = 0.0
         draw = ImageDraw.Draw(Image.new("RGB", (4, 4)))
 
@@ -171,20 +172,51 @@ class RichTextRow(Row):
             max_w -= 8
 
         # 先按显式换行符拆成子段(span.text 可能含 \n),再分别换行
-        para_lines: List[List[md.Span]] = []
+        para_lines: list[list[md.Span]] = []
         for sp in spans:
             parts = sp.text.split("\n")
             for i, pt in enumerate(parts):
                 if i == 0:
                     if para_lines:
-                        para_lines[-1].append(md.Span(pt, bold=sp.bold, italic=sp.italic, strike=sp.strike, code=sp.code, link=sp.link))
+                        para_lines[-1].append(
+                            md.Span(
+                                pt,
+                                bold=sp.bold,
+                                italic=sp.italic,
+                                strike=sp.strike,
+                                code=sp.code,
+                                link=sp.link,
+                            )
+                        )
                     else:
-                        para_lines.append([md.Span(pt, bold=sp.bold, italic=sp.italic, strike=sp.strike, code=sp.code, link=sp.link)])
+                        para_lines.append(
+                            [
+                                md.Span(
+                                    pt,
+                                    bold=sp.bold,
+                                    italic=sp.italic,
+                                    strike=sp.strike,
+                                    code=sp.code,
+                                    link=sp.link,
+                                )
+                            ]
+                        )
                 else:
-                    para_lines.append([md.Span(pt if pt else " ", bold=sp.bold, italic=sp.italic, strike=sp.strike, code=sp.code, link=sp.link)])
+                    para_lines.append(
+                        [
+                            md.Span(
+                                pt if pt else " ",
+                                bold=sp.bold,
+                                italic=sp.italic,
+                                strike=sp.strike,
+                                code=sp.code,
+                                link=sp.link,
+                            )
+                        ]
+                    )
 
         # 每段按像素换行
-        wrapped: List[List[md.Span]] = []
+        wrapped: list[list[md.Span]] = []
         for pl in para_lines:
             ws = self._wrap_spans(pl, max_w, self.font_size)
             wrapped.extend(ws)
@@ -210,7 +242,9 @@ class RichTextRow(Row):
             x0 += 8
 
         color = _rgba(self.color)
-        line_h = int(self.text_h * self.r.line_height) if self.text_h else self.font_size
+        line_h = (
+            int(self.text_h * self.r.line_height) if self.text_h else self.font_size
+        )
         for line in self.lines:
             x = x0
             for sp in line:
@@ -248,7 +282,12 @@ class CodeRow(Row):
         )
         ty = y + self.pad
         for line in self.lines:
-            draw.text((x0 + self.pad, ty), line, font=self.font, fill=_rgba(self.r.t.text_secondary))
+            draw.text(
+                (x0 + self.pad, ty),
+                line,
+                font=self.font,
+                fill=_rgba(self.r.t.text_secondary),
+            )
             ty += self.line_h
 
 
@@ -270,7 +309,9 @@ class PillRow(Row):
     视觉上与对话气泡区分,避免割裂。
     """
 
-    def __init__(self, r, text: str, *, font_size: int | None = None, color: str | None = None):
+    def __init__(
+        self, r, text: str, *, font_size: int | None = None, color: str | None = None
+    ):
         super().__init__(r)
         self.text = text.strip()
         self.font_size = font_size or int(r.font_size * 0.92)
@@ -399,7 +440,10 @@ class ImageRow(Row):
         if self._img is None:
             draw = ImageDraw.Draw(canvas)
             x0 = self.r.h_pad
-            draw.rectangle([x0, y, self.r.width - self.r.h_pad, y + self.height], fill=_rgba(self.r.t.code_bg))
+            draw.rectangle(
+                [x0, y, self.r.width - self.r.h_pad, y + self.height],
+                fill=_rgba(self.r.t.code_bg),
+            )
             msg = f"🖼️ {self.blk.alt or '(未加载)'}"
             draw.text(
                 (x0 + 8, y + (self.height - self.r.font_size) // 2),
@@ -447,7 +491,7 @@ class DialogueRow(Row):
         # 间距配置
         self.gap = max(10, int(r.font_size * 0.4))  # 头像与内容间距
         self.margin_lr = 14  # 气泡水平内边距
-        self.margin_v = 10   # 气泡垂直内边距
+        self.margin_v = 10  # 气泡垂直内边距
         # 名字行高(即名字占用的高度)
         self.name_h = r.name_font_size + 4
         # 名字与气泡间距
@@ -536,8 +580,11 @@ class DialogueRow(Row):
         # 绘制气泡背景
         bubble_bg = r.t.bubble_self if self.is_self else r.t.bubble_other
         self._draw_bubble(
-            canvas, bubble_x, bubble_y,
-            self.bubble_w, self.bubble_h,
+            canvas,
+            bubble_x,
+            bubble_y,
+            self.bubble_w,
+            self.bubble_h,
             _rgba(bubble_bg),
         )
 
@@ -550,7 +597,11 @@ class DialogueRow(Row):
             else:
                 # 自己的名字右对齐到头像左边界前
                 avatar_left = r.width - r.h_pad - self.av
-                name_x = avatar_left - self.gap - int(draw.textlength(self.speaker, font=name_font))
+                name_x = (
+                    avatar_left
+                    - self.gap
+                    - int(draw.textlength(self.speaker, font=name_font))
+                )
                 name_x = max(r.h_pad, name_x)
             draw.text(
                 (name_x, outer_top),

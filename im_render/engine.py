@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Union
 
 from PIL import Image, ImageDraw
 
@@ -20,9 +21,9 @@ from .rows import (
     RichTextRow,
     Row,
 )
-from .style import THEMES, Theme, load_font, rgba
+from .style import THEMES, Theme, load_font
 
-__all__ = ["render_narrative", "ChatRenderer", "TooManyPages", "AvatarSource", "Row"]
+__all__ = ["AvatarSource", "ChatRenderer", "Row", "TooManyPages", "render_narrative"]
 
 AvatarSource = Union[str, "os.PathLike", Image.Image]
 SelfNamePred = Callable[[str], bool]
@@ -65,17 +66,17 @@ class ChatRenderer:
     msg_gap: int = 26
 
     # 主题
-    theme: Union[str, Theme] = "light"
+    theme: str | Theme = "light"
 
     # 判定自己
-    is_self: Optional[SelfNamePred] = None
+    is_self: SelfNamePred | None = None
 
     # 标题
     title: str = ""
     show_title: bool = True
 
     # 块 → 行 的转换临时存储
-    _rows_cache: List[Row] = field(default_factory=list)
+    _rows_cache: list[Row] = field(default_factory=list)
 
     def __post_init__(self):
         self._t: Theme = (
@@ -92,9 +93,13 @@ class ChatRenderer:
         return int((self.width - self.h_pad * 2) * self.max_bubble_ratio)
 
     def title_height(self) -> int:
-        return int(self.title_font_size * 0) if not (self.title and self.show_title) else int(self.title_font_size * 2.8)
+        return (
+            int(self.title_font_size * 0)
+            if not (self.title and self.show_title)
+            else int(self.title_font_size * 2.8)
+        )
 
-    def new_page(self, height: int) -> "Image.Image":
+    def new_page(self, height: int) -> Image.Image:
         """创建带垂直渐变的画布(top → bottom 平滑线性过渡)。
 
         用 NumPy 一次性构造逐行渐变,避免逐行绘制导致高图过慢;
@@ -109,10 +114,8 @@ class ChatRenderer:
         ys = _np.linspace(0, 1, h, dtype=_np.float32)
         # (h, 3) 颜色,再加 alpha=255 → (h, 4)
         rgb = (
-            _np.array(top, dtype=_np.float32)[None, :]
-            * (1 - ys)[:, None]
-            + _np.array(bottom, dtype=_np.float32)[None, :]
-            * ys[:, None]
+            _np.array(top, dtype=_np.float32)[None, :] * (1 - ys)[:, None]
+            + _np.array(bottom, dtype=_np.float32)[None, :] * ys[:, None]
         )
         arr = _np.zeros((h, 4), dtype=_np.uint8)
         arr[:, :3] = _np.clip(rgb, 0, 255).astype(_np.uint8)
@@ -129,16 +132,16 @@ class ChatRenderer:
         self,
         blocks: Sequence[md.Block],
         *,
-        avatars: Optional[Dict[str, AvatarSource]] = None,
-        title: Optional[str] = None,
-    ) -> List[Image.Image]:
+        avatars: dict[str, AvatarSource] | None = None,
+        title: str | None = None,
+    ) -> list[Image.Image]:
         """渲染块序列为多张图。"""
         self.avatars = avatars or {}
         if title is not None:
             self.title = title
 
         # 1. 块 → 行
-        self._rows: List[Row] = []
+        self._rows: list[Row] = []
         for blk in blocks:
             self._layout_block(blk)
         rows = list(self._rows)
@@ -151,12 +154,14 @@ class ChatRenderer:
         # 3. 每页绘制
         out = []
         for page_rows in pages:
-            img = self._draw_page(title_h, page_rows, pages[0] if len(pages) > 1 else page_rows)
+            img = self._draw_page(
+                title_h, page_rows, pages[0] if len(pages) > 1 else page_rows
+            )
             out.append(img)
         return out
 
     # ── 头像匹配(容错:精确 → 前缀 → 包含 → 首字)──────────────
-    def resolve_avatar(self, speaker: str) -> Optional[object]:
+    def resolve_avatar(self, speaker: str) -> object | None:
         """按说话人查找头像,支持角色名变体的模糊匹配。
 
         模型可能输出简称(如「小亚」→ 头像存「汐见小亚」),这里依次尝试:
@@ -197,14 +202,16 @@ class ChatRenderer:
                     if best_key is None or len(kn) > len(best_key):
                         best_key, best_v = kn, v
                     continue
+
                 # 4. 子序列:按顺序逐字出现在对方中(如「凯伊」⊆「天童凯伊」)
                 def is_subseq(small: str, big: str) -> bool:
                     it = iter(big)
                     return all(any(c == ch for c in it) for ch in small)
 
-                if is_subseq(sp_norm, kn) or is_subseq(kn, sp_norm):
-                    if best_key is None or len(kn) > len(best_key):
-                        best_key, best_v = kn, v
+                if (is_subseq(sp_norm, kn) or is_subseq(kn, sp_norm)) and (
+                    best_key is None or len(kn) > len(best_key)
+                ):
+                    best_key, best_v = kn, v
             if best_v is not None:
                 return best_v
         return None
@@ -259,7 +266,7 @@ class ChatRenderer:
             )
         elif blk.type == "list":
             for i, item in enumerate(blk.items):
-                prefix = f"{i+1}. " if blk.ordered else "•  "
+                prefix = f"{i + 1}. " if blk.ordered else "•  "
                 if not blk.ordered and len(blk.items) > 1 and i == len(blk.items) - 1:
                     pass
                 span = [md.Span(prefix)] + item
@@ -317,11 +324,11 @@ class ChatRenderer:
         )
 
     # ── 分页 ─────────────────────────────────────────────────
-    def _paginate(self, rows: List[Row], title_h: int) -> List[List[Row]]:
+    def _paginate(self, rows: list[Row], title_h: int) -> list[list[Row]]:
         if not rows:
             return [[]]
-        pages: List[List[Row]] = []
-        cur: List[Row] = []
+        pages: list[list[Row]] = []
+        cur: list[Row] = []
         lead_gap = self.v_pad if (self.title and self.show_title) else self.v_pad // 2
         cur_h = title_h + lead_gap
         for row in rows:
@@ -341,7 +348,7 @@ class ChatRenderer:
         return pages
 
     # ── 绘制单页 ─────────────────────────────────────────────
-    def _draw_page(self, title_h: int, rows: List[Row], _all: List[Row]) -> "Image.Image":
+    def _draw_page(self, title_h: int, rows: list[Row], _all: list[Row]) -> Image.Image:
         # 首行内容与标题之间留 v_pad 间隙(若无标题则顶部留 padding)
         lead_gap = self.v_pad if (self.title and self.show_title) else 0
         # 计算总高
@@ -374,7 +381,10 @@ class ChatRenderer:
         font = load_font(self.title_font_size, bold=True)
         tw = draw.textlength(title, font=font)
         draw.text(
-            ((self.width - tw) / 2, (th - font.getmetrics()[0] - font.getmetrics()[1]) / 2),
+            (
+                (self.width - tw) / 2,
+                (th - font.getmetrics()[0] - font.getmetrics()[1]) / 2,
+            ),
             title,
             font=font,
             fill=_rgba(self.t.header_text),
@@ -392,15 +402,15 @@ class ChatRenderer:
 def render_narrative(
     text: str,
     *,
-    avatars: Optional[Dict[str, AvatarSource]] = None,
-    theme: Union[str, Theme] = "light",
+    avatars: dict[str, AvatarSource] | None = None,
+    theme: str | Theme = "light",
     width: int = 1024,
     font_size: int = 34,
     title: str = "",
-    is_self: Optional[SelfNamePred] = None,
+    is_self: SelfNamePred | None = None,
     max_pages: int = 5,
     **kw,
-) -> List[Image.Image]:
+) -> list[Image.Image]:
     """渲染 markdown 剧情文本为一张或多张聊天截图。
 
     Args:
@@ -425,7 +435,7 @@ def render_narrative(
     # 模型输出的标题始终优先;没有一级标题时才 fallback 到传入的 title(chat_card_title 配置)。
     config_title = title or ""
     auto_title = ""  # 模型标题
-    new_blocks: List[md.Block] = []
+    new_blocks: list[md.Block] = []
     for blk in blocks:
         if blk.type == "heading" and getattr(blk, "level", 1) == 1:
             # 只取第一个一级标题作为顶部标题,并从正文移除(不重复渲染)

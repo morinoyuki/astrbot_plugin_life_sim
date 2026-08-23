@@ -11,11 +11,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional
 
 __all__ = [
-    "Span",
     "Block",
+    "Span",
     "parse_blocks",
     "plain_text",
 ]
@@ -42,12 +41,12 @@ class Block:
     """块基类。"""
 
     type: str = "paragraph"
-    spans: List[Span] = field(default_factory=list)
+    spans: list[Span] = field(default_factory=list)
 
 
 @dataclass
 class Heading(Block):
-    def __init__(self, level: int, spans: List[Span]):
+    def __init__(self, level: int, spans: list[Span]):
         super().__init__("heading", spans)
         self.level = level
 
@@ -61,7 +60,7 @@ class Dialogue(Block):
         speaker: str,
         content: str,
         protagonist: bool = False,
-        avatar: Optional[str] = None,
+        avatar: str | None = None,
     ):
         super().__init__("dialogue")
         self.speaker = speaker.strip()
@@ -76,12 +75,12 @@ class ListBlock(Block):
     def __init__(self, ordered: bool):
         super().__init__("list")
         self.ordered = ordered
-        self.items: List[List[Span]] = []
+        self.items: list[list[Span]] = []
 
 
 @dataclass
 class Quote(Block):
-    def __init__(self, spans: List[Span]):
+    def __init__(self, spans: list[Span]):
         super().__init__("quote", spans)
 
 
@@ -97,8 +96,8 @@ class CodeBlock(Block):
 class TableBlock(Block):
     def __init__(self):
         super().__init__("table")
-        self.header: List[str] = []
-        self.rows: List[List[str]] = []
+        self.header: list[str] = []
+        self.rows: list[list[str]] = []
 
 
 @dataclass
@@ -115,7 +114,7 @@ class ImageBlock(Block):
         self.url = url
 
 
-def plain_text(spans: List[Span]) -> str:
+def plain_text(spans: list[Span]) -> str:
     return "".join(s.text for s in spans)
 
 
@@ -133,14 +132,14 @@ _STYLE_RE = re.compile(
 )
 
 
-def parse_inline(text: str) -> List[Span]:
+def parse_inline(text: str) -> list[Span]:
     """把纯文本解析为 span 列表。"""
     if not text:
         return []
-    spans: List[Span] = []
+    spans: list[Span] = []
 
     # 1. 提取行内代码
-    tmp: List[Span] = []
+    tmp: list[Span] = []
     for idx, part in enumerate(_CODE_RE.split(text)):
         if not part:
             continue
@@ -154,11 +153,11 @@ def parse_inline(text: str) -> List[Span]:
     return _merge(spans)
 
 
-def _parse_style(text: str) -> List[Span]:
+def _parse_style(text: str) -> list[Span]:
     """解析单个片段内的粗体/斜体/删除线。"""
     if not text:
         return []
-    out: List[Span] = []
+    out: list[Span] = []
     for seg in _STYLE_RE.split(text):
         if not seg:
             continue
@@ -178,9 +177,9 @@ def _parse_style(text: str) -> List[Span]:
     return out
 
 
-def parse_links(spans: List[Span]) -> List[Span]:
+def parse_links(spans: list[Span]) -> list[Span]:
     """从 spans 中提取链接。"""
-    out: List[Span] = []
+    out: list[Span] = []
     for sp in spans:
         if sp.link or sp.code or not sp.text:
             out.append(sp)
@@ -199,11 +198,11 @@ def parse_links(spans: List[Span]) -> List[Span]:
     return out
 
 
-def _merge(spans: List[Span]) -> List[Span]:
+def _merge(spans: list[Span]) -> list[Span]:
     """合并相同样式的相邻片段。"""
     if not spans:
         return []
-    out: List[Span] = [spans[0]]
+    out: list[Span] = [spans[0]]
     for s in spans[1:]:
         last = out[-1]
         if (
@@ -236,13 +235,13 @@ _TABLE_SEP_RE = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
 
 # 角色名对白:名字(不含标点) + 冒号 + 内容
 # 主角标记:名字前加 `*`(由 LLM 按剧情判断谁是主角)
-_DIALOGUE_RE = re.compile(r"^(.{1,24}?)[:：]\s*(.+)$", re.S)
+_DIALOGUE_RE = re.compile(r"^(.{1,24}?)[:：]\s*(.+)$", re.DOTALL)
 _DIALOGUE_BAD_PREFIX = ("http", "https", "www.")
 
 
 def _looks_like_dialogue(
     line: str,
-) -> Optional[tuple[str, str, bool, Optional[str]]]:
+) -> tuple[str, str, bool, str | None] | None:
     """如果一行像 `角色名: 对白`,返回 (角色名, 内容, 是否主角, 头像覆盖)。
 
     主角标记:``*角色名: 台词`` —— 名字前加一个星号,渲染时靠右显示蓝色气泡。
@@ -269,8 +268,7 @@ def _looks_like_dialogue(
 
     # 排除系统/元信息行:剧情ID标记、emoji标记行、方括号开头的标签
     if (
-        stripped.startswith("📝")
-        or stripped.startswith("[")
+        stripped.startswith(("📝", "["))
         or "剧情ID" in stripped
         or "narrative_ref" in stripped.lower()
         or repr(who_raw).startswith("'📝")
@@ -301,25 +299,28 @@ def _looks_like_dialogue(
     if any(c in who for c in "[]`"):
         return None
     # 角色名不能包含明显不是名字的字符
-    if " " in who and not who.replace(" ", "").isalnum():
+    if (
+        " " in who
+        and not who.replace(" ", "").isalnum()
+        and not all(part.strip() for part in who.split())
+    ):
         # 允许"林 晓","Mr. Smith"等
-        if not all(part.strip() for part in who.split()):
-            return None
+        return None
     if "\n" in who or "  " in who:
         return None
     return who, content, protagonist, avatar_key
 
 
 def _strip_quotes(text: str) -> str:
-    pairs = [("「", "」"), ("『", "』"), ("“", "”"), ("\"", "\""), ("'", "'")]
+    pairs = [("「", "」"), ("『", "』"), ("“", "”"), ('"', '"'), ("'", "'")]
     for op, cl in pairs:
         if len(text) >= 2 and text[0] == op and text[-1] == cl:
             return text[1:-1]
     return text
 
 
-def parse_blocks(text: str) -> List[Block]:
-    blocks: List[Block] = []
+def parse_blocks(text: str) -> list[Block]:
+    blocks: list[Block] = []
     lines = (text or "").replace("\r\n", "\n").split("\n")
 
     i = 0
@@ -379,7 +380,9 @@ def parse_blocks(text: str) -> List[Block]:
             if diag:
                 who, content, protagonist, avatar_key = diag
                 blocks.append(
-                    Dialogue(who, _strip_quotes(content), protagonist, avatar=avatar_key)
+                    Dialogue(
+                        who, _strip_quotes(content), protagonist, avatar=avatar_key
+                    )
                 )
                 i += 1
                 continue
@@ -410,7 +413,7 @@ def parse_blocks(text: str) -> List[Block]:
 
         # 引用
         if _QUOTE_RE.match(line):
-            quote_spans: List[Span] = []
+            quote_spans: list[Span] = []
             while i < n:
                 mq = _QUOTE_RE.match(lines[i])
                 if not mq:
@@ -437,11 +440,11 @@ def parse_blocks(text: str) -> List[Block]:
                             i += 1
                         blocks.append(tb)
                         continue
-            except Exception:
-                pass
+            except (ValueError, IndexError):
+                pass  # 表格解析失败则按普通段落处理
 
         # 普通段落:收集到空行
-        para_spans: List[Span] = []
+        para_spans: list[Span] = []
         while i < n and lines[i].strip():
             if not para_spans:
                 para_spans.extend(parse_inline(lines[i].strip()))
@@ -454,5 +457,5 @@ def parse_blocks(text: str) -> List[Block]:
     return blocks
 
 
-def _split_table_row(line: str) -> List[str]:
+def _split_table_row(line: str) -> list[str]:
     return [c.strip() for c in line.strip("|").split("|")]

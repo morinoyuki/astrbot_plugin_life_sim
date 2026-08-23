@@ -57,7 +57,7 @@ class AvatarStore:
     @staticmethod
     def _sanitize(name: str) -> str:
         """规范化角色名:去空格、去路径分隔符,限制长度。"""
-        name = (name or "").strip().rstrip("\\/:*?\"<>|")
+        name = (name or "").strip().rstrip('\\/:*?"<>|')
         return name[:64] if name else ""
 
     @staticmethod
@@ -117,7 +117,7 @@ class AvatarStore:
                 try:
                     if os.path.exists(tmp):
                         os.remove(tmp)
-                except Exception:
+                except OSError:
                     pass
                 return None
         # ext 变量保持引用,避免 linter 告警
@@ -153,9 +153,7 @@ class AvatarStore:
         """返回全局默认头像路径 avatars/<DEFAULT_AVATAR_NAME>.*(存在时)。"""
         prefix = self._filename(DEFAULT_AVATAR_NAME, "")
         for p in os.listdir(self.base):
-            if p.startswith(prefix) and os.path.isfile(
-                os.path.join(self.base, p)
-            ):
+            if p.startswith(prefix) and os.path.isfile(os.path.join(self.base, p)):
                 return os.path.join(self.base, p)
         return None
 
@@ -198,8 +196,8 @@ class AvatarStore:
                     continue  # 默认头像不算角色
                 try:
                     result.append(unquote(stem))
-                except Exception:
-                    continue
+                except ValueError:
+                    continue  # 文件名不是合法 URL 编码,跳过
         return sorted(result)
 
     # ── 工具 ──────────────────────────────────────────────────

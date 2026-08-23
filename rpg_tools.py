@@ -9,12 +9,12 @@
     6. RPGMixin      ── 19 个 rpg_* LLM 工具 + 私有助手
 """
 
+import hashlib
 import json
 import os
 import random
 import re
 import time
-import hashlib
 
 from .storage_base import safe_remove
 from .storage_rpg import RpgStore
@@ -595,7 +595,7 @@ class RPGMixin:
             ):
                 gid = str(event.message_obj.group_id or "")
             return gid.strip()
-        except Exception:
+        except (AttributeError, TypeError):
             return ""
 
     def _make_char_uid(self, group_id: str, char_name: str, sender_uid: str) -> str:

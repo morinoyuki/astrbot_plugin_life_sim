@@ -23,23 +23,23 @@ SENTINEL = "# __PATCHED_LATEX_POISONING__"
 
 # 待匹配的原始锚点（绘制循环开头）
 _ANCHOR = (
-    '        islatex = False\n'
-    '\n'
+    "        islatex = False\n"
+    "\n"
     '        if latexs and latexs[0]["begin"]< idx <latexs[0]["end"]:'
 )
 
 # 注入后的内容
 _REPLACEMENT = (
-    '        islatex = False\n'
-    '\n'
-    f'        {SENTINEL}\n'
+    "        islatex = False\n"
+    "\n"
+    f"        {SENTINEL}\n"
     '        # 丢弃已走过的 latex 条目：当公式"子图数==源码字符数"时，\n'
-    '        # `>= len(images)` 分支永不触发、del latexs[0] 不执行，\n'
-    '        # 过期条目会毒化其后所有公式，使之退化为字面文本。\n'
+    "        # `>= len(images)` 分支永不触发、del latexs[0] 不执行，\n"
+    "        # 过期条目会毒化其后所有公式，使之退化为字面文本。\n"
     '        while latexs and idx >= latexs[0]["end"]:\n'
-    '            del latexs[0]\n'
-    '            nowlatexImageIdx = -1\n'
-    '\n'
+    "            del latexs[0]\n"
+    "            nowlatexImageIdx = -1\n"
+    "\n"
     '        if latexs and latexs[0]["begin"]< idx <latexs[0]["end"]:'
 )
 
@@ -68,6 +68,7 @@ def apply_patch(logger=None):
         "anchor_missing" 源码与预期不符（可能已被上游修复或版本变动），跳过
         "error:<msg>"    写入失败等异常，已安全跳过
     """
+
     def _log(msg):
         if logger is not None:
             try:
@@ -102,7 +103,9 @@ def apply_patch(logger=None):
 
         dir_name = os.path.dirname(path)
         tmp_path = None
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=dir_name) as tf:
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", delete=False, dir=dir_name
+        ) as tf:
             tf.write(patched)
             tmp_path = tf.name
         os.replace(tmp_path, path)
@@ -117,4 +120,3 @@ def apply_patch(logger=None):
 
     _log("pillowmd 补丁：已修复公式渲染 BUG（latex-formula-poisoning）")
     return "patched"
-

@@ -8,24 +8,23 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
-from typing import Optional, Tuple
 
 from PIL import ImageFont
 
 __all__ = [
-    "resolve_font_path",
-    "load_font",
-    "clear_font_cache",
-    "MOMOTOKI_LIGHT",
     "MOMOTOKI_DARK",
+    "MOMOTOKI_LIGHT",
     "THEMES",
     "Theme",
+    "clear_font_cache",
+    "load_font",
+    "resolve_font_path",
 ]
 
 # 常见 CJK 字体(环境变量 LIFE_SIM_FONT 优先级最高)
-_OS_FONT_CANDIDATES: Tuple[str, ...] = (
+_OS_FONT_CANDIDATES: tuple[str, ...] = (
     # Linux
     "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
@@ -47,7 +46,7 @@ _OS_FONT_CANDIDATES: Tuple[str, ...] = (
 )
 
 
-def _discover_font_candidates() -> Tuple[str, ...]:
+def _discover_font_candidates() -> tuple[str, ...]:
     """构建字体候选:环境变量 > styles 模板字体 > 系统字体 > pillowmd 内置雅黑。
 
     优先级:
@@ -97,9 +96,9 @@ def _discover_font_candidates() -> Tuple[str, ...]:
     return tuple(found)
 
 
-FALLBACK_FONT_CANDIDATES: Tuple[str, ...] = _discover_font_candidates()
+FALLBACK_FONT_CANDIDATES: tuple[str, ...] = _discover_font_candidates()
 
-BOLD_FONT_CANDIDATES: Tuple[str, ...] = (
+BOLD_FONT_CANDIDATES: tuple[str, ...] = (
     "C:/Windows/Fonts/msyhbd.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Bold.otf",
@@ -107,19 +106,19 @@ BOLD_FONT_CANDIDATES: Tuple[str, ...] = (
     *tuple(p for p in FALLBACK_FONT_CANDIDATES),
 )
 
-_font_path: Optional[str] = None
-_bold_font_path: Optional[str] = None
+_font_path: str | None = None
+_bold_font_path: str | None = None
 _font_searched = False
 
 
-def _find_font(candidates) -> Optional[str]:
+def _find_font(candidates) -> str | None:
     for p in candidates:
         try:
             if p and os.path.isfile(p) and os.access(p, os.R_OK):
                 ImageFont.truetype(p, 12)
                 return p
-        except Exception:
-            continue
+        except (OSError, ValueError):
+            continue  # 字体文件损坏或不可用,试下一个候选
     return None
 
 
@@ -136,7 +135,7 @@ def search_fonts() -> None:
     _font_searched = True
 
 
-def resolve_font_path() -> Optional[str]:
+def resolve_font_path() -> str | None:
     search_fonts()
     return _font_path
 
@@ -161,8 +160,8 @@ def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
     if path:
         try:
             return _cached_truetype(path, size)
-        except Exception:
-            pass
+        except OSError:
+            pass  # 主字体失效时回退到默认字体
     return _cached_default(size)
 
 
@@ -175,10 +174,10 @@ def clear_font_cache() -> None:
 # 主中文字体(OPPO Sans 等)缺少 emoji 字形时,回退到 Symbola_hint.ttf(表情/符号字体)。
 # 用户可在字体目录放置 Symbola_hint.ttf(默认随插件 fonts/ 提供)。
 
-_emoji_font_path: Optional[str] = None
+_emoji_font_path: str | None = None
 
 
-def _discover_emoji_font() -> Optional[str]:
+def _discover_emoji_font() -> str | None:
     """在字体搜索目录(含 fonts/)中查找 Symbola / Symbola_hint 等 emoji 字体。"""
     global _emoji_font_path
     if _emoji_font_path is not None:
@@ -197,10 +196,10 @@ def _discover_emoji_font() -> Optional[str]:
     return None
 
 
-_cmap_cache: dict[str, Optional[set]] = {}
+_cmap_cache: dict[str, set | None] = {}
 
 
-def _charset(path: str) -> Optional[set]:
+def _charset(path: str) -> set | None:
     """读取字体的 cmap 码点集合(缓存)。"""
     if path not in _cmap_cache:
         try:
@@ -214,14 +213,14 @@ def _charset(path: str) -> Optional[set]:
     return _cmap_cache[path]
 
 
-def _supports(path: Optional[str], char: str) -> bool:
+def _supports(path: str | None, char: str) -> bool:
     if not path:
         return True
     s = _charset(path)
     return bool(s and ord(char) in s)
 
 
-def emoji_font_for(char: str, size: int) -> Optional[ImageFont.FreeTypeFont]:
+def emoji_font_for(char: str, size: int) -> ImageFont.FreeTypeFont | None:
     """若主字体缺失该字符且 emoji 字体有,返回 emoji 字体;否则 None。"""
     search_fonts()
     em = _discover_emoji_font()
@@ -240,7 +239,6 @@ def font_for_char(char: str, size: int, bold: bool = False) -> ImageFont.FreeTyp
     if ef is not None:
         return ef
     return load_font(size, bold)
-
 
 
 # ═════════════════════════════════════════════════════════════════
@@ -330,7 +328,7 @@ def _hex(color: str) -> tuple:
         c = "".join(x * 2 for x in c)
     try:
         return (int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16))
-    except Exception:
+    except ValueError:
         return (136, 136, 136)
 
 
