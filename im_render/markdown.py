@@ -295,17 +295,21 @@ def _looks_like_dialogue(
     # 角色名不允许包含超长 / 标点
     if not who or len(who) > 12:
         return None
+    # 角色名若含句子内标点(逗号/顿号/句号/分号/冒号/叹号/问号) → 多半是 LLM
+    # 把「阿龙思索片刻，点头」这类动作咒拼进了名字,直接判为旁白,不要当作气泡。
+    if any(c in who for c in "，,、。;；:：!！?？"):
+        return None
     # 角色名不能包含明显不是名字的字符,排除含方括号/反引号的系统标签
     if any(c in who for c in "[]`"):
         return None
     # 角色名不能包含明显不是名字的字符
-    if (
-        " " in who
-        and not who.replace(" ", "").isalnum()
-        and not all(part.strip() for part in who.split())
-    ):
-        # 允许"林 晓","Mr. Smith"等
-        return None
+    if " " in who:
+        # 中文名不该有空格(「阿龙 点头」「林 晓」在中文语境多为 动作/短语混入)。
+        # 只有纯英文字母名(如 Mr. Smith)允许带空格。
+        if re.search(r"[\u4e00-\u9fff\u3000-\u303f]", who):
+            return None
+        if not all(part.strip() for part in who.split()):
+            return None
     if "\n" in who or "  " in who:
         return None
     return who, content, protagonist, avatar_key
