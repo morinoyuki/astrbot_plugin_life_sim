@@ -215,9 +215,46 @@ def clear_font_cache() -> None:
 #   - Segoe UI Emoji / AppleColorEmoji / OpenMoji / Twemoji 同理
 _EMOJI_FALLBACK_NAMES = (
     "NotoColorEmoji-Regular.ttf",
+    "NotoColorEmoji.ttf",
     "Segoe UI Emoji.ttf",
+    "SegoeUIEmoji.ttf",
     "OpenMoji-black.ttf",
+    "OpenMoji-black.otf",
+    "TwemojiSans.ttf",
     "NotoEmoji-Regular.ttf",
+    "Apple Color Emoji.ttc",
+)
+
+# 随系统自带的 emoji / 符号字体路径(优先级最高)。
+# 自带 Symbola 只覆盖 2014 年以前的 emoji,较新的 🥺/🤔/🙄 等缺失;
+# Windows 的 Segoe UI Emoji / macOS 的 Apple Color Emoji / Linux 的 NotoColorEmoji
+# 等能覆盖几乎所有现代 emoji,有的话优先选用。
+_OS_EMOJI_FONT_CAND = (
+    # Windows
+    "C:/Windows/Fonts/Segoe UI Emoji.ttf",
+    "C:/Windows/Fonts/SegoeUIEmoji.ttf",
+    "C:/Windows/Fonts/NotoColorEmoji-Regular.ttf",
+    "C:/Windows/Fonts/NotoColorEmoji.ttf",
+    # macOS
+    "/System/Library/Fonts/Apple Color Emoji.ttc",
+    "/Library/Fonts/Apple Color Emoji.ttc",
+    # Linux
+    "/usr/share/fonts/opentype/noto/NotoColorEmoji-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji-Regular.ttf",
+    "/usr/share/fonts/noto/NotoColorEmoji-Regular.ttf",
+    "/usr/share/fonts/noto-cjk/NotoColorEmoji-Regular.ttf",
+    "/usr/share/fonts/twemoji/TwitterColorEmoji-SVGinOT.ttf",
+    "/usr/share/fonts/truetype/noto/NotoEmoji-Regular.ttf",
+)
+
+# 额外的系统字体目录,按文件名扫描其中的 emoji 字体(兜底)。
+_OS_EMOJI_FONT_DIRS = (
+    "C:/Windows/Fonts",
+    "/System/Library/Fonts",
+    "/Library/Fonts",
+    "/usr/share/fonts",
+    "/usr/share/fonts/truetype/noto",
+    "/usr/share/fonts/opentype/noto",
 )
 
 
@@ -266,10 +303,14 @@ _emoji_fonts_cache: list[str] | None = None
 
 
 def _discover_emoji_fonts() -> list[str]:
-    """发现 fonts/ 目录中的备用符号/emoji 字体(secondFonts 模型)。
+    """发现备用符号/emoji 字体(secondFonts 模型),按优先级排列。
 
-    优先级:Symbola(黑白符号,随插件提供)→ 可选的彩色 emoji 字体
-    (NotoColorEmoji 等,能覆盖更全的较新 emoji)。返回按优先级排列的路径列表。
+    优先级:
+    1. 系统自带的彩色 emoji 字体(Segoe UI Emoji / Apple Color Emoji /
+       NotoColorEmoji 等,覆盖几乎全部现代 emoji)。若系统有,优先选用;
+    2. 按文件名扫描系统字体目录(兜底命中其它命名/路径);
+    3. 随插件 fonts/ 提供的黑白 Symbola(符号覆盖较全,但新版 emoji 缺失)。
+    返回可用的字体路径列表(先探测存在的)。
     """
     global _emoji_fonts_cache
     if _emoji_fonts_cache is not None:
@@ -277,14 +318,24 @@ def _discover_emoji_fonts() -> list[str]:
     here = os.path.dirname(os.path.abspath(__file__))
     bases = [os.path.dirname(here), here, os.getcwd()]
     found: list[str] = []
-    wanted = ("Symbola_hint.ttf", "Symbola.ttf") + _EMOJI_FALLBACK_NAMES
+
+    def add(p: str) -> None:
+        if p and os.path.isfile(p) and p not in found:
+            found.append(p)
+
+    # 1) 系统自带 emoji 字体优先
+    for p in _OS_EMOJI_FONT_CAND:
+        add(p)
+    # 2) 按文件名扫描常见系统字体目录(有些字体在子目录 / 命名略异)
+    for d in _OS_EMOJI_FONT_DIRS:
+        for fn in _EMOJI_FALLBACK_NAMES:
+            add(os.path.join(d, fn))
+    # 3) 随插件 fonts/ 提供的 Symbola 等黑白符号字体
     for base in bases:
         for sub in ("fonts", "font", ""):
             d = os.path.join(base, sub)
-            for fn in wanted:
-                fp = os.path.join(d, fn)
-                if os.path.isfile(fp) and fp not in found:
-                    found.append(fp)
+            for fn in _EMOJI_FALLBACK_NAMES + ("Symbola_hint.ttf", "Symbola.ttf"):
+                add(os.path.join(d, fn))
     _emoji_fonts_cache = found
     return list(found)
 
@@ -295,8 +346,11 @@ def emoji_font_for(char: str, size: int) -> ImageFont.FreeTypeFont | None:
     if _supports(_font_path, char):
         return None  # 主字体有字形
     for alt in _discover_emoji_fonts():
-        if _supports(alt, char):
-            return _cached_truetype(alt, size)
+        try:
+            if _supports(alt, char):
+                return _cached_truetype(alt, size)
+        except Exception:
+            continue  # 该字体无法读取 / 加载失败,试下一个
     return None  # 所有备用字体都没有 → 由调用方回主字体(尽力)
 
 
