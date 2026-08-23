@@ -446,6 +446,134 @@ def _build_narrative_ref_tag(last_nid: str) -> str:
     )
 
 
+def _compact_lore_versions(session: dict) -> None:
+    """把 `lore_snapshots` 收敛为 `_lore_versions` 内容索引表(去重)。
+
+    - 老会话中快照内联了整份 `world_lore` / `character_lore`,连续轮次内容相同
+      时会产生大量重复数据(实测 25 轮里只有 5 组内容)。
+    - 这里把每份不相同的内容存到 `session["_lore_versions"]` 表里一次,
+      快照只保留 `{turn, version}` 轻量索引;同一内容被多个 turn 复用。
+    - 兼容反向:快照若已带 `version` 引用则按其指向解析,旧格式内联字段也会照常迁移。
+
+    快照窗口滑动时,此函数同时处理两类快照,结果仍保证 `_resolve_snapshot_lore` 一致。
+    """
+    old_versions = session.get("_lore_versions") or []
+    snapshots = session.get("lore_snapshots") or []
+    versions: list[dict] = []
+    index: dict[tuple[str, str], int] = {}
+    out: list[dict] = []
+    for snap in snapshots:
+        if not isinstance(snap, dict) or "turn" not in snap:
+            out.append(snap)
+            continue
+        turn = snap["turn"]
+        vi = snap.get("version")
+        if isinstance(vi, int) and 0 <= vi < len(old_versions):
+            prev = old_versions[vi]
+            wl = prev.get("world_lore", [])
+            cl = prev.get("character_lore", {})
+        else:
+            wl = snap.get("world_lore", [])
+            cl = snap.get("character_lore", {})
+        key = (
+            json.dumps(wl, sort_keys=True, ensure_ascii=False),
+            json.dumps(cl, sort_keys=True, ensure_ascii=False),
+        )
+        new_vi = index.get(key)
+        if new_vi is None:
+            new_vi = len(versions)
+            index[key] = new_vi
+            versions.append({"world_lore": wl, "character_lore": cl})
+        out.append({"turn": turn, "version": new_vi})
+    session["lore_snapshots"] = out
+    if out:
+        session["_lore_versions"] = versions
+    else:
+        session.pop("_lore_versions", None)
+
+
+def _resolve_snapshot_lore(session: dict, snapshot: dict) -> tuple[list, dict]:
+    """解析单个 lore 快照的 (world_lore, character_lore)。
+
+    新格式快照只带 `version` 索引,从 `_lore_versions` 取内容;
+    旧格式快照仍内联了整份内容,直接返回。
+    """
+    if not isinstance(snapshot, dict):
+        return [], {}
+    vi = snapshot.get("version")
+    if isinstance(vi, int):
+        versions = session.get("_lore_versions") or []
+        if 0 <= vi < len(versions):
+            v = versions[vi]
+            return v.get("world_lore", []), v.get("character_lore", {})
+    return (
+        snapshot.get("world_lore", []),
+        snapshot.get("character_lore", {}),
+    )
+
+
+def _compact_rpg_versions(session: dict) -> None:
+    """把 `rpg_snapshots` 收敛为 `_rpg_versions` 内容索引表(去重)。
+
+    RPG 快照里 `chars` / `sessions` 是整份角色档案副本,大多数 turn 里内容完全
+    相同(实测 25 轮只有 1 组内容)。这里按 (chars, sessions) 内容寻址,相同内容
+    只存一次;快照本身退化为 `{turn, scope, version}` 轻量引用。
+
+    `scope` 每轮保留(记录当时触发者),不进版本表 —— 不同 sender 触发同一状态
+    时共享同一版本,不重复存储。
+    """
+    old_versions = session.get("_rpg_versions") or []
+    snapshots = session.get("rpg_snapshots") or []
+    versions: list[dict] = []
+    index: dict[str, int] = {}
+    out: list[dict] = []
+    for snap in snapshots:
+        if not isinstance(snap, dict) or "turn" not in snap:
+            out.append(snap)
+            continue
+        vi = snap.get("version")
+        if isinstance(vi, int) and 0 <= vi < len(old_versions):
+            body = old_versions[vi]
+        else:
+            body = {k: snap[k] for k in ("chars", "sessions") if k in snap}
+        key = json.dumps(body, sort_keys=True, ensure_ascii=False)
+        new_vi = index.get(key)
+        if new_vi is None:
+            new_vi = len(versions)
+            index[key] = new_vi
+            versions.append(body)
+        ref: dict = {"turn": snap["turn"], "version": new_vi}
+        scope = snap.get("scope")
+        if scope is not None:
+            ref["scope"] = scope
+        out.append(ref)
+    session["rpg_snapshots"] = out
+    if out:
+        session["_rpg_versions"] = versions
+    else:
+        session.pop("_rpg_versions", None)
+
+
+def _resolve_rpg_snapshot(session: dict, snapshot: dict) -> dict:
+    """解析单个 RPG 快照为 `_rpg_restore` 需要的完整 dict。
+
+    - 新格式: `{turn, scope, version}` → 从 `_rpg_versions` 取 (chars, sessions)。
+    - 旧格式: 内联了 chars/sessions,原样返回。
+    """
+    if not isinstance(snapshot, dict):
+        return {}
+    vi = snapshot.get("version")
+    if isinstance(vi, int):
+        versions = session.get("_rpg_versions") or []
+        if 0 <= vi < len(versions):
+            body = dict(versions[vi])
+            scope = snapshot.get("scope")
+            if scope is not None:
+                body["scope"] = scope
+            return body
+    return dict(snapshot)
+
+
 class _LifeSimToolHooks(BaseAgentRunHooks[AstrAgentContext]):
     """从 run_context.messages 中提取本轮 agent 新增的工具调用上下文。
 
@@ -1124,6 +1252,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             # 限制最多保留 25 个快照(每个可能含多角色,避免 KV 膨胀)
             if len(rpg_snaps) > 25:
                 del rpg_snaps[: len(rpg_snaps) - 25]
+            # 去重:chars/sessions 内容寻址收敛到 `_rpg_versions` 索引表
+            _compact_rpg_versions(session)
 
         contexts = bind_checkpoint_messages(messages)
 
@@ -1503,9 +1633,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         """在 turn 处快照当前 lore 状态,供 /undo 回滚。
 
         每个 turn 开始时(LLM 调用前)调用一次。/undo 时用 turn 计数回滚,
-        比 msg_index 更稳定 — 压缩 / 增删消息不影响 turn 计数。
+        比 msg_index 更稳定 —— 压缩 / 分支切换不影响 turn 计数。
 
-        深拷贝避免后续修改 session.lore 影响快照。
+        深拷贝避免后续修改 session.lore 影响快照。快照经 `_compact_lore_versions`
+        内容寻址去重:连续多轮 lore 未变时,只保留一份较新版本引用而不是整份拷贝。
         """
         snapshots = session.setdefault("lore_snapshots", [])
         char_lore_dict = self._normalize_character_lore(session.get("character_lore"))
@@ -1523,6 +1654,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         # undo 最大回滚 20 轮,25 个快照足够覆盖。
         if len(snapshots) > 25:
             del snapshots[: len(snapshots) - 25]
+        # 去重 + 迁移旧格式(把内联整份 lore 收敛到 `_lore_versions` 索引表)
+        _compact_lore_versions(session)
 
     async def _snapshot_narrative_history(
         self, session: dict, turn: int, scope: str
@@ -2418,10 +2551,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             None,
         )
         if target_snapshot:
-            session["world_lore"] = target_snapshot["world_lore"]
-            session["character_lore"] = target_snapshot["character_lore"]
+            (
+                session["world_lore"],
+                session["character_lore"],
+            ) = _resolve_snapshot_lore(session, target_snapshot)
         # 删掉被回滚的快照(turn > target_turn)
         session["lore_snapshots"] = [s for s in snapshots if s["turn"] <= target_turn]
+        # 快照去重表同步收敛,丢弃已无快照引用的版本
+        _compact_lore_versions(session)
         # 同时回滚 lore_turn 计数
         session["lore_turn"] = target_turn
         lore_restored = target_snapshot is not None
@@ -2434,10 +2571,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         )
         rpg_stats = None
         if target_rpg_snap is not None:
-            rpg_stats = self._rpg_restore(target_rpg_snap)
+            rpg_stats = self._rpg_restore(
+                _resolve_rpg_snapshot(session, target_rpg_snap)
+            )
         session["rpg_snapshots"] = [
             s for s in rpg_snapshots if s["turn"] <= target_turn
         ]
+        # 回滚后收敛去重表,丢弃已无快照引用的版本
+        _compact_rpg_versions(session)
 
         # 回滚剧情历史(新增的删掉、被修订的还原)
         narr_snapshots = session.get("narrative_snapshots") or []
@@ -2463,7 +2604,12 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         session["messages"] = messages
 
         # 统计(给展示用)
-        char_dict = (target_snapshot or {}).get("character_lore") or {}
+        _resolved_lore = (
+            _resolve_snapshot_lore(session, target_snapshot)
+            if target_snapshot
+            else ({}, {})
+        )
+        char_dict = _resolved_lore[1] or {}
         return {
             "turns": take,
             "removed": removed,
@@ -2909,7 +3055,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             "last_narrative_id": session.get("last_narrative_id"),
             "lore_turn": session.get("lore_turn", 0),
             "lore_snapshots": copy.deepcopy(session.get("lore_snapshots") or []),
+            "_lore_versions": copy.deepcopy(session.get("_lore_versions") or []),
             "rpg_snapshots": copy.deepcopy(session.get("rpg_snapshots") or []),
+            "_rpg_versions": copy.deepcopy(session.get("_rpg_versions") or []),
             "narrative_snapshots": copy.deepcopy(
                 session.get("narrative_snapshots") or []
             ),
@@ -2936,7 +3084,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             "last_narrative_id": branch.get("last_narrative_id"),
             "lore_turn": branch.get("lore_turn", 0),
             "lore_snapshots": copy.deepcopy(branch.get("lore_snapshots") or []),
+            "_lore_versions": copy.deepcopy(branch.get("_lore_versions") or []),
             "rpg_snapshots": copy.deepcopy(branch.get("rpg_snapshots") or []),
+            "_rpg_versions": copy.deepcopy(branch.get("_rpg_versions") or []),
             "narrative_snapshots": copy.deepcopy(
                 branch.get("narrative_snapshots") or []
             ),
