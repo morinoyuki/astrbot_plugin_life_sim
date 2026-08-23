@@ -37,9 +37,12 @@ from astrbot.core.provider.func_tool_manager import PY_TO_JSON_TYPE
 from astrbot.core.star.star_tools import StarTools
 from astrbot.core.utils.quoted_message.extractor import QuotedMessageExtractor
 
+from .avatar_store import AvatarStore
+from .im_render.engine import render_narrative
 from .dice import DiceMixin
 from .md_to_image import MdToImageMixin
 from .prompts import (
+    CHAT_CARD_PROMPT,
     HELP_TEXT,
     MODE_DETECT_SYSTEM_PROMPT,
     MODE_NAMES,
@@ -524,6 +527,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.data_dir = StarTools.get_data_dir()
+        # 角色头像存储
+        self.avatar_store = AvatarStore(self.data_dir)
         # 文件存储实例(sim 会话 + RPG 数据 + 剧情历史 + 分支快照,各自独立模块)
         self.sim_store = SimStore(self.data_dir)
         self.rpg_store = RpgStore(self.data_dir)
@@ -558,12 +563,22 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         return val if val is not None else default
 
     async def _yield_narrative_result(self, event, text: str):
-        """把叙事输出以文本或图片形式 yield(根据 output_as_image 开关)。
+        """把叙事输出以文本或图片形式 yield(根据 chat_card_enable / output_as_image)。
 
-        转图失败自动回退纯文本,不影响主流程。图片走 framework 的临时文件
-        跟踪(event.track_temporary_local_file),事件处理完后统一删除;
-        渲染/保存失败时 `md_render_to_path` 已自清理,不会残留空文件。
+        优先级:聊天卡片(IM 对白) > Markdown 转图(pillowmd) > 纯文本。
+        图片走 framework 的临时文件跟踪,事件处理完后自动删除。
         """
+        if self._cfg("chat_card_enable", False):
+            try:
+                sent = False
+                async for item in self._chat_card_generate(text, event):
+                    sent = True
+                    yield item
+                if sent:
+                    return
+            except Exception as e:
+                logger.warning(f"life-sim: 聊天卡片渲染失败,回退: {e}")
+
         if self.md_should_render(text):
             try:
                 path = await self.md_render_to_path(
@@ -578,8 +593,124 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         yield event.plain_result(text)
 
     # ════════════════════════════════════════════════════════════════
-    # 转生模拟:独立文件会话(叙事历史)
+    # 聊天卡片(IM 对白样式) — 基于 im_render 新引擎
     # ════════════════════════════════════════════════════════════════
+
+    def _chat_card_avatar_prompt(self) -> str:
+        """生成角色头像列表提示,注入 system prompt,让 LLM 输出规范角色名。
+
+        作用:头像按「角色名」存储(/头像 汐见小亚 <图>)。若 LLM 输出简称(如
+        「小亚」而不是「汐见小亚」),聊天卡片渲染时头像就匹配不上。这里把已
+        设置头像的角色名全部列出,要求 LLM 与之一致。
+
+        头像自选:LLM 可在对白中通过 `角色名@头像名: 台词` 显式指定该气泡使用
+        列表里的哪张头像(即使角色名与头像名不同);不写 `@` 时默认按角色名匹配。
+        """
+        try:
+            store = getattr(self, "avatar_store", None)
+            names = store.list_names() if store else []
+        except Exception as e:
+            logger.warning(f"life-sim: 读取头像列表失败: {e}")
+            names = []
+        if not names:
+            return ""
+        lines = "\n".join(f"- {n}" for n in names)
+        return (
+            "\n\n## 📷 现有角色头像(对白可用完整角色名匹配,也可自选)"
+            "\n以下角色已设置头像。剧情中对白的角色名请："
+            "\n1. 若该角色名已在列表中,直接用它作角色名即可自动匹配头像;"
+            "\n2. 若你想**让任意角色使用列表中的某张头像**(即使名字不同——如让"
+            "一个由阴影化出的少女用「汐见小亚」的头像),在角色名后加 `@头像名`:"
+            "\n   格式 `角色名@头像名: 台词`,例如 `阴影少女@汐见小亚: 你是谁?`"
+            "  —— 气泡显示「阴影少女」,头像用「汐见小亚」;"
+            "\n3. 不写 `@` 时,系统默认按角色名对列表做模糊匹配。"
+            "\n可用头像名单："
+            + lines + "\n"
+        )
+
+    def _chat_card_avatars(self) -> dict:
+        """构建 角色名 → 头像 映射(含默认头兜底)。"""
+        avatars = {}
+        try:
+            store = getattr(self, "avatar_store", None)
+            if store is not None:
+                for name in store.list_names():
+                    avatars[name] = store.get_avatar(name)
+                d = store.get_default_avatar()
+                if d:
+                    avatars[""] = d
+        except Exception as e:
+            logger.warning(f"life-sim: 加载角色头像失败: {e}")
+        return avatars
+
+    async def _chat_card_generate(self, text: str, event):
+        """把叙事 markdown 渲染为聊天截图并逐一 yield。"""
+        from .im_render.engine import TooManyPages
+
+        loops = asyncio.get_running_loop()
+
+        def _build() -> list:
+            return self._chat_card_render(text)
+
+        try:
+            images = await loops.run_in_executor(None, _build)
+        except TooManyPages:
+            logger.warning("life-sim: 聊天卡片分页超限,降级")
+            return
+        except Exception as e:
+            logger.warning(f"life-sim: 聊天卡片渲染失败: {e}")
+            return
+
+        for img in images or []:
+            if img is None:
+                continue
+            path = await self._save_chat_bubble(img)
+            if path:
+                event.track_temporary_local_file(path)
+                yield event.image_result(path)
+
+    def _chat_card_render(self, text: str) -> list:
+        """同步执行渲染,返回图片列表。可被线程池调用。"""
+        theme = str(self._cfg("chat_card_theme", "light") or "light").strip().lower()
+        if theme not in ("light", "dark"):
+            theme = "light"
+        self_names = [
+            s.strip()
+            for s in str(self._cfg("chat_card_self_names", "我,自己,你,玩家")).split(",")
+            if s.strip()
+        ]
+        avatars = self._chat_card_avatars()
+
+        def _is_self(speaker: str) -> bool:
+            return speaker in self_names
+
+        return render_narrative(
+            text,
+            theme=theme,
+            width=int(self._cfg("chat_card_width", 1024)),
+            font_size=int(self._cfg("chat_card_font_size", 34)),
+            title=str(self._cfg("chat_card_title", "") or ""),
+            max_pages=int(self._cfg("chat_card_max_pages", 5)),
+            is_self=_is_self,
+            avatars=avatars,
+        )
+
+    async def _save_chat_bubble(self, img) -> str:
+        """保存聊天卡片图到临时文件并返回路径。"""
+        import tempfile
+
+        fd, p = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, img.save, p, "PNG")
+            return p
+        except Exception as e:
+            logger.warning(f"life-sim: 聊天卡片保存失败: {e}")
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            return None
 
     def _sim_session_key(self, event: AstrMessageEvent) -> str:
         gid = event.message_obj.group_id
@@ -940,6 +1071,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         lore = self._build_lore_addendum(session, user_input)
         if lore:
             system_prompt += "\n\n" + lore
+
+        # 聊天卡片模式:注入对白输出规范
+        if self._cfg("chat_card_enable", False):
+            system_prompt += CHAT_CARD_PROMPT
+            system_prompt += self._chat_card_avatar_prompt()
 
         # 输出前自检 — 放在 system prompt 最末尾,利用 recency bias 强化设定遵从度
         system_prompt += (
@@ -1881,6 +2017,75 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
     # ════════════════════════════════════════════════════════════════
     # 指令
     # ════════════════════════════════════════════════════════════════
+
+    @filter.command("头像", alias={"set_avatar", "设置头像", "头像设置"})
+    async def cmd_set_avatar(self, event: AstrMessageEvent):
+        """/头像 <角色名> <图片> - 设置角色头像(用于聊天卡片);/头像 列表 查看已设置"""
+        # 提取参数(去掉命令本身)
+        arg = self._extract_after_cmd(event, ("头像", "set_avatar", "设置头像", "头像设置"))
+
+        # 列表操作优先(不需要图片)
+        if arg.strip() in ("列表", "list", "-l", "查看"):
+            names = self.avatar_store.list_names()
+            if not names:
+                yield event.plain_result("📭 还没有设置任何头像")
+            else:
+                yield event.plain_result("已设置头像:\n" + "\n".join(f"• {n}" for n in names))
+            return
+
+        # 提取图片
+        imgs = await _extract_image(event)
+        if not imgs:
+            yield event.plain_result(
+                "❌ 请附带一张角色头像图片:\n`/头像 阿龙 <图片>`\n\n查看已设置: `/头像 列表`"
+            )
+            return
+        if not arg:
+            yield event.plain_result("❌ 请指定角色名,例如:\n`/头像 阿龙 <图片>`")
+            return
+
+        # 取第一张图片
+        try:
+            img = imgs[0]
+            path = await img.convert_to_file_path()
+        except Exception as e:
+            yield event.plain_result(f"❌ 图片下载失败:{e}")
+            return
+
+        name = arg.strip()
+        # 重新从文件读字节(convert_to_file_path 已处理网络/本地)
+        try:
+            with open(path, "rb") as f:
+                data = f.read()
+        except Exception as e:
+            yield event.plain_result(f"❌ 读取图片失败:{e}")
+            return
+
+        saved = self.avatar_store.save_avatar(name, data)
+        if saved:
+            yield event.plain_result(f"✅ 已为「{name}」设置头像")
+        else:
+            yield event.plain_result("❌ 保存失败,请检查图片格式 / 角色名")
+
+    @filter.command("删除头像", alias={"del_avatar", "清除头像"})
+    async def cmd_del_avatar(self, event: AstrMessageEvent):
+        """/删除头像 <角色名> - 删除角色头像"""
+        arg = self._extract_after_cmd(event, ("删除头像", "del_avatar", "清除头像"))
+        if not arg:
+            yield event.plain_result("❌ 用法: `/删除头像 阿龙`")
+            return
+        names = [n.strip() for n in arg.replace(" ", ",").split(",") if n.strip()]
+        if not names:
+            yield event.plain_result("❌ 用法: `/删除头像 阿龙`")
+            return
+        deleted = []
+        for n in names:
+            if self.avatar_store.delete(n):
+                deleted.append(n)
+        if deleted:
+            yield event.plain_result(f"🗑️ 已删除: {', '.join(deleted)}")
+        else:
+            yield event.plain_result("ℹ️ 没有找到对应的头像")
 
     @filter.command("创建", alias={"create"})
     async def cmd_create(self, event: AstrMessageEvent):

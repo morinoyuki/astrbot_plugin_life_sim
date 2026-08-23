@@ -95,6 +95,48 @@
     "hint": "渲染时启用 pillowmd 的 autoPage(尽可能接近黄金分割比,避免图片过长)。关闭后内容多时会生成超长单图。GIF 样式下自动分页仍输出动图",
     "default": true
   },
+  "chat_card_enable": {
+    "description": "剧情对白显示为聊天卡片(IM 样式,实验性)",
+    "type": "bool",
+    "hint": "开启后,剧情中的角色对白会以即时通讯气泡的形式渲染成图片(类似蓝色档案·桃信)。需先关闭本插件的「叙事输出转图片」或两者可同时开启,互不影响。对白识别依赖「角色名:内容」格式。",
+    "default": false
+  },
+  "chat_card_theme": {
+    "description": "聊天卡片主题(light/dark)",
+    "type": "string",
+    "hint": "light=米白底(默认), dark=深色底",
+    "default": "light"
+  },
+  "chat_card_title": {
+    "description": "聊天卡片标题(留空不显示标题栏)",
+    "type": "string",
+    "hint": "显示在聊天气泡顶部的标题,类似群聊名称。留空则不显示标题栏。",
+    "default": ""
+  },
+  "chat_card_self_names": {
+    "description": "兜底判定「主角」的称呼(逗号分隔,靠右蓝色气泡)",
+    "type": "string",
+    "hint": "推荐让 LLM 用 *名字: 台词 标记主角(见提示词说明)。这里作为兜底:对白说话人等于这些名称时也视为主角。多个用英文逗号分隔。",
+    "default": "我,自己,你,玩家"
+  },
+  "chat_card_width": {
+    "description": "聊天卡片宽度(px)",
+    "type": "int",
+    "hint": "整张卡片宽度,默认 1024。越大气泡越宽、每行字数越多。",
+    "default": 1024
+  },
+  "chat_card_font_size": {
+    "description": "正文字号(px)",
+    "type": "int",
+    "hint": "气泡内文字大小,默认 34。",
+    "default": 34
+  },
+  "chat_card_max_pages": {
+    "description": "聊天卡片最大分页数(超出放弃)",
+    "type": "int",
+    "hint": "对白过长时最多分几页(张图)。超过上限会回退为纯文本,避免消息过长刷屏。",
+    "default": 5
+  },
   "lore_selective_load": {
     "description": "选择性加载 lore(默认开,减少 system prompt 占用)",
     "type": "bool",
