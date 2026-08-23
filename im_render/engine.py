@@ -351,8 +351,15 @@ class ChatRenderer:
     def _draw_page(self, title_h: int, rows: list[Row], _all: list[Row]) -> Image.Image:
         # 首行内容与标题之间留 v_pad 间隙(若无标题则顶部留 padding)
         lead_gap = self.v_pad if (self.title and self.show_title) else 0
-        # 计算总高
-        total_h = sum(r.height for r in rows) + title_h + lead_gap + self.v_pad // 2
+        # 计算总高。各行高度 + 行间间距(与绘制循环一致)+ 标题 + 间隙 + 底部留白
+        # 若忽略行间 msg_gap,多行时底边会被挤出画布、内容超长被裁。
+        total_h = (
+            sum(r.height for r in rows)
+            + self.msg_gap * max(0, len(rows) - 1)
+            + title_h
+            + lead_gap
+            + self.v_pad // 2
+        )
         # 高宽比保护,避免过度拉伸
         img = self.new_page(max(80, min(40000, total_h)))
         y = 0
