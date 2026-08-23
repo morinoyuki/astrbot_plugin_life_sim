@@ -231,6 +231,7 @@ class ChatRenderer:
                     color=self.t.text,
                     margin=(12, 8, 12, 0),
                     align="left",
+                    use_title_font=True,
                 )
             )
         elif blk.type == "paragraph":

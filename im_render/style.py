@@ -20,6 +20,7 @@ __all__ = [
     "Theme",
     "clear_font_cache",
     "load_font",
+    "load_title_font",
     "resolve_font_path",
 ]
 
@@ -106,8 +107,12 @@ BOLD_FONT_CANDIDATES: tuple[str, ...] = (
     *tuple(p for p in FALLBACK_FONT_CANDIDATES),
 )
 
+# 标题专用字体(仓耳小丸子等圆体),按文件名关键词逐个探测
+_TITLE_FONT_NAMES = ("仓耳", "丸子", "圆体", "comic", "pixel")
+
 _font_path: str | None = None
 _bold_font_path: str | None = None
+_title_font_path: str | None = None
 _font_searched = False
 
 
@@ -122,8 +127,22 @@ def _find_font(candidates) -> str | None:
     return None
 
 
+def _find_title_font() -> str | None:
+    """从字体候选里挑选标题专用字体(仓耳小丸子等)。"""
+    for p in FALLBACK_FONT_CANDIDATES:
+        name = os.path.basename(p).lower()
+        if any(k in name for k in _TITLE_FONT_NAMES):
+            try:
+                if os.path.isfile(p) and os.access(p, os.R_OK):
+                    ImageFont.truetype(p, 12)
+                    return p
+            except (OSError, ValueError):
+                continue
+    return None
+
+
 def search_fonts() -> None:
-    global _font_searched, _font_path, _bold_font_path
+    global _font_searched, _font_path, _bold_font_path, _title_font_path
     if _font_searched:
         return
     env = os.environ.get("LIFE_SIM_FONT", "").strip()
@@ -132,6 +151,7 @@ def search_fonts() -> None:
     reg += list(FALLBACK_FONT_CANDIDATES)
     _font_path = _find_font(reg)
     _bold_font_path = _find_font(([env] if env else []) + list(BOLD_FONT_CANDIDATES))
+    _title_font_path = _find_title_font() or _font_path
     _font_searched = True
 
 
@@ -163,6 +183,19 @@ def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
         except OSError:
             pass  # 主字体失效时回退到默认字体
     return _cached_default(size)
+
+
+def load_title_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
+    """加载标题专用字体(仓耳小丸子等圆体);没找到时回退主字体。"""
+    search_fonts()
+    size = max(4, int(size))
+    path = _title_font_path or _font_path
+    if path:
+        try:
+            return _cached_truetype(path, size)
+        except OSError:
+            pass
+    return load_font(size, bold)
 
 
 def clear_font_cache() -> None:

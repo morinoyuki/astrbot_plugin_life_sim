@@ -11,7 +11,12 @@ from collections.abc import Sequence
 from PIL import Image, ImageDraw, ImageFont
 
 from . import markdown as md
-from .style import _is_emoji_control, font_for_char, load_font
+from .style import (
+    _is_emoji_control,
+    font_for_char,
+    load_font,
+    load_title_font,
+)
 
 try:  # noqa: E129
     from .engine import AvatarSource  # noqa: F401
@@ -161,9 +166,11 @@ class RichTextRow(Row):
         margin=(0, 0, 0, 0),
         border_left: int = 0,
         dedent: bool = True,
+        use_title_font: bool = False,
     ):
         super().__init__(r)
         self.bold = bold
+        self.use_title_font = use_title_font
         self.color = color or r.t.text_secondary
         self.font_size = font_size or r.font_size
         self.align = align
@@ -227,11 +234,16 @@ class RichTextRow(Row):
         self.lines = wrapped
 
         # 计算高度
-        font = load_font(self.font_size, bold=bold)
+        font = self._measure_font(bold)
         self.text_h = font_metrics(font)
         line_h = int(self.text_h * r.line_height) if self.text_h else self.font_size
         pad_y = margin[0] + margin[1]
         self.height = max(self.font_size, len(self.lines) * line_h + pad_y)
+
+    def _measure_font(self, bold: bool) -> ImageFont.FreeTypeFont:
+        if self.use_title_font:
+            return load_title_font(self.font_size, bold=bold)
+        return load_font(self.font_size, bold=bold)
 
     def _paint_on(self, canvas: Image.Image, y: int) -> None:
         draw = ImageDraw.Draw(canvas)
@@ -256,10 +268,22 @@ class RichTextRow(Row):
                 for ch in sp.text:
                     if _is_emoji_control(ch):
                         continue
-                    f = font_for_char(ch, self.font_size, bold=sp.bold or self.bold)
+                    f = self._paint_font(ch, sp)
                     draw.text((x, ty), ch, font=f, fill=col)
                     x += draw.textlength(ch, font=f)
             ty += line_h
+
+    def _paint_font(self, ch: str, sp) -> ImageFont.FreeTypeFont:
+        """标题模式:标题专用字体(仓耳小丸子)优先;emoji/符号仍回退。"""
+        if self.use_title_font and sp is not None and not getattr(sp, "code", False):
+            f = load_title_font(self.font_size)
+            # 标题字体缺该字符时回退常规路径
+            try:
+                if f and f.getmask(ch).getbbox():
+                    return f
+            except Exception:
+                pass
+        return font_for_char(ch, self.font_size, bold=sp.bold or self.bold)
 
 
 class CodeRow(Row):
