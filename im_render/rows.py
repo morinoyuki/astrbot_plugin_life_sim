@@ -36,6 +36,39 @@ def _rgba(c, a=255):
     return (r, g, b, a)
 
 
+def _measure_fallback(draw, text: str, size: int, *, bold: bool = False) -> float:
+    """测量含 emoji 的字符串宽度(T,逐字符选用回退字体,与绘制一致)。"""
+    total = 0.0
+    for ch in text:
+        if _is_emoji_control(ch):
+            continue
+        f = font_for_char(ch, size, bold=bold)
+        total += draw.textlength(ch, font=f)
+    return total
+
+
+def _draw_fallback(
+    draw, xy, text: str, size: int, fill, *, bold: bool = False
+) -> float:
+    """逐字符绘制文本,支持 emoji / 符号字体回退。返回末端 x 坐标。"""
+    x, y = xy
+    for ch in text:
+        if _is_emoji_control(ch):
+            continue
+        f = font_for_char(ch, size, bold=bold)
+        draw.text((x, y), ch, font=f, fill=fill)
+        x += draw.textlength(ch, font=f)
+    return x
+
+
+def _measure_spans_fallback(draw, spans, size: int) -> float:
+    """测量 span 序列总宽度(逐字符回退)。"""
+    total = 0.0
+    for sp in spans:
+        total += _measure_fallback(draw, sp.text, size, bold=sp.bold)
+    return total
+
+
 def font_metrics(font: ImageFont.FreeTypeFont) -> int:
     """返回字体行高(含行距)。"""
     top, bottom = font.getmetrics()
@@ -101,15 +134,11 @@ class Row:
         return cx
 
     def _measure_spans(self, spans: Sequence[md.Span], font_size: int) -> float:
-        """测量 span 序列的总宽度。"""
+        """测量 span 序列的总宽度(emoji/符号逐字符回退)。"""
         from PIL import ImageDraw
 
         draw = ImageDraw.Draw(Image.new("RGB", (4, 4)))
-        total = 0.0
-        for sp in spans:
-            f = load_font(font_size, bold=sp.bold)
-            total += draw.textlength(sp.text, font=f)
-        return total
+        return _measure_spans_fallback(draw, spans, font_size)
 
     def _wrap_spans(
         self,
@@ -117,7 +146,7 @@ class Row:
         max_width: int,
         font_size: int,
     ) -> list[list[md.Span]]:
-        """把 spans 按最大宽度换行,返回多行。"""
+        """把 spans 按最大宽度换行,返回多行。emoji 宽度按回退字体计算。"""
         if not spans:
             return [[]]
         lines: list[list[md.Span]] = []
@@ -129,7 +158,7 @@ class Row:
             for ch in sp.text:
                 if _is_emoji_control(ch):
                     continue
-                f = load_font(font_size, bold=sp.bold)
+                f = font_for_char(ch, font_size, bold=sp.bold)
                 cw = draw.textlength(ch, font=f)
                 if cur and cur_w + cw > max_width:
                     lines.append(cur)
@@ -347,17 +376,17 @@ class PillRow(Row):
         self.font_size = font_size or int(r.font_size * 0.92)
         self.color = color or r.t.pill_text
 
-        # 换行
+        # 换行(emoji 宽度按回退字体计算,避免把 emoji 栏错)
         font = load_font(self.font_size)
         max_w = int(r.width * 0.72)
-        sw = font.getlength(self.text)
+        d = ImageDraw.Draw(Image.new("RGB", (4, 4)))
+        sw = _measure_fallback(d, self.text, self.font_size)
         if sw > max_w:
             # 手动按字换行
             lines = []
             cur = ""
-            d = ImageDraw.Draw(Image.new("RGB", (4, 4)))
             for ch in self.text:
-                if cur and d.textlength(cur + ch, font=font) > max_w:
+                if cur and _measure_fallback(d, cur + ch, self.font_size) > max_w:
                     lines.append(cur)
                     cur = ch
                 else:
@@ -381,11 +410,11 @@ class PillRow(Row):
         pad_x = int(self.font_size * 0.9)
         color = _rgba(self.color)
 
-        # 逐行绘制居中胶囊
+        # 逐行绘制居中胶囊(emoji 逐字符回退)
         ty = y + self.pad_v
         pill_color = _rgba(self.r.t.pill_bg)
         for line in self.lines:
-            tw = font.getlength(line)
+            tw = _measure_fallback(draw, line, self.font_size)
             pw = tw + pad_x * 2
             px = (self.r.width - pw) / 2
             draw.rounded_rectangle(
@@ -393,11 +422,12 @@ class PillRow(Row):
                 radius=line_h / 2,
                 fill=pill_color,
             )
-            draw.text(
+            _draw_fallback(
+                draw,
                 (px + pad_x, ty + (line_h - font.size) / 2),
                 line,
-                font=font,
-                fill=color,
+                self.font_size,
+                color,
             )
             ty += line_h
 
@@ -475,11 +505,12 @@ class ImageRow(Row):
                 fill=_rgba(self.r.t.code_bg),
             )
             msg = f"🖼️ {self.blk.alt or '(未加载)'}"
-            draw.text(
-                (x0 + 8, y + (self.height - self.r.font_size) // 2),
+            _draw_fallback(
+                draw,
+                (x0 + 8, y + (self.height - self.font_size) // 2),
                 msg,
-                font=load_font(int(self.r.font_size * 0.85)),
-                fill=_rgba(self.r.t.text_muted),
+                int(self.r.font_size * 0.85),
+                _rgba(self.r.t.text_muted),
             )
             return
         x = (self.r.width - self._img.width) // 2
@@ -566,11 +597,7 @@ class DialogueRow(Row):
         from PIL import ImageDraw
 
         draw = ImageDraw.Draw(Image.new("RGB", (4, 4)))
-        total = 0.0
-        for sp in spans:
-            f = load_font(font_size, bold=sp.bold)
-            total += draw.textlength(sp.text, font=f)
-        return total
+        return _measure_spans_fallback(draw, spans, font_size)
 
     def _max_line_width(self, lines) -> float:
         max_w = 0.0
@@ -621,23 +648,20 @@ class DialogueRow(Row):
         # 名字(在气泡上方;自己的名字右对齐,与头像同侧)
         if self.speaker:
             draw = ImageDraw.Draw(canvas)
-            name_font = load_font(r.name_font_size)
+            name_w = _measure_fallback(draw, self.speaker, r.name_font_size)
             if not self.is_self:
                 name_x = self._content_x()
             else:
                 # 自己的名字右对齐到头像左边界前
                 avatar_left = r.width - r.h_pad - self.av
-                name_x = (
-                    avatar_left
-                    - self.gap
-                    - int(draw.textlength(self.speaker, font=name_font))
-                )
+                name_x = avatar_left - self.gap - int(name_w)
                 name_x = max(r.h_pad, name_x)
-            draw.text(
+            _draw_fallback(
+                draw,
                 (name_x, outer_top),
                 self.speaker,
-                font=name_font,
-                fill=_rgba(r.t.name_color),
+                r.name_font_size,
+                _rgba(r.t.name_color),
             )
 
         # 文本(在气泡内垂直居中)

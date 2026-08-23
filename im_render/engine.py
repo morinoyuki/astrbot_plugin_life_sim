@@ -20,6 +20,8 @@ from .rows import (
     PillRow,
     RichTextRow,
     Row,
+    _draw_fallback,
+    _measure_fallback,
 )
 from .style import THEMES, Theme, load_font
 
@@ -385,17 +387,19 @@ class ChatRenderer:
         # 半透明遮罩
         overlay = Image.new("RGBA", (self.width, th), _rgba(self.t.header_bg))
         img.alpha_composite(overlay, (0, 0))
-        # 文字
+        # 文字(emoji / 符号逐字符回退)
         font = load_font(self.title_font_size, bold=True)
-        tw = draw.textlength(title, font=font)
-        draw.text(
+        tw = _measure_fallback(draw, title, self.title_font_size, bold=True)
+        _draw_fallback(
+            draw,
             (
                 (self.width - tw) / 2,
                 (th - font.getmetrics()[0] - font.getmetrics()[1]) / 2,
             ),
             title,
-            font=font,
-            fill=_rgba(self.t.header_text),
+            self.title_font_size,
+            _rgba(self.t.header_text),
+            bold=True,
         )
         # 底部细线
         draw.line([(0, th - 1), (self.width, th - 1)], fill=_rgba(self.t.card_border))
