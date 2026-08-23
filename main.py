@@ -48,6 +48,8 @@ from .prompts import (
     MODE_NAMES,
     SUMMARY_SYSTEM_PROMPT,
     SYSTEM_PROMPTS,
+    TYPOGRAPHY_CHAT_CARD,
+    TYPOGRAPHY_TEXT,
     _keyword_detect_mode,
     _parse_mode_prefix,
 )
@@ -1081,8 +1083,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         if lore:
             system_prompt += "\n\n" + lore
 
-        # 聊天卡片模式:注入对白输出规范
+        # 聊天卡片模式:先把公共排版段替换成聊天卡片专用排版(避免普通"合并短句"
+        # 规则污染聊天输出),再注入对白输出规范
         if self._cfg("chat_card_enable", False):
+            if TYPOGRAPHY_TEXT and TYPOGRAPHY_TEXT in system_prompt:
+                system_prompt = system_prompt.replace(
+                    TYPOGRAPHY_TEXT, TYPOGRAPHY_CHAT_CARD
+                )
             system_prompt += CHAT_CARD_PROMPT
             system_prompt += self._chat_card_avatar_prompt()
 
