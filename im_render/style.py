@@ -166,34 +166,43 @@ def load_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
 
 
 def clear_font_cache() -> None:
+    global _emoji_fonts_cache
     _cached_truetype.cache_clear()
     _cached_default.cache_clear()
+    _emoji_fonts_cache = None
 
 
 # ── emoji / 符号字体回退 ────────────────────────────────────────────
 # 主中文字体(OPPO Sans 等)缺少 emoji 字形时,回退到 Symbola_hint.ttf(表情/符号字体)。
 # 用户可在字体目录放置 Symbola_hint.ttf(默认随插件 fonts/ 提供)。
+# 若 Symbola 也不含该字符(如较新 emoji),则按 ``_EMOJI_FALLBACK_NAMES`` 扩展现有字体。
 
-_emoji_font_path: str | None = None
+# 额外的 emoji 覆盖字体文件名(优先级依次)。放置任意一个到 fonts/ 目录即可扩展回退:
+#   - NotoColorEmoji-Regular.ttf  (Google,覆盖几乎全部现代 emoji)
+#   - Segoe UI Emoji / AppleColorEmoji / OpenMoji / Twemoji 同理
+_EMOJI_FALLBACK_NAMES = (
+    "NotoColorEmoji-Regular.ttf",
+    "Segoe UI Emoji.ttf",
+    "OpenMoji-black.ttf",
+    "NotoEmoji-Regular.ttf",
+)
 
 
-def _discover_emoji_font() -> str | None:
-    """在字体搜索目录(含 fonts/)中查找 Symbola / Symbola_hint 等 emoji 字体。"""
-    global _emoji_font_path
-    if _emoji_font_path is not None:
-        return _emoji_font_path or None
-    here = os.path.dirname(os.path.abspath(__file__))
-    bases = [os.path.dirname(here), here, os.getcwd()]
-    for base in bases:
-        for sub in ("fonts", "font", ""):
-            d = os.path.join(base, sub)
-            for fn in ("Symbola_hint.ttf", "Symbola.ttf", "NotoEmoji-Regular.ttf"):
-                fp = os.path.join(d, fn)
-                if os.path.isfile(fp):
-                    _emoji_font_path = fp
-                    return fp
-    _emoji_font_path = ""
-    return None
+def _is_emoji_control(ch: str) -> bool:
+    """变体选择符 / 零宽连接符等组合控制码点。
+
+    这类码点本身没有可见字形,但与前一字符组合成一个视觉 emoji(如 ``❤️``=
+    ❤+FE0F、阶级 ZWJ 序列)。当前逐字符渲染无法合成彩色 emoji,若单独绘制
+    会被字体当作缺字符打出方块,故绘制时应直接跳过。
+    """
+    if not ch:
+        return True
+    cp = ord(ch)
+    return (
+        cp in (0x200B, 0x200C, 0x200D, 0x200E, 0xFE00, 0xFEFF)  # ZWJ/ZWNJ/单位/字节序
+        or 0xFE00 <= cp <= 0xFE0F  # 变体选择符
+        or 0xE0100 <= cp <= 0xE01EF  # 补充变体选择符
+    )
 
 
 _cmap_cache: dict[str, set | None] = {}
@@ -220,21 +229,46 @@ def _supports(path: str | None, char: str) -> bool:
     return bool(s and ord(char) in s)
 
 
+_emoji_fonts_cache: list[str] | None = None
+
+
+def _discover_emoji_fonts() -> list[str]:
+    """发现 fonts/ 目录中的备用符号/emoji 字体(secondFonts 模型)。
+
+    优先级:Symbola(黑白符号,随插件提供)→ 可选的彩色 emoji 字体
+    (NotoColorEmoji 等,能覆盖更全的较新 emoji)。返回按优先级排列的路径列表。
+    """
+    global _emoji_fonts_cache
+    if _emoji_fonts_cache is not None:
+        return list(_emoji_fonts_cache)
+    here = os.path.dirname(os.path.abspath(__file__))
+    bases = [os.path.dirname(here), here, os.getcwd()]
+    found: list[str] = []
+    wanted = ("Symbola_hint.ttf", "Symbola.ttf") + _EMOJI_FALLBACK_NAMES
+    for base in bases:
+        for sub in ("fonts", "font", ""):
+            d = os.path.join(base, sub)
+            for fn in wanted:
+                fp = os.path.join(d, fn)
+                if os.path.isfile(fp) and fp not in found:
+                    found.append(fp)
+    _emoji_fonts_cache = found
+    return list(found)
+
+
 def emoji_font_for(char: str, size: int) -> ImageFont.FreeTypeFont | None:
-    """若主字体缺失该字符且 emoji 字体有,返回 emoji 字体;否则 None。"""
+    """主字体缺失该字符时,从备用字体列表中选第一个覆盖它的(secondFonts 模型)。"""
     search_fonts()
-    em = _discover_emoji_font()
-    if not em:
-        return None
-    if not _supports(em, char):
-        return None
     if _supports(_font_path, char):
-        return None
-    return _cached_truetype(em, size)
+        return None  # 主字体有字形
+    for alt in _discover_emoji_fonts():
+        if _supports(alt, char):
+            return _cached_truetype(alt, size)
+    return None  # 所有备用字体都没有 → 由调用方回主字体(尽力)
 
 
 def font_for_char(char: str, size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
-    """按字符选择字体:主字体无字形时回退到 Symbola emoji 字体。"""
+    """按字符选择字体:主字体有字形用主, 否则在备用符号/emoji 字体中选第一个能覆盖的。"""
     ef = emoji_font_for(char, size)
     if ef is not None:
         return ef

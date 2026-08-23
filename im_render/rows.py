@@ -11,7 +11,7 @@ from collections.abc import Sequence
 from PIL import Image, ImageDraw, ImageFont
 
 from . import markdown as md
-from .style import font_for_char, load_font
+from .style import _is_emoji_control, font_for_char, load_font
 
 try:  # noqa: E129
     from .engine import AvatarSource  # noqa: F401
@@ -82,6 +82,8 @@ class Row:
             color = _rgba(self.r.t.link) if sp.link else _rgba(default_color)
             # 逐字符绘制以支持 emoji / 符号字体回退
             for ch in sp.text:
+                if _is_emoji_control(ch):
+                    continue
                 f = font_for_char(ch, fs, bold=sp.bold)
                 draw.text((cx, y), ch, font=f, fill=color)
                 cw = draw.textlength(ch, font=f)
@@ -120,6 +122,8 @@ class Row:
 
         for sp in spans:
             for ch in sp.text:
+                if _is_emoji_control(ch):
+                    continue
                 f = load_font(font_size, bold=sp.bold)
                 cw = draw.textlength(ch, font=f)
                 if cur and cur_w + cw > max_width:
@@ -250,6 +254,8 @@ class RichTextRow(Row):
             for sp in line:
                 col = _rgba(self.r.t.link) if sp.link else color
                 for ch in sp.text:
+                    if _is_emoji_control(ch):
+                        continue
                     f = font_for_char(ch, self.font_size, bold=sp.bold or self.bold)
                     draw.text((x, ty), ch, font=f, fill=col)
                     x += draw.textlength(ch, font=f)
@@ -630,6 +636,8 @@ class DialogueRow(Row):
         for sp in spans:
             col = _rgba(self.r.t.link) if sp.link else _hex(color) + (255,)
             for ch in sp.text:
+                if _is_emoji_control(ch):
+                    continue
                 f = font_for_char(ch, self.fs, bold=sp.bold)
                 draw.text((cx, y), ch, font=f, fill=col)
                 cx += draw.textlength(ch, font=f)
