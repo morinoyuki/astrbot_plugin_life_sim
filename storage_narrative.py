@@ -13,25 +13,31 @@
     user_action       - 触发本段的用户输入(已剥 <system_reminder> / <Quoted Message>)
     summary           - 自动摘要(首段标题或前 50 字)
     narrative         - 完整剧情文本(可被 revise 覆盖)
-    world_setting     - 写入时的世界设定快照(用户后期 /创建 新会话不会影响老记录)
-    character_lore    - 写入时的角色设定快照
-    world_lore        - 写入时的世界观信息快照
     created_at        - ISO 时间
     revised_at        - ISO 时间,初次与 created_at 一致
+
+快照字段去重:
+    `world_setting / character_lore / world_lore` 三字段在同一 scope 内连续轮次常
+    完全重复(实测 206 条只有 1 / 67 / 23 种内容)。为避免每条记录整份拷贝,每个
+    scope 共享版本表 `_versions.json`(含三个并行数组,按内容寻址)。记录本体只存
+    `_ref` 三个整数索引;读取(list / get / overwrite_all)时按 `_ref` 透明还原三字段。
+
+    旧记录(无 `_ref`)原样返回,兼容老数据;新记录写入时自动去重。
 
 API:
     append(scope, payload)         - 写入并返回 id
     revise(scope, id, narrative)   - 覆盖 narrative + revised_at
     get(scope, id)                 - 读单条(缺 None)
-    list(scope)                    - 列本 scope 全部(按 created_at 升序)
+    list(scope)                    - 列本 scope 全部(按 created_at 升序,快照已还原)
     list_all_for_owner(owner_uid)  - 列此用户相关所有 scope 的记录(跨群)
     delete(scope, id)              - 删一条
-    delete_scope(scope)            - 清空整个 scope 目录
+    delete_scope(scope)            - 清空整个 scope 目录(含版本表)
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import secrets
 import time
@@ -45,10 +51,12 @@ from .storage_base import (
 )
 
 SUB_DIR = "narrative_history"
+VERSIONS_FILE = "_versions.json"
+# 参与去重的三字段(顺序对齐 `_ref` 索引)
+SNAP_KEYS = ("world_setting", "character_lore", "world_lore")
 
 
 def _gen_id() -> str:
-    """生成 `n_<8hex>` 短 ID,冲突概率极低(单 scope 内 <10k 条时)。"""
     return "n_" + secrets.token_hex(4)
 
 
@@ -58,7 +66,10 @@ class NarrativeStore:
     def __init__(self, data_dir: str):
         self.data_dir = data_dir
         self._root = ensure_dir(os.path.join(data_dir, SUB_DIR))
+        # scope → 版本表(进程内缓存,避免每次读盘)
+        self._ver_cache: dict[str, dict] = {}
 
+    # ── 内部路径 ─────────────────────────────────────────────
     def _scope_dir(self, scope: str) -> str:
         safe_scope = sanitize_key(scope)
         if not safe_scope:
@@ -71,6 +82,9 @@ class NarrativeStore:
             raise ValueError("record_id 不能为空")
         return os.path.join(self._scope_dir(scope), f"{safe_id}.json")
 
+    def _versions_path(self, scope: str) -> str:
+        return os.path.join(self._scope_dir(scope), VERSIONS_FILE)
+
     def list_scopes(self) -> list[str]:
         if not os.path.exists(self._root):
             return []
@@ -80,33 +94,88 @@ class NarrativeStore:
             if os.path.isdir(os.path.join(self._root, d))
         ]
 
-    # ─── 写入 ───────────────────────────────────────────────
+    # ── 版本表 ───────────────────────────────────────────────
+    def _load_versions(self, scope: str) -> dict:
+        cached = self._ver_cache.get(scope)
+        if cached is not None:
+            return cached
+        data = read_json(self._versions_path(scope))
+        if not isinstance(data, dict):
+            data = {}
+        table = {}
+        for k in SNAP_KEYS:
+            v = data.get(k, [])
+            table[k] = v if isinstance(v, list) else []
+        self._ver_cache[scope] = table
+        return table
+
+    def _save_versions(self, scope: str, table: dict) -> None:
+        self._ver_cache[scope] = table
+        write_json_atomic(self._versions_path(scope), table)
+
+    @staticmethod
+    def _content_idx(values: list, value) -> int:
+        key = json.dumps(value, ensure_ascii=False, sort_keys=True)
+        for i, v in enumerate(values):
+            if json.dumps(v, ensure_ascii=False, sort_keys=True) == key:
+                return i
+        values.append(value)
+        return len(values) - 1
+
+    @staticmethod
+    def _build_ref(payload: dict, table: dict) -> dict:
+        """把 payload 的三快照字段去重进版本表,返回 `_ref` 索引 dict。"""
+        ref: dict[str, int | None] = {}
+        for k in SNAP_KEYS:
+            if k in payload and payload[k] is not None:
+                ref[k] = NarrativeStore._content_idx(table[k], payload[k])
+            else:
+                ref[k] = None
+        return ref
+
+    @staticmethod
+    def _expand_record(record: dict, table: dict) -> dict:
+        """把记录里的 `_ref` 展开成快照字段;旧记录(无 _ref)原样返回。"""
+        if not isinstance(record, dict) or "_ref" not in record:
+            return record
+        out = dict(record)
+        ref = record.get("_ref") or {}
+        for k in SNAP_KEYS:
+            idx = ref.get(k)
+            if isinstance(idx, int) and 0 <= idx < len(table[k]):
+                out[k] = table[k][idx]
+        return out
+
+    @staticmethod
+    def _strip_snap(payload: dict) -> dict:
+        return {k: v for k, v in payload.items() if k not in SNAP_KEYS}
+
+    # ── 写入 ───────────────────────────────────────────────
 
     async def append(self, scope: str, payload: dict) -> str:
-        """写入一条新记录,返回分配的 record_id。
-
-        payload 应包含 narrative(必填)、user_action / summary / world_setting /
-        character_lore / world_lore / source_session_key(可选)。
-        创建时间与首次 revised_at 自动填入。
-        """
+        """写入一条新记录,返回 record_id。快照字段自动去重进版本表。"""
         now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
         record_id = _gen_id()
-        record = {
-            "id": record_id,
-            "scope": scope,
-            "created_at": now,
-            "revised_at": now,
-            **payload,
-        }
-        await asyncio.to_thread(
-            write_json_atomic,
-            self._path(scope, record_id),
-            record,
-        )
+
+        def _write():
+            table = self._load_versions(scope)
+            ref = self._build_ref(payload, table)
+            record = {
+                "id": record_id,
+                "scope": scope,
+                "created_at": now,
+                "revised_at": now,
+                "_ref": ref,
+                **self._strip_snap(payload),
+            }
+            self._save_versions(scope, table)
+            write_json_atomic(self._path(scope, record_id), record)
+
+        await asyncio.to_thread(_write)
         return record_id
 
     async def revise(self, scope: str, record_id: str, narrative: str) -> bool:
-        """只覆盖 narrative 字段 + revised_at;其它字段(包括 world_setting 快照)保留。"""
+        """只覆盖 narrative + revised_at;其它字段(含 _ref / 快照)保留。"""
         path = self._path(scope, record_id)
         existing = await asyncio.to_thread(read_json, path)
         if existing is None:
@@ -118,13 +187,7 @@ class NarrativeStore:
         return True
 
     async def restore(self, scope: str, state: dict) -> bool:
-        """就地恢复单条记录的 narrative / revised_count / revised_at(用于 /undo 回滚)。
-
-        world_setting / character_lore / world_lore 等快照字段**不动** — 它们是历史信息,
-        撤销叙事不该篡改记录写入时刻的世界观快照。
-
-        缺失的记录(已被外部删除)直接返回 False。
-        """
+        """就地恢复 narrative / revised_count / revised_at(/undo 回滚)。快照不动。"""
         record_id = state.get("id")
         if not record_id:
             return False
@@ -141,24 +204,31 @@ class NarrativeStore:
     # ─── 读取 ───────────────────────────────────────────────
 
     async def get(self, scope: str, record_id: str) -> dict | None:
-        return await asyncio.to_thread(read_json, self._path(scope, record_id))
+        def _run():
+            data = read_json(self._path(scope, record_id))
+            if not data:
+                return None
+            return self._expand_record(data, self._load_versions(scope))
+
+        return await asyncio.to_thread(_run)
 
     async def list(self, scope: str) -> list[dict]:
-        """列本 scope 全部记录,按 created_at 升序。"""
+        """列本 scope 全部记录,按 created_at 升序,快照字段还原。"""
         scope_dir = self._scope_dir(scope)
         if not os.path.exists(scope_dir):
             return []
 
         def _load_all():
+            table = self._load_versions(scope)
             out: list[dict] = []
             for fname in os.listdir(scope_dir):
                 if not fname.endswith(".json"):
                     continue
+                if fname == VERSIONS_FILE:
+                    continue
                 data = read_json(os.path.join(scope_dir, fname))
                 if data:
-                    out.append(data)
-            # created_at 只到秒,同秒内用 id 作 tie-breaker 保证稳定顺序
-            # (ID 含 secrets.token_hex,无序;但能保证全序)
+                    out.append(self._expand_record(data, table))
             out.sort(key=lambda r: (r.get("created_at", ""), r.get("id", "")))
             return out
 
@@ -167,26 +237,16 @@ class NarrativeStore:
     async def list_all_for_owner(
         self, sender_uid: str, current_scope: str = ""
     ) -> list[dict]:
-        """列 sender 可见的所有 scope 记录。
-
-        可见性规则(避免跨用户隐私泄露):
-        - `user_<uid>` 私聊 scope:仅 owner 可见(uid 必须等于 sender_uid)
-        - `group_<gid>` 群聊 scope:全员可见(已通过 AstrBot 鉴权,本插件不做成员校验)
-        - 其它 scope 命名:保守跳过
-
-        `current_scope` 兜底:即使命名不匹配,也允许它(调用方一般就是从那里来的)。
-        """
+        """列 sender 可见的所有 scope 记录。可见性规则见类 docstring。"""
         out: list[dict] = []
         sender_uid = (sender_uid or "").strip()
         for scope in self.list_scopes():
             if scope.startswith("user_"):
-                # 私聊只能看自己的(若 current_scope 就是这个,放行)
                 if scope != current_scope and scope != f"user_{sender_uid}":
                     continue
             elif scope.startswith("group_"):
-                pass  # 群聊全员可见
+                pass
             else:
-                # 未知 scope 命名 — 仅当正好是 current_scope 时放行
                 if scope != current_scope:
                     continue
             out.extend(await self.list(scope))
@@ -199,7 +259,7 @@ class NarrativeStore:
         return await asyncio.to_thread(safe_remove, self._path(scope, record_id))
 
     async def delete_scope(self, scope: str) -> int:
-        """删整个 scope 目录下的所有记录,返回删除条数。"""
+        """删整个 scope 目录下的所有记录 + 版本表文件,返回删除条数。"""
         scope_dir = self._scope_dir(scope)
         if not os.path.exists(scope_dir):
             return 0
@@ -215,26 +275,22 @@ class NarrativeStore:
                 os.rmdir(scope_dir)
             except OSError:
                 pass
+            self._ver_cache.pop(scope, None)
             return count
 
         return await asyncio.to_thread(_purge)
 
     async def overwrite_all(self, scope: str, records: list[dict]) -> dict:
-        """把 scope 的剧情历史**整体覆盖**为 records(用于分支切换)。
-
-        - 目标记录(id 在 records 里)直接重写为最新内容(含所有快照字段)
-        - 磁盘上存在但不在 records 里的记录删除
-
-        返回 {"written": int, "deleted": int}。
-        """
+        """把 scope 剧情历史整体覆盖为 records(分支切换),快照字段重新去重。"""
         target_ids = {r.get("id") for r in records if r.get("id")}
         scope_dir = self._scope_dir(scope)
 
         def _overwrite() -> tuple[int, int]:
+            table = {k: [] for k in SNAP_KEYS}
             deleted = 0
             if os.path.exists(scope_dir):
                 for fname in os.listdir(scope_dir):
-                    if not fname.endswith(".json"):
+                    if not fname.endswith(".json") or fname == VERSIONS_FILE:
                         continue
                     if fname[:-5] not in target_ids and safe_remove(
                         os.path.join(scope_dir, fname)
@@ -245,10 +301,13 @@ class NarrativeStore:
                 rid = r.get("id")
                 if not rid:
                     continue
+                ref = self._build_ref(r, table)
                 record = dict(r)
                 record["scope"] = scope
+                record["_ref"] = ref
                 write_json_atomic(self._path(scope, rid), record)
                 written += 1
+            self._save_versions(scope, table)
             return written, deleted
 
         written, deleted = await asyncio.to_thread(_overwrite)
