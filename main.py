@@ -3146,7 +3146,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         刻意**不包含**分支列表 / current_branch — 它们属于会话运行时状态,
         分支快照只保存"从这一刻往后继续推进所需的全部状态"。
         """
-        scope = self._sim_session_key(event)
         mode = session.get("mode", "A")
         return {
             "world_setting": session.get("world_setting"),
@@ -3168,17 +3167,21 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             "narrative_snapshots": copy.deepcopy(
                 session.get("narrative_snapshots") or []
             ),
-            # RPG 存档/会话的磁盘快照 + 剧情历史全量 — 还原时整体回滚
+            # RPG 存档/会话的磁盘快照 — 还原时整体回滚
+            # 剧情历史不再内嵌:切换分支时用 `narrative_store.switch_to_branch`
+            # 直接复用同目录的分支历史文件(branch_<名>.json)
             "rpg_state": self._rpg_snapshot(event, mode),
-            "narrative_records": await self.narrative_store.list(scope),
         }
 
     async def _branch_restore(self, branch: dict, event) -> dict:
         """把会话还原到分支保存时的状态,返回新 session dict。
 
         current_branch 等运行时标记由调用方在还原后设置,不在这里处理。
+        剧情历史优先走 `switch_to_branch`(直接复制同目录分支历史文件),
+        旧分支(内嵌 narrative_records)回退 overwrite_all。
         """
         scope = self._sim_session_key(event)
+        branch_name = (branch.get("name") or "").strip()
         new_session = {
             "world_setting": branch.get("world_setting"),
             "mode": branch.get("mode", "A"),
@@ -3202,9 +3205,15 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         rpg_state = branch.get("rpg_state")
         if rpg_state:
             self._rpg_restore(rpg_state)
-        # 剧情历史整体覆盖为分支点状态
-        records = branch.get("narrative_records") or []
-        await self.narrative_store.overwrite_all(scope, records)
+        # 剧情历史:优先直接复制同目录的分支历史文件(快,且 versions 自洽);
+        # 旧分支文件里内嵌的 narrative_records 则回退整体重建。
+        switched = False
+        if branch_name:
+            switched = await self.narrative_store.switch_to_branch(scope, branch_name)
+        if not switched:
+            records = branch.get("narrative_records") or []
+            if records:
+                await self.narrative_store.overwrite_all(scope, records)
         return new_session
 
     @filter.command("分支", alias={"branch"})
@@ -3331,6 +3340,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             capture["label"] = desc
             overwritten = name in branches
             await self.branch_store.save(scope, name, capture)
+            # 剧情历史同目录归档一份(切换时直接复制该文件,不重建)
+            await self.narrative_store.save_branch_history(scope, name)
             turn = capture.get("lore_turn", 0)
             overwrite_note = "(已覆盖同名分支)" if overwritten else ""
             yield event.plain_result(
@@ -3370,6 +3381,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 auto = await self._branch_capture(session, event)
                 auto["label"] = "切换分支前的当前进度(自动保留)"
                 await self.branch_store.save(scope, "主线", auto)
+                await self.narrative_store.save_branch_history(scope, "主线")
                 auto_saved = True
 
             target = await self.branch_store.get(scope, name)
@@ -3415,6 +3427,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 yield event.plain_result(f"❌ 分支「{name}」不存在。")
                 return
             await self.branch_store.delete(scope, name)
+            # 同目录的分支历史文件一并清理
+            await self.narrative_store.delete_branch_history(scope, name)
             # 删除的正是当前分支时,回到「主线」标记(仅此时才需要落盘会话)
             if session.get("current_branch") == name:
                 session["current_branch"] = None

@@ -53,6 +53,7 @@ import os
 import secrets
 import shutil
 import time
+from urllib.parse import quote_plus, unquote_plus
 
 from .storage_base import (
     ensure_dir,
@@ -67,6 +68,8 @@ HISTORY_FILE = "history.json"
 # 老布局残留文件名(迁移用):逐条记录文件前缀 + 独立版本表文件
 LEGACY_RECORD_PREFIX = "n_"
 VERSIONS_FILE = "_versions.json"
+# 分支历史文件前缀:history.json 同目录下 `branch_<编码名>.json`
+BRANCH_FILE_PREFIX = "branch_"
 # 参与去重的三字段(顺序对齐 `_ref` 键)
 SNAP_KEYS = ("world_setting", "character_lore", "world_lore")
 
@@ -369,3 +372,104 @@ class NarrativeStore:
 
             written, deleted = await asyncio.to_thread(_overwrite)
             return {"written": written, "deleted": deleted}
+
+    # ─── 分支历史(与 history.json 同目录) ─────────────────────
+
+    @staticmethod
+    def _encode_branch(name: str) -> str:
+        return quote_plus(name, safe="")
+
+    @staticmethod
+    def _decode_branch(stem: str) -> str:
+        return unquote_plus(stem)
+
+    def _branch_path(self, scope: str, branch_name: str) -> str:
+        safe = self._encode_branch(branch_name)
+        return os.path.join(self._scope_dir(scope), f"{BRANCH_FILE_PREFIX}{safe}.json")
+
+    async def save_branch_history(self, scope: str, branch_name: str) -> bool:
+        """把当前剧情历史整体归档为分支历史文件(同目录,结构同 history.json)。
+
+        分支文件与 history.json 同构(records + versions),versions 自洽 ——
+        切换分支时直接整个文件复制回 history.json 即可,无需重建版本表。
+        返回 True;当前无任何记录时也照样归档(空分支)。
+        """
+        async with self._get_lock(scope):
+            def _run() -> bool:
+                data = self._load_history(scope)
+                snapshot = {
+                    "_format": 2,
+                    "branch": branch_name,
+                    "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "versions": data["versions"],
+                    "records": data["records"],
+                }
+                write_json_atomic(self._branch_path(scope, branch_name), snapshot)
+                return True
+
+            return await asyncio.to_thread(_run)
+
+    async def load_branch_history(self, scope: str, branch_name: str) -> dict | None:
+        """读某分支的历史文件(展开后的 records + versions),缺返回 None。"""
+        def _run():
+            data = read_json(self._branch_path(scope, branch_name))
+            if not isinstance(data, dict):
+                return None
+            versions = {k: (data.get("versions") or {}).get(k, []) for k in SNAP_KEYS}
+            return {
+                "records": [
+                    self._expand_record(r, versions) for r in (data.get("records") or [])
+                ],
+                "versions": versions,
+                "branch": branch_name,
+            }
+
+        return await asyncio.to_thread(_run)
+
+    async def switch_to_branch(self, scope: str, branch_name: str) -> bool:
+        """切换到某分支:把该分支的历史文件整体复制为 history.json。
+
+        versions 表随文件一起复制,记录里的 _ref 指向同一份 versions,天然自洽,
+        无需重建去重表。分支文件不存在时返回 False(调用方回退 overwrite_all)。
+        """
+        async with self._get_lock(scope):
+            def _run() -> bool:
+                path = self._branch_path(scope, branch_name)
+                data = read_json(path)
+                if not isinstance(data, dict) or "records" not in data:
+                    return False
+                # 抹掉归档元字段,落成标准 history.json
+                clean = {"records": data.get("records") or [], "versions": data.get("versions") or {}}
+                self._save_history(scope, clean)
+                return True
+
+            return await asyncio.to_thread(_run)
+
+    async def delete_branch_history(self, scope: str, branch_name: str) -> bool:
+        """删除某分支的历史文件。"""
+        return await asyncio.to_thread(safe_remove, self._branch_path(scope, branch_name))
+
+    async def list_branch_histories(self, scope: str) -> dict[str, dict]:
+        """列出 scope 下全部分支历史(分支名 → {saved_at, record_count})。"""
+        scope_dir = self._scope_dir(scope)
+
+        def _run():
+            if not os.path.isdir(scope_dir):
+                return {}
+            out: dict[str, dict] = {}
+            for f in os.listdir(scope_dir):
+                if not f.startswith(BRANCH_FILE_PREFIX) or not f.endswith(".json"):
+                    continue
+                stem = f[len(BRANCH_FILE_PREFIX) : -5]
+                try:
+                    name = self._decode_branch(stem)
+                except ValueError:
+                    continue
+                d = read_json(os.path.join(scope_dir, f))
+                out[name] = {
+                    "saved_at": (d or {}).get("saved_at", ""),
+                    "record_count": len((d or {}).get("records") or []),
+                }
+            return out
+
+        return await asyncio.to_thread(_run)
