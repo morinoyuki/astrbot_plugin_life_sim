@@ -2232,21 +2232,56 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
     @filter.command("头像", alias={"set_avatar", "设置头像", "头像设置"})
     async def cmd_set_avatar(self, event: AstrMessageEvent):
-        """/头像 <角色名> <图片> - 设置角色头像(用于聊天卡片);/头像 列表 查看已设置"""
+        """/头像 <角色名> <图片> - 设置角色头像;\n/头像 列表 · /头像 查看 [角色名]"""
         # 提取参数(去掉命令本身)
         arg = self._extract_after_cmd(
             event, ("头像", "set_avatar", "设置头像", "头像设置")
         )
+        stripped = arg.strip()
 
         # 列表操作优先(不需要图片)
-        if arg.strip() in ("列表", "list", "-l", "查看"):
+        if stripped in ("列表", "list", "-l"):
             names = self.avatar_store.list_names()
             if not names:
                 yield event.plain_result("📭 还没有设置任何头像")
             else:
                 yield event.plain_result(
                     "已设置头像:\n" + "\n".join(f"• {n}" for n in names)
+                    + f"\n💡 共 {len(names)} 个, `/头像 查看 <角色名>` 看具体图片"
                 )
+            return
+
+        # 查看头像(不需要图片): /头像 查看 [角色名]
+        if stripped in ("查看",) or stripped.startswith("查看 ") or stripped == "view":
+            target = stripped[2:].strip() if stripped.startswith("查看 ") else ""
+            if not target:
+                # 不带角色名 → 逐个展示全部
+                names = self.avatar_store.list_names()
+                if not names:
+                    yield event.plain_result("📭 还没有设置任何头像")
+                    return
+                yield event.plain_result(
+                    "🖼️ 已设置头像:" + "\n".join(f"• {n}" for n in names)
+                )
+                for n in names:
+                    path = self.avatar_store.get_avatar(n)
+                    if path:
+                        event.track_temporary_local_file(path)
+                        yield event.image_result(path)
+                return
+            # 指定角色名 → 只展示该角色
+            path = self.avatar_store.resolve(target)
+            if not path:
+                available = "、".join(self.avatar_store.list_names())
+                yield event.plain_result(
+                    f"❌ 未找到角色「{target}」的头像。"
+                    + (f"\n现有角色: {available}" if available else "")
+                    + "\n💡 `/头像 列表` 查看全部"
+                )
+                return
+            event.track_temporary_local_file(path)
+            yield event.image_result(path)
+            yield event.plain_result(f"🖼️ 角色「{target}」的头像")
             return
 
         # 提取图片:当前消息无图时回退到引用消息的图片(手机端常无法同发文字+图)
