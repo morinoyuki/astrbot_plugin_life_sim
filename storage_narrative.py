@@ -101,8 +101,24 @@ class NarrativeStore:
             raise ValueError("scope 不能为空")
         return ensure_dir(os.path.join(self._root, safe_scope))
 
-    def _history_path(self, scope: str) -> str:
+    def _history_path(self, scope: str, branch: str = "") -> str:
+        """当前线对应的历史文件:主线(空)用 history.json,分支用 branch_<编码名>.json。"""
+        if branch:
+            safe = quote_plus(branch, safe="")
+            return os.path.join(
+                self._scope_dir(scope), f"{BRANCH_FILE_PREFIX}{safe}.json"
+            )
         return os.path.join(self._scope_dir(scope), HISTORY_FILE)
+
+    def _branch_name_from_file(self, fname: str) -> str | None:
+        """由分支文件名还原分支名(branch_<编码>.json → 名);非分支文件返回 None。"""
+        if not fname.startswith(BRANCH_FILE_PREFIX) or not fname.endswith(".json"):
+            return None
+        stem = fname[len(BRANCH_FILE_PREFIX) : -5]
+        try:
+            return unquote_plus(stem)
+        except ValueError:
+            return None
 
     def list_scopes(self) -> list[str]:
         if not os.path.exists(self._root):
@@ -151,21 +167,23 @@ class NarrativeStore:
     def _strip_snap(record: dict) -> dict:
         return {k: v for k, v in record.items() if k not in SNAP_KEYS}
 
-    # ── 读写整文件(含旧布局迁移) ───────────────────────────
-    def _load_history(self, scope: str) -> dict:
-        """读 scope 的 history.json;发现旧布局时自动迁移合并(幂等)。
+    # ── 读写整文件(含旧布局迁移,仅主线) ───────────────────
+    def _load_history(self, scope: str, branch: str = "") -> dict:
+        """读指定线(主线/分支)的历史文件;主线发现旧布局时自动迁移合并(幂等)。
 
-        返回 {"records": [...], "versions": {...}}。迁移后旧文件被清理。
+        分支文件不存在 → 返回空。返回 {"records": [...], "versions": {...}}。
         """
         scope_dir = self._scope_dir(scope)
-        hist_path = os.path.join(scope_dir, HISTORY_FILE)
+        hist_path = self._history_path(scope, branch)
         data = read_json(hist_path)
         if not (isinstance(data, dict) and "records" in data):
             data = {"records": [], "versions": {k: [] for k in SNAP_KEYS}}
         records = list(data.get("records") or [])
         versions = {k: (data.get("versions") or {}).get(k, []) for k in SNAP_KEYS}
 
-        # 旧布局:逐条 n_*.json(可能带独立 _versions.json)
+        # 旧布局迁移只对主线(history.json)执行:逐条 n_*.json + 独立 _versions.json
+        if branch:
+            return {"records": records, "versions": versions}
         legacy = sorted(
             f
             for f in os.listdir(scope_dir)
@@ -200,59 +218,64 @@ class NarrativeStore:
         safe_remove(os.path.join(scope_dir, VERSIONS_FILE))
         return data
 
-    def _save_history(self, scope: str, data: dict) -> None:
-        write_json_atomic(self._history_path(scope), data)
+    def _save_history(self, scope: str, data: dict, branch: str = "") -> None:
+        write_json_atomic(self._history_path(scope, branch), data)
 
     # ── 写入 ───────────────────────────────────────────────
 
-    async def append(self, scope: str, payload: dict) -> str:
-        """追加一条新记录,返回 record_id。快照字段自动去重。"""
-        async with self._get_lock(scope):
+    async def append(self, scope: str, payload: dict, branch: str = "") -> str:
+        """向指定线(主线/分支)追加一条新记录,返回 record_id。快照自动去重。"""
+        async with self._get_lock(scope + "|" + branch):
             now = time.strftime("%Y-%m-%dT%H:%M:%S%z")
             record_id = _gen_id()
 
             def _write():
-                data = self._load_history(scope)
+                data = self._load_history(scope, branch)
                 table = data["versions"]
                 ref = self._build_ref(payload, table)
                 record = {
                     "id": record_id,
                     "scope": scope,
+                    "branch": branch,
                     "created_at": now,
                     "revised_at": now,
                     "_ref": ref,
                     **self._strip_snap(payload),
                 }
                 data["records"].append(record)
-                self._save_history(scope, data)
+                self._save_history(scope, data, branch)
 
             await asyncio.to_thread(_write)
             return record_id
 
-    async def revise(self, scope: str, record_id: str, narrative: str) -> bool:
+    async def revise(
+        self, scope: str, record_id: str, narrative: str, branch: str = ""
+    ) -> bool:
         """只覆盖 narrative + revised_at + revised_count;快照(_ref)保留。"""
-        async with self._get_lock(scope):
+        async with self._get_lock(scope + "|" + branch):
             def _run() -> bool:
-                data = self._load_history(scope)
+                data = self._load_history(scope, branch)
                 for r in data["records"]:
                     if r.get("id") == record_id:
                         r["narrative"] = narrative
                         r["revised_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
                         r["revised_count"] = int(r.get("revised_count", 0)) + 1
-                        self._save_history(scope, data)
+                        self._save_history(scope, data, branch)
                         return True
                 return False
 
             return await asyncio.to_thread(_run)
 
-    async def restore(self, scope: str, state: dict) -> bool:
+    async def restore(
+        self, scope: str, state: dict, branch: str = ""
+    ) -> bool:
         """就地恢复 narrative / revised_count / revised_at(/undo 回滚)。快照不动。"""
-        async with self._get_lock(scope):
+        async with self._get_lock(scope + "|" + branch):
             def _run() -> bool:
                 record_id = state.get("id")
                 if not record_id:
                     return False
-                data = self._load_history(scope)
+                data = self._load_history(scope, branch)
                 for r in data["records"]:
                     if r.get("id") == record_id:
                         r["narrative"] = state.get(
@@ -262,7 +285,7 @@ class NarrativeStore:
                         r["revised_at"] = state.get(
                             "revised_at", r.get("revised_at", "")
                         )
-                        self._save_history(scope, data)
+                        self._save_history(scope, data, branch)
                         return True
                 return False
 
@@ -270,9 +293,9 @@ class NarrativeStore:
 
     # ─── 读取 ───────────────────────────────────────────────
 
-    async def get(self, scope: str, record_id: str) -> dict | None:
+    async def get(self, scope: str, record_id: str, branch: str = "") -> dict | None:
         def _run():
-            data = self._load_history(scope)
+            data = self._load_history(scope, branch)
             for r in data["records"]:
                 if r.get("id") == record_id:
                     return self._expand_record(r, data["versions"])
@@ -280,10 +303,10 @@ class NarrativeStore:
 
         return await asyncio.to_thread(_run)
 
-    async def list(self, scope: str) -> list[dict]:
-        """列本 scope 全部记录,按 created_at 升序,快照字段还原。"""
+    async def list(self, scope: str, branch: str = "") -> list[dict]:
+        """列指定线(主线/分支)全部记录,按 created_at 升序,快照字段还原。"""
         def _run():
-            data = self._load_history(scope)
+            data = self._load_history(scope, branch)
             out = [self._expand_record(r, data["versions"]) for r in data["records"]]
             out.sort(key=lambda r: (r.get("created_at", ""), r.get("id", "")))
             return out
@@ -293,7 +316,7 @@ class NarrativeStore:
     async def list_all_for_owner(
         self, sender_uid: str, current_scope: str = ""
     ) -> list[dict]:
-        """列 sender 可见的所有 scope 记录。可见性规则见类 docstring。"""
+        """列 sender 可见的所有 scope 记录(跨群,含各分支线)。可见性规则见类 docstring。"""
         out: list[dict] = []
         sender_uid = (sender_uid or "").strip()
         for scope in self.list_scopes():
@@ -305,55 +328,87 @@ class NarrativeStore:
             else:
                 if scope != current_scope:
                     continue
-            out.extend(await self.list(scope))
+            # 合并主线 + 全部分支线记录
+            for line_records in await self._list_all_lines(scope):
+                out.extend(line_records)
         out.sort(key=lambda r: r.get("created_at", ""))
         return out
 
+    async def _list_all_lines(self, scope: str) -> list[list[dict]]:
+        """列 scope 下每条线(主线 + 各分支)的展开记录,返回 [线记录列表, ...]。"""
+        def _run():
+            lines: list[list[dict]] = []
+            scope_dir = self._scope_dir(scope)
+            # 主线
+            main = self._load_history(scope, "")
+            lines.append([self._expand_record(r, main["versions"]) for r in main["records"]])
+            # 分支文件
+            if os.path.isdir(scope_dir):
+                for f in sorted(os.listdir(scope_dir)):
+                    if not f.startswith(BRANCH_FILE_PREFIX) or not f.endswith(".json"):
+                        continue
+                    name = self._branch_name_from_file(f)
+                    if not name:
+                        continue
+                    data = self._load_history(scope, name)
+                    lines.append([self._expand_record(r, data["versions"]) for r in data["records"]])
+            return lines
+
+        return await asyncio.to_thread(_run)
+
     # ─── 删除 ───────────────────────────────────────────────
 
-    async def delete(self, scope: str, record_id: str) -> bool:
-        async with self._get_lock(scope):
+    async def delete(self, scope: str, record_id: str, branch: str = "") -> bool:
+        async with self._get_lock(scope + "|" + branch):
             def _run() -> bool:
-                data = self._load_history(scope)
+                data = self._load_history(scope, branch)
                 before = len(data["records"])
                 data["records"] = [
                     r for r in data["records"] if r.get("id") != record_id
                 ]
                 if len(data["records"]) == before:
                     return False
-                self._save_history(scope, data)
+                self._save_history(scope, data, branch)
                 return True
 
             return await asyncio.to_thread(_run)
 
     async def delete_scope(self, scope: str) -> int:
-        """删整个 scope 目录(含 history.json / 旧布局残留),返回记录数。"""
+        """删整个 scope 目录(含主线 history.json / 全部分支历史 / 旧布局残留),返回总记录数。"""
         scope_dir = self._scope_dir(scope)
         if not os.path.exists(scope_dir):
             return 0
 
         def _purge() -> int:
             count = 0
+            # 主线
             data = read_json(os.path.join(scope_dir, HISTORY_FILE))
             if isinstance(data, dict) and "records" in data:
-                count = len(data["records"])
+                count += len(data["records"])
             else:
-                # 旧布局:数一下逐条文件
-                count = sum(
+                count += sum(
                     1
                     for f in os.listdir(scope_dir)
                     if f.startswith(LEGACY_RECORD_PREFIX) and f.endswith(".json")
                 )
+            # 分支历史文件
+            for f in sorted(os.listdir(scope_dir)):
+                if not f.startswith(BRANCH_FILE_PREFIX) or not f.endswith(".json"):
+                    continue
+                d = read_json(os.path.join(scope_dir, f))
+                count += len((d or {}).get("records") or [])
             shutil.rmtree(scope_dir, ignore_errors=True)
             return count
 
         return await asyncio.to_thread(_purge)
 
-    async def overwrite_all(self, scope: str, records: list[dict]) -> dict:
-        """把 scope 剧情历史整体覆盖为 records(分支切换),快照重新去重。"""
-        async with self._get_lock(scope):
+    async def overwrite_all(
+        self, scope: str, records: list[dict], branch: str = ""
+    ) -> dict:
+        """把指定线(主线/分支)的剧情历史整体覆盖为 records(旧分支回退用),快照重新去重。"""
+        async with self._get_lock(scope + "|" + branch):
             def _overwrite() -> tuple[int, int]:
-                old = self._load_history(scope)
+                old = self._load_history(scope, branch)
                 table = {k: [] for k in SNAP_KEYS}
                 new_records: list[dict] = []
                 for r in records:
@@ -362,41 +417,37 @@ class NarrativeStore:
                     ref = self._build_ref(r, table)
                     nr = dict(r)
                     nr["scope"] = scope
+                    nr["branch"] = branch
                     nr["_ref"] = ref
                     # 展开的输入里通常带着快照字段,收敛进版本表后移除,保持单文件精简
                     nr = self._strip_snap(nr)
                     new_records.append(nr)
                 data = {"records": new_records, "versions": table}
-                self._save_history(scope, data)
+                self._save_history(scope, data, branch)
                 return len(new_records), len(old["records"]) - len(new_records)
 
             written, deleted = await asyncio.to_thread(_overwrite)
             return {"written": written, "deleted": deleted}
 
-    # ─── 分支历史(与 history.json 同目录) ─────────────────────
+    # ─── 分支文件(与 history.json 同目录,各自独立) ─────────
 
-    @staticmethod
-    def _encode_branch(name: str) -> str:
-        return quote_plus(name, safe="")
+    async def branch_exists(self, scope: str, branch_name: str) -> bool:
+        """指定分支的历史文件是否存在。"""
+        path = self._history_path(scope, branch_name)
+        return await asyncio.to_thread(os.path.exists, path)
 
-    @staticmethod
-    def _decode_branch(stem: str) -> str:
-        return unquote_plus(stem)
-
-    def _branch_path(self, scope: str, branch_name: str) -> str:
-        safe = self._encode_branch(branch_name)
-        return os.path.join(self._scope_dir(scope), f"{BRANCH_FILE_PREFIX}{safe}.json")
-
-    async def save_branch_history(self, scope: str, branch_name: str) -> bool:
-        """把当前剧情历史整体归档为分支历史文件(同目录,结构同 history.json)。
-
-        分支文件与 history.json 同构(records + versions),versions 自洽 ——
-        切换分支时直接整个文件复制回 history.json 即可,无需重建版本表。
-        返回 True;当前无任何记录时也照样归档(空分支)。
-        """
-        async with self._get_lock(scope):
+    async def save_branch_history(
+        self,
+        scope: str,
+        branch_name: str,
+        source_branch: str = "",
+    ) -> bool:
+        """把源线(默认主线)的历史归档为分支文件(复制文件,versions 随行)。"""
+        if not branch_name:
+            return False
+        async with self._get_lock(scope + "|" + branch_name):
             def _run() -> bool:
-                data = self._load_history(scope)
+                data = self._load_history(scope, source_branch)
                 snapshot = {
                     "_format": 2,
                     "branch": branch_name,
@@ -404,7 +455,7 @@ class NarrativeStore:
                     "versions": data["versions"],
                     "records": data["records"],
                 }
-                write_json_atomic(self._branch_path(scope, branch_name), snapshot)
+                write_json_atomic(self._history_path(scope, branch_name), snapshot)
                 return True
 
             return await asyncio.to_thread(_run)
@@ -412,8 +463,8 @@ class NarrativeStore:
     async def load_branch_history(self, scope: str, branch_name: str) -> dict | None:
         """读某分支的历史文件(展开后的 records + versions),缺返回 None。"""
         def _run():
-            data = read_json(self._branch_path(scope, branch_name))
-            if not isinstance(data, dict):
+            data = read_json(self._history_path(scope, branch_name))
+            if not isinstance(data, dict) or "records" not in data:
                 return None
             versions = {k: (data.get("versions") or {}).get(k, []) for k in SNAP_KEYS}
             return {
@@ -426,28 +477,9 @@ class NarrativeStore:
 
         return await asyncio.to_thread(_run)
 
-    async def switch_to_branch(self, scope: str, branch_name: str) -> bool:
-        """切换到某分支:把该分支的历史文件整体复制为 history.json。
-
-        versions 表随文件一起复制,记录里的 _ref 指向同一份 versions,天然自洽,
-        无需重建去重表。分支文件不存在时返回 False(调用方回退 overwrite_all)。
-        """
-        async with self._get_lock(scope):
-            def _run() -> bool:
-                path = self._branch_path(scope, branch_name)
-                data = read_json(path)
-                if not isinstance(data, dict) or "records" not in data:
-                    return False
-                # 抹掉归档元字段,落成标准 history.json
-                clean = {"records": data.get("records") or [], "versions": data.get("versions") or {}}
-                self._save_history(scope, clean)
-                return True
-
-            return await asyncio.to_thread(_run)
-
     async def delete_branch_history(self, scope: str, branch_name: str) -> bool:
         """删除某分支的历史文件。"""
-        return await asyncio.to_thread(safe_remove, self._branch_path(scope, branch_name))
+        return await asyncio.to_thread(safe_remove, self._history_path(scope, branch_name))
 
     async def list_branch_histories(self, scope: str) -> dict[str, dict]:
         """列出 scope 下全部分支历史(分支名 → {saved_at, record_count})。"""
@@ -460,10 +492,8 @@ class NarrativeStore:
             for f in os.listdir(scope_dir):
                 if not f.startswith(BRANCH_FILE_PREFIX) or not f.endswith(".json"):
                     continue
-                stem = f[len(BRANCH_FILE_PREFIX) : -5]
-                try:
-                    name = self._decode_branch(stem)
-                except ValueError:
+                name = self._branch_name_from_file(f)
+                if not name:
                     continue
                 d = read_json(os.path.join(scope_dir, f))
                 out[name] = {
