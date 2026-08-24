@@ -8,6 +8,8 @@
 from __future__ import annotations
 
 import os
+import zlib
+from collections.abc import Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -18,10 +20,13 @@ __all__ = [
     "MOMOTOKI_LIGHT",
     "THEMES",
     "Theme",
+    "char_renderable",
     "clear_font_cache",
     "load_font",
     "load_title_font",
+    "main_font_supports",
     "resolve_font_path",
+    "speaker_color",
 ]
 
 # 常见 CJK 字体(环境变量 LIFE_SIM_FONT 优先级最高)
@@ -277,6 +282,34 @@ def _is_emoji_control(ch: str) -> bool:
 
 _cmap_cache: dict[str, set | None] = {}
 
+# ── 位图 emoji 字体(CBDT/CBLC,如 NotoColorEmoji)──────────────────
+# 此类字体只有固定尺寸字形(109px),Pillow 在其他尺寸下加载报
+# "invalid pixel size"。按内置尺寸加载,由绘制方缩放贴图(见 rows.py)。
+_EMOJI_BITMAP_SIZE = 109
+
+# 已确认的位图字体路径(加载回退时注册)
+BITMAP_FONT_PATHS: set[str] = set()
+
+
+def _load_font_fallback(path: str, size: int) -> ImageFont.FreeTypeFont:
+    """加载字体;固定尺寸位图字体在目标尺寸下失败时回退到内置尺寸。"""
+    try:
+        return _cached_truetype(path, size)
+    except OSError:
+        # 位图字体(CBDT)只有内置尺寸字形,按 109px 加载,绘制方缩放贴图;
+        # 内置尺寸也失败(字体损坏)则让 OSError 继续抛出
+        font = _cached_truetype(path, _EMOJI_BITMAP_SIZE)
+        BITMAP_FONT_PATHS.add(path)
+        return font
+
+
+def is_bitmap_font(font) -> bool:
+    """字体是否为固定尺寸位图字体(绘制时需临时画布缩放贴图)。"""
+    try:
+        return bool(font.path) and font.path in BITMAP_FONT_PATHS
+    except Exception:
+        return False
+
 
 def _charset(path: str) -> set | None:
     """读取字体的 cmap 码点集合(缓存)。"""
@@ -348,7 +381,7 @@ def emoji_font_for(char: str, size: int) -> ImageFont.FreeTypeFont | None:
     for alt in _discover_emoji_fonts():
         try:
             if _supports(alt, char):
-                return _cached_truetype(alt, size)
+                return _load_font_fallback(alt, size)
         except Exception:
             continue  # 该字体无法读取 / 加载失败,试下一个
     return None  # 所有备用字体都没有 → 由调用方回主字体(尽力)
@@ -390,6 +423,8 @@ class Theme:
     link: str
     header_bg: str
     header_text: str
+    # 说话人名字色板(按角色名 hash 稳定取色;空则统一用 name_color)
+    name_palette: tuple[str, ...] = ()
 
 
 MOMOTOKI_LIGHT = Theme(
@@ -412,6 +447,18 @@ MOMOTOKI_LIGHT = Theme(
     link="#4A8AC6",
     header_bg="#3D6A93",
     header_text="#FFFFFF",
+    name_palette=(
+        "#C25B5B",
+        "#5B84C2",
+        "#4F9E6E",
+        "#B8865B",
+        "#8B6EC2",
+        "#3F8FA0",
+        "#C25B93",
+        "#7A8B3A",
+        "#9E6B4F",
+        "#5F87A8",
+    ),
 )
 
 MOMOTOKI_DARK = Theme(
@@ -434,6 +481,18 @@ MOMOTOKI_DARK = Theme(
     link="#6FA8DA",
     header_bg="#2A3846",
     header_text="#EDF2F6",
+    name_palette=(
+        "#E08A8A",
+        "#8AB0E0",
+        "#8ACBA0",
+        "#D8B48A",
+        "#B39AE0",
+        "#7FC4CE",
+        "#E08ABF",
+        "#B5C47A",
+        "#D8A58A",
+        "#96B8CC",
+    ),
 )
 
 THEMES = {
@@ -457,3 +516,44 @@ def rgba(color: str, alpha: int = 255) -> tuple:
     """#RRGGBB -> (r,g,b,a)"""
     r, g, b = _hex(color)
     return (r, g, b, alpha)
+
+
+def speaker_color(palette: Sequence[str], speaker: str, default: str) -> str:
+    """按说话人名稳定取色(crc32 hash → 色板下标)。
+
+    同一角色每次渲染颜色一致;不同角色尽量散开。名字为空或色板为空时用 default。
+    """
+    if not palette or not speaker:
+        return default
+    idx = zlib.crc32(speaker.encode("utf-8")) % len(palette)
+    return palette[idx]
+
+
+def char_renderable(ch: str) -> bool:
+    """字符是否可被任何可用字体渲染(cmap 判定)。
+
+    返回 False 仅在:主字体与全部备用字体的 cmap 都成功加载、且都不含该码点
+    —— 此时绘制必然是豆腐块,调用方应跳过该字符。
+    任一字体 cmap 加载失败(如 fontTools 缺失)时返回 True(保守:照常绘制,
+    保持与旧版行为一致,避免误删整段文字)。
+    """
+    search_fonts()
+    if _supports(_font_path, ch):
+        return True
+    for alt in _discover_emoji_fonts():
+        s = _charset(alt)
+        if s is None:
+            return True  # 覆盖信息不可得,保守绘制
+        if ord(ch) in s:
+            return True
+    return False
+
+
+def main_font_supports(ch: str) -> bool:
+    """主字体是否含该字符的字形(cmap 判定)。
+
+    注意:必须通过本函数而非直接导入 ``_font_path`` 使用 —— 按值导入会在
+    字体搜索完成前捕获 None,导致判定恒为 True、回退逻辑失效。
+    """
+    search_fonts()
+    return _supports(_font_path, ch)

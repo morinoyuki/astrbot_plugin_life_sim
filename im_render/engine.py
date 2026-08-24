@@ -23,7 +23,7 @@ from .rows import (
     _draw_fallback,
     _measure_fallback,
 )
-from .style import THEMES, Theme, load_font
+from .style import THEMES, Theme, load_font, speaker_color
 
 __all__ = ["AvatarSource", "ChatRenderer", "Row", "TooManyPages", "render_narrative"]
 
@@ -90,6 +90,10 @@ class ChatRenderer:
     @property
     def t(self) -> Theme:
         return self._t
+
+    def name_color_for(self, speaker: str) -> str:
+        """说话人名字颜色:按角色名 hash 从主题色板取色,同一角色稳定同色。"""
+        return speaker_color(self._t.name_palette, speaker, self._t.name_color)
 
     def get_max_bubble_width(self) -> int:
         return int((self.width - self.h_pad * 2) * self.max_bubble_ratio)
@@ -352,10 +356,12 @@ class ChatRenderer:
 
     # ── 绘制单页 ─────────────────────────────────────────────
     def _draw_page(self, title_h: int, rows: list[Row], _all: list[Row]) -> Image.Image:
-        # 首行内容与标题之间留 v_pad 间隙(若无标题则顶部留 padding)
-        lead_gap = self.v_pad if (self.title and self.show_title) else 0
-        # 计算总高。各行高度 + 行间间距(与绘制循环一致)+ 标题 + 间隙 + 底部留白
+        # 首行内容与标题之间留 v_pad 间隙(若无标题则顶部留 v_pad//2,与下方绘制起点一致)
+        lead_gap = self.v_pad if (self.title and self.show_title) else self.v_pad // 2
+        # 计算总高。各行高度 + 行间间距(与绘制循环一致)+ 标题 + 顶部间隙 + 底部留白。
         # 若忽略行间 msg_gap,多行时底边会被挤出画布、内容超长被裁。
+        # 无标题时 lead_gap 必须计入 v_pad//2 —— 绘制起点就是 v_pad//2,
+        # 否则顶部 padding 会吃掉底部留白,最后一个气泡贴底被裁。
         total_h = (
             sum(r.height for r in rows)
             + self.msg_gap * max(0, len(rows) - 1)
@@ -391,7 +397,7 @@ class ChatRenderer:
         font = load_font(self.title_font_size, bold=True)
         tw = _measure_fallback(draw, title, self.title_font_size, bold=True)
         _draw_fallback(
-            draw,
+            img,
             (
                 (self.width - tw) / 2,
                 (th - font.getmetrics()[0] - font.getmetrics()[1]) / 2,
