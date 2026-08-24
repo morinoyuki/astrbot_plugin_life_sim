@@ -1929,7 +1929,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
     @staticmethod
     def _render_lore_timeline(
-        entries: list, indent: str = "", hard_sections: set[str] | None = None
+        entries: list,
+        indent: str = "",
+        hard_sections: set[str] | None = None,
+        max_content_chars: int | None = None,
+        max_total_chars: int = 0,
     ) -> list[str]:
         """把 (角色 / 世界观) 的 entries 列表渲染成时间轴字符串列表。
 
@@ -1938,6 +1942,12 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
         `hard_sections` 指定的 section(如 appearance / forms)在首条前会插入
         一行「禁止脑补」警告,强化模型对这些字段的遵从度。
+
+        `max_content_chars` / `max_total_chars` 用于**用户展示**路径(如 /lore):
+        QQ 平台对超长转发消息(>4096 字符)会直接拒绝发送,而角色/世界观条目可能
+        单条上千字。设限后每条 content 截断到 `max_content_chars`(默认不截),
+        累计超出 `max_total_chars` 时停止追加并提示省略条数。
+        LLM 注入 / 工具返回等路径不传这两个参数,保持全文。
 
         为什么按首次出现顺序而不是字典序:
         - 新 entry 永远是**追加**到对应 section 组末尾,老条目的字节位置不动;
@@ -1957,18 +1967,42 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
         lines: list[str] = []
         prev_section: str | None = None
+        total_chars = 0
+        truncated = False
         for sec in sorted(groups, key=lambda s: section_order.get(s, 0)):
             group = sorted(groups[sec], key=lambda e: int(e.get("seq", 0)))
             for e in group:
                 seq = e.get("seq", "?")
                 ts = e.get("updated_at", "")
                 content = e.get("content", "")
+                if (
+                    max_content_chars
+                    and isinstance(content, str)
+                    and len(content) > max_content_chars
+                ):
+                    content = content[:max_content_chars] + "…"
+                line = f"{indent}[#{seq} | {ts}] **{sec}** — {content}"
                 if sec != prev_section and sec in hard_sections:
-                    lines.append(
+                    warn = (
                         f"{indent}> 🔒 **「{sec}」为硬性约束 — 发色/瞳色/服装/配饰等严禁凭印象脑补,叙事必须照写。**"
                     )
-                lines.append(f"{indent}[#{seq} | {ts}] **{sec}** — {content}")
+                    if max_total_chars and total_chars + len(warn) > max_total_chars:
+                        truncated = True
+                        break
+                    lines.append(warn)
+                    total_chars += len(warn)
+                if max_total_chars and total_chars + len(line) > max_total_chars:
+                    truncated = True
+                    break
+                lines.append(line)
+                total_chars += len(line)
+            if truncated:
+                break
             prev_section = sec
+        # 截断提示:内容过长时告知总条数与已显示条数
+        if truncated:
+            all_ = sum(len(g) for g in groups.values())
+            lines.append(f"{indent}…(内容过长,已截断,共 {all_} 条,显示 {len(lines)} 条)")
         return lines
 
     async def life_sim_save_world_lore(
@@ -3366,7 +3400,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 yield event.plain_result("🌍 暂无世界观设定。")
                 return
             lines = ["🌍 持久化世界观(时间轴):"]
-            lines.extend(self._render_lore_timeline(world_lore, indent="  "))
+            lines.extend(
+                self._render_lore_timeline(
+                    world_lore,
+                    indent="  ",
+                    max_content_chars=300,
+                    max_total_chars=3500,
+                )
+            )
             yield event.plain_result("\n".join(lines))
             return
 
@@ -3394,7 +3435,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             lines = [f"👤 {mn} 设定(时间轴):"]
             lines.extend(
                 self._render_lore_timeline(
-                    entries, indent="  ", hard_sections={"appearance", "forms"}
+                    entries,
+                    indent="  ",
+                    hard_sections={"appearance", "forms"},
+                    max_content_chars=300,
+                    max_total_chars=3500,
                 )
             )
             yield event.plain_result("\n".join(lines))
