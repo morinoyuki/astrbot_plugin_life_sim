@@ -763,19 +763,22 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
     # 聊天卡片(IM 对白样式) — 基于 im_render 新引擎
     # ════════════════════════════════════════════════════════════════
 
-    def _chat_card_avatar_prompt(self) -> str:
+    def _chat_card_avatar_prompt(self, event=None) -> str:
         """生成角色头像列表提示,注入 system prompt,让 LLM 输出规范角色名。
 
-        作用:头像按「角色名」存储(/头像 汐见小亚 <图>)。若 LLM 输出简称(如
-        「小亚」而不是「汐见小亚」),聊天卡片渲染时头像就匹配不上。这里把已
+        作用:头像按「角色名 + scope」存储(/头像 汐见小亚 <图>)。若 LLM 输出简称
+        (如「小亚」而不是「汐见小亚」),聊天卡片渲染时头像就匹配不上。这里把已
         设置头像的角色名全部列出,要求 LLM 与之一致。
+
+        按当前会话 scope(群/私聊)列出本区头像,不跨群泄露。
 
         头像自选:LLM 可在对白中通过 `角色名@头像名: 台词` 显式指定该气泡使用
         列表里的哪张头像(即使角色名与头像名不同);不写 `@` 时默认按角色名匹配。
         """
         try:
             store = getattr(self, "avatar_store", None)
-            names = store.list_names() if store else []
+            scope = self._sim_session_key(event) if event is not None else ""
+            names = store.list_names(scope) if store else []
         except Exception as e:
             logger.warning(f"life-sim: 读取头像列表失败: {e}")
             names = []
@@ -794,14 +797,15 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             "\n可用头像名单：" + lines + "\n"
         )
 
-    def _chat_card_avatars(self) -> dict:
-        """构建 角色名 → 头像 映射(含默认头兜底)。"""
+    def _chat_card_avatars(self, event=None) -> dict:
+        """构建 角色名 → 头像 映射(含默认头兜底),按当前 scope 过滤。"""
         avatars = {}
         try:
             store = getattr(self, "avatar_store", None)
             if store is not None:
-                for name in store.list_names():
-                    avatars[name] = store.get_avatar(name)
+                scope = self._sim_session_key(event) if event is not None else ""
+                for name in store.list_names(scope):
+                    avatars[name] = store.get_avatar(name, scope)
                 d = store.get_default_avatar()
                 if d:
                     avatars[""] = d
@@ -816,7 +820,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         loops = asyncio.get_running_loop()
 
         def _build() -> list:
-            return self._chat_card_render(text)
+            return self._chat_card_render(text, event)
 
         try:
             images = await loops.run_in_executor(None, _build)
@@ -835,7 +839,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 event.track_temporary_local_file(path)
                 yield event.image_result(path)
 
-    def _chat_card_render(self, text: str) -> list:
+    def _chat_card_render(self, text: str, event=None) -> list:
         """同步执行渲染,返回图片列表。可被线程池调用。"""
         theme = str(self._cfg("chat_card_theme", "light") or "light").strip().lower()
         if theme not in ("light", "dark"):
@@ -847,7 +851,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             )
             if s.strip()
         ]
-        avatars = self._chat_card_avatars()
+        avatars = self._chat_card_avatars(event)
 
         def _is_self(speaker: str) -> bool:
             return speaker in self_names
@@ -901,14 +905,16 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         await self.sim_store.save(self._sim_session_key(event), session)
 
     async def _clear_sim(self, event: AstrMessageEvent) -> int:
-        """删除当前会话文件,并同步清理该会话名下全部分支快照。
+        """删除当前会话文件,并同步清理该会话名下全部分支快照与头像。
 
-        分支快照独立存储(见 BranchStore),不会随会话文件自动消失,
-        必须在删除/重建会话时显式清理,避免留下孤儿分支。
+        分支快照独立存储(见 BranchStore),不会随会话文件自动消失;
+        头像按 scope 分区(见 AvatarStore)。都会在删除/重建会话时显式清理。
         返回被清理的分支快照数量。
         """
         key = self._sim_session_key(event)
         await self.sim_store.delete(key)
+        # 头像按 scope 分区,随会话一起清除(默认头像在根目录,不动)
+        self.avatar_store.clear_scope(key)
         return await self.branch_store.delete_scope(key)
 
     def _busy_message(self) -> str:
@@ -1248,7 +1254,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                     TYPOGRAPHY_TEXT, TYPOGRAPHY_CHAT_CARD
                 )
             system_prompt += CHAT_CARD_PROMPT
-            system_prompt += self._chat_card_avatar_prompt()
+            system_prompt += self._chat_card_avatar_prompt(event)
 
         # 输出前自检 — 放在 system prompt 最末尾,利用 recency bias 强化设定遵从度
         system_prompt += (
@@ -2238,10 +2244,12 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             event, ("头像", "set_avatar", "设置头像", "头像设置")
         )
         stripped = arg.strip()
+        # 头像按会话 scope 分区(群/私聊彼此隔离)
+        scope = self._sim_session_key(event)
 
         # 列表操作优先(不需要图片)
         if stripped in ("列表", "list", "-l"):
-            names = self.avatar_store.list_names()
+            names = self.avatar_store.list_names(scope)
             if not names:
                 yield event.plain_result("📭 还没有设置任何头像")
             else:
@@ -2256,7 +2264,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             target = stripped[2:].strip() if stripped.startswith("查看 ") else ""
             if not target:
                 # 不带角色名 → 逐个展示全部
-                names = self.avatar_store.list_names()
+                names = self.avatar_store.list_names(scope)
                 if not names:
                     yield event.plain_result("📭 还没有设置任何头像")
                     return
@@ -2264,15 +2272,15 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                     "🖼️ 已设置头像:" + "\n".join(f"• {n}" for n in names)
                 )
                 for n in names:
-                    path = self.avatar_store.get_avatar(n)
+                    path = self.avatar_store.get_avatar(n, scope)
                     if path:
                         event.track_temporary_local_file(path)
                         yield event.image_result(path)
                 return
             # 指定角色名 → 只展示该角色
-            path = self.avatar_store.resolve(target)
+            path = self.avatar_store.resolve(target, scope)
             if not path:
-                available = "、".join(self.avatar_store.list_names())
+                available = "、".join(self.avatar_store.list_names(scope))
                 yield event.plain_result(
                     f"❌ 未找到角色「{target}」的头像。"
                     + (f"\n现有角色: {available}" if available else "")
@@ -2311,7 +2319,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             yield event.plain_result(f"❌ 读取图片失败:{e}")
             return
 
-        saved = self.avatar_store.save_avatar(name, data)
+        saved = self.avatar_store.save_avatar(name, data, scope=scope)
         if saved:
             yield event.plain_result(f"✅ 已为「{name}」设置头像")
         else:
@@ -2328,9 +2336,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         if not names:
             yield event.plain_result("❌ 用法: `/删除头像 阿龙`")
             return
+        scope = self._sim_session_key(event)
         deleted = []
         for n in names:
-            if self.avatar_store.delete(n):
+            if self.avatar_store.delete(n, scope):
                 deleted.append(n)
         if deleted:
             yield event.plain_result(f"🗑️ 已删除: {', '.join(deleted)}")
