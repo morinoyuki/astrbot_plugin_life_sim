@@ -602,6 +602,19 @@ def _resolve_rpg_snapshot(session: dict, snapshot: dict) -> dict:
             return body
     return dict(snapshot)
 
+def _narrative_branch(session: dict | None) -> str:
+    """从会话取当前剧情线(分支)名;空 = 主线(history.json)。
+
+    老会话里 current_branch 可能是 `"主线"`(旧版自动保留分支语义,
+    表示"处于主线的延续线上"),归一为空串,与主线 history.json 对齐。
+    """
+    if not session:
+        return ""
+    b = (session.get("current_branch") or "").strip()
+    if b == "主线":
+        return ""
+    return b
+
 
 class _LifeSimToolHooks(BaseAgentRunHooks[AstrAgentContext]):
     """从 run_context.messages 中提取本轮 agent 新增的工具调用上下文。
@@ -1692,12 +1705,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         # 去重 + 迁移旧格式(把内联整份 lore 收敛到 `_lore_versions` 索引表)
         _compact_lore_versions(session)
 
-    def _narrative_branch(self, session: dict | None) -> str:
-        """从会话取当前剧情线(分支)名;空 = 主线(history.json)。"""
-        if not session:
-            return ""
-        return (session.get("current_branch") or "").strip()
-
     async def _snapshot_narrative_history(
         self, session: dict, turn: int, scope: str
     ) -> None:
@@ -1715,7 +1722,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         限制:最多保留 25 个快照,与 lore / rpg 一致。
         """
         # 只存记录 ID 列表(轻量);快照标记所属 branch,回滚时按当前线隔离
-        records = await self.narrative_store.list(scope, self._narrative_branch(session))
+        records = await self.narrative_store.list(scope, _narrative_branch(session))
         snapshots = session.setdefault("narrative_snapshots", [])
         snapshots.append(
             {
@@ -1834,7 +1841,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 "mode": session.get("mode", "A"),
             }
             return await self.narrative_store.append(
-                scope, payload, branch=self._narrative_branch(session)
+                scope, payload, branch=_narrative_branch(session)
             )
         except (OSError, ValueError, TypeError) as e:
             logger.warning(f"life-sim: 剧情历史记录失败: {e}")
@@ -2216,7 +2223,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             "previous",
         }:
             session = await self._load_sim(event)
-            branch = self._narrative_branch(session)
+            branch = _narrative_branch(session)
             resolved_id = (session or {}).get("last_narrative_id") or ""
             auto = True
             if not resolved_id:
@@ -2715,14 +2722,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 scope,
                 target_narr_snap,
                 narr_snapshots,
-                branch=self._narrative_branch(session),
+                branch=_narrative_branch(session),
             )
         session["narrative_snapshots"] = [
             s for s in narr_snapshots if s.get("turn", 0) <= target_turn
         ]
         # last_narrative_id 若指向被删除的记录,清空(下次 /do 会重写)
         if narr_stats and narr_stats.get("deleted", 0) > 0:
-            branch = self._narrative_branch(session)
+            branch = _narrative_branch(session)
             remaining = await self.narrative_store.list(scope, branch)
             last_id = remaining[-1]["id"] if remaining else None
             if last_id != session.get("last_narrative_id"):
@@ -2753,7 +2760,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             "rpg_stats": rpg_stats,
             "narr_stats": narr_stats,
             "remaining_narr": len(
-                await self.narrative_store.list(scope, self._narrative_branch(session))
+                await self.narrative_store.list(scope, _narrative_branch(session))
             ),
         }
 
@@ -2933,7 +2940,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         scope = self._sim_session_key(event)
         session = await self._load_sim(event)
         records = await self.narrative_store.list(
-            scope, self._narrative_branch(session)
+            scope, _narrative_branch(session)
         )
         if not records:
             yield event.plain_result("📭 当前会话暂无剧情历史(每轮 /do 输出会自动记录)")
@@ -2992,7 +2999,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             scope_label = "all"
         else:
             records = await self.narrative_store.list(
-                scope, self._narrative_branch(session)
+                scope, _narrative_branch(session)
             )
             scope_label = scope
 
@@ -3134,7 +3141,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
         scope = self._sim_session_key(event)
         session = await self._load_sim(event)
-        branch = self._narrative_branch(session)
+        branch = _narrative_branch(session)
 
         if arg.lower() in ("all", "全部"):
             n = await self.narrative_store.delete_scope(scope)
@@ -3319,7 +3326,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             name = session.get("current_branch")
             turn_now = session.get("lore_turn", 0)
             n_records = len(
-                await self.narrative_store.list(scope, self._narrative_branch(session))
+                await self.narrative_store.list(scope, _narrative_branch(session))
             )
             position = ""
             for m in reversed(session.get("messages") or []):
