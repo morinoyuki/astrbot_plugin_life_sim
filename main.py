@@ -380,6 +380,35 @@ async def _extract_image(event: AstrMessageEvent) -> list[Image]:
     return images
 
 
+async def _extract_image_with_quoted(event: AstrMessageEvent) -> list[Image]:
+    """取图片,当前消息无图时回退到**引用消息**的图片。
+
+    手机端常无法在同一消息里同时发文字 + 图片(引用图片省去重新上传)。
+    复用 QuotedMessageExtractor(event).images()(与 /create /do 相同的引用通道):
+    它会把引用消息里的图片解析成可 LLM 读取的 URL / base64 / 本地路径。
+    这里统一包成 Image 组件(convert_to_file_path 能处理以上全部形态)。
+    """
+    imgs = await _extract_image(event)
+    if imgs:
+        return imgs
+
+    try:
+        refs = await QuotedMessageExtractor(event=event).images()
+    except Exception as e:
+        logger.warning(f"life-sim: 解析引用图片失败: {e}")
+        return []
+    # resolver 可能对同一张图返回重复/本地路径,去重后构造 Image
+    out: list[Image] = []
+    seen: set[str] = set()
+    for ref in refs or []:
+        ref = (ref or "").strip()
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        out.append(Image(file=ref))
+    return out
+
+
 def _restore_images_from_content(content) -> list[Image]:
     """从已存储的 user 消息 content 里恢复图片(Image 组件列表)。
 
@@ -2220,11 +2249,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 )
             return
 
-        # 提取图片
-        imgs = await _extract_image(event)
+        # 提取图片:当前消息无图时回退到引用消息的图片(手机端常无法同发文字+图)
+        imgs = await _extract_image_with_quoted(event)
         if not imgs:
             yield event.plain_result(
-                "❌ 请附带一张角色头像图片:\n`/头像 阿龙 <图片>`\n\n查看已设置: `/头像 列表`"
+                "❌ 请附带一张角色头像图片:\n`/头像 阿龙 <图片>`\n\n也可**引用**(回复)一张图片后跟随该命令。\n查看已设置: `/头像 列表`"
             )
             return
         if not arg:
