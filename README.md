@@ -230,7 +230,6 @@ LLM 调用时通过 `contexts=[...]` 显式传入,完全不走主对话的 `conv
 - `world_lore`:list 结构 `[{section, content, updated_at}]`,同 section 覆盖。工具签名:
   ```
   life_sim_save_world_lore(content, section)
-  life_sim_get_world_lore(section="")     # 按需读取世界观(留空返回全部)
   ```
 - **选择性加载**(`lore_selective_load` 默认开,`lore_active_rounds` 默认 6):
   角色多 / 轮数多时,system prompt 不再被整棵角色树撑爆 ——

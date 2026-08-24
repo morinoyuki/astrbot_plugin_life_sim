@@ -1903,8 +1903,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
           (名字 + 条目数 + 按需读取工具),刻画前由 LLM 调
           `life_sim_get_character_lore` 获取完整设定 → 角色多、轮数多时
           system prompt 不再被整棵角色树撑爆。
-        - 世界观:每个 section 只注入最新一条(世界状态以最新为准),
-          历史条目提示可用 `life_sim_get_world_lore` 查询。
+        - 世界观:不做按需裁剪,一律完整注入(历史条目本身有参考价值,
+          且不依赖 LLM 主动调工具读取)。
         关闭开关则与旧行为一致:全部完整注入。
 
         在块顶部加粗体权威性声明,`appearance` 等硬约束 section 前面插入

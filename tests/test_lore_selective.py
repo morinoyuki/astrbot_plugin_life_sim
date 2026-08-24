@@ -66,9 +66,6 @@ class _FakePlugin:
     async def life_sim_get_character_lore(self, event, character="主角"):
         return await LifeSimPlugin.life_sim_get_character_lore(self, event, character)
 
-    async def life_sim_get_world_lore(self, event, section=""):
-        return await LifeSimPlugin.life_sim_get_world_lore(self, event, section)
-
 
 def _session_with_lore():
     """主角(2条) + 两个 NPC 各 3 条;最近几轮只提到主角和 导师·长者。"""
@@ -174,14 +171,7 @@ async def test_read_tools():
         # 空 character → 返回列表
         out3 = await p.life_sim_get_character_lore(ev, "")
         assert "已收录角色" in out3, out3
-        # 按 section 读世界观
-        out4 = await p.life_sim_get_world_lore(ev, "魔法体系")
-        assert "元素魔法为主" in out4 and "新增禁忌魔法分类" in out4, out4
-        out5 = await p.life_sim_get_world_lore(ev, "不存在的分类")
-        assert "已有 section" in out5, out5
-        # 读全部世界观
-        out6 = await p.life_sim_get_world_lore(ev, "")
-        assert "大陆分五国" in out6, out6
+        # 世界观已改为全量注入(e9bc3d3),不再有 get_world_lore 按需读取工具
         print("read tools OK")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
