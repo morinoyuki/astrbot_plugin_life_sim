@@ -11,6 +11,7 @@ import copy
 import json
 import os
 import re
+import shutil
 import time
 
 import docstring_parser
@@ -825,6 +826,30 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         except Exception as e:
             logger.warning(f"life-sim: 加载角色头像失败: {e}")
         return avatars
+
+    def _temporary_avatar_copy(self, path: str, event) -> str | None:
+        """把已存储的头像复制成临时文件,交给框架在事件结束后清理。
+
+        不能直接把 avatar_store 里的真实头像文件登记为临时文件——框架会在
+        事件结束后清理掉这些文件,那样「查看头像」反而会把用户的头像删掉。
+        """
+        import tempfile
+
+        p: str | None = None
+        try:
+            fd, p = tempfile.mkstemp(suffix=os.path.splitext(path)[1] or ".png")
+            os.close(fd)
+            shutil.copyfile(path, p)
+            event.track_temporary_local_file(p)
+            return p
+        except Exception as e:
+            logger.warning(f"life-sim: 头像临时副本创建失败: {e}")
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            return None
 
     async def _chat_card_generate(self, text: str, event):
         """把叙事 markdown 渲染为聊天截图并逐一 yield。"""
@@ -2296,9 +2321,12 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 )
                 for n in names:
                     path = self.avatar_store.get_avatar(n, scope)
+                    # 必须复制一份,不能把已存储的头像本身登记为临时文件,
+                    # 否则框架会在事件结束后把它删掉(见 _temporary_avatar_copy 注释)。
                     if path:
-                        event.track_temporary_local_file(path)
-                        yield event.image_result(path)
+                        shown = self._temporary_avatar_copy(path, event)
+                        if shown:
+                            yield event.image_result(shown)
                 return
             # 指定角色名 → 只展示该角色
             path = self.avatar_store.resolve(target, scope)
@@ -2310,8 +2338,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                     + "\n💡 `/头像 列表` 查看全部"
                 )
                 return
-            event.track_temporary_local_file(path)
-            yield event.image_result(path)
+            shown = self._temporary_avatar_copy(path, event)
+            if shown:
+                yield event.image_result(shown)
             yield event.plain_result(f"🖼️ 角色「{target}」的头像")
             return
 
