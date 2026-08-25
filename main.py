@@ -1464,25 +1464,15 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             session.get("messages", []), event=event
         )
 
-        # 用 turn 计数器快照 lore(单调递增,与消息位置/压缩解耦,稳定)
-        turn = session.get("lore_turn", 0) + 1
-        session["lore_turn"] = turn
-        self._snapshot_lore(session, turn)
-        # 同步快照剧情历史状态(供 /undo 回滚被本 turn 新增/修订的记录)
-        # 必须在 LLM 调用前抓取 — `_auto_record_narrative` 在调用结束后才写。
-        await self._snapshot_narrative_history(session, turn, event_key)
-        # 同步快照 RPG 数值状态,供 /undo 回滚 HP/EXP/装备/会话等
-        # mode B/C 一律保存(包括空快照)— 否则回滚到"首个创建 RPG 数据的 turn"时找不到快照,
-        # 导致本应被删除的新建角色/会话漏网。
-        if mode in ("B", "C"):
-            rpg_snap = self._rpg_snapshot(event, mode)
-            rpg_snaps = session.setdefault("rpg_snapshots", [])
-            rpg_snaps.append({"turn": turn, **rpg_snap})
-            # 限制最多保留 25 个快照(每个可能含多角色,避免 KV 膨胀)
-            if len(rpg_snaps) > 25:
-                del rpg_snaps[: len(rpg_snaps) - 25]
-            # 去重:chars/sessions 内容寻址收敛到 `_rpg_versions` 索引表
-            _compact_rpg_versions(session)
+        # ── turn 计数与快照:失败 / 空输出的 /do 不推进 ──
+        # 旧实现:进入 LLM 调用前就递增 lore_turn 并拍快照;若本轮调用失败/返回空文本
+        # (不落任何 user 消息),lore_turn 与用户消息数会错位 —— /undo N 按消息数回滚,
+        # 却按 lore_turn 倒推目标轮,导致目标轮偏晚、剧情历史只删了一条。
+        # 现在:RPG 快照内容(存档文件会被本轮工具就地修改)必须在调用前抓取;
+        # lore / 剧情历史快照与 turn 递增移到 LLM 成功后统一提交(见下)。
+        rpg_capture = (
+            self._rpg_snapshot(event, mode) if mode in ("B", "C") else None
+        )
 
         contexts = bind_checkpoint_messages(messages)
 
@@ -1554,6 +1544,33 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         new_msgs = await self._llm_resp_to_messages(
             user_input, llm_resp, imgs, tool_hooks
         )
+
+        # ── LLM 调用成功,提交本轮 turn:递增计数 + 快照 pre-turn 状态 ──
+        turn = session.get("lore_turn", 0) + 1
+        session["lore_turn"] = turn
+        self._snapshot_lore(session, turn)
+        # 同步快照剧情历史状态(供 /undo 回滚被本 turn 新增/修订的记录)。
+        # 此时本轮记录尚未写入(`_auto_record_narrative` 在末尾才调),
+        # 所以快照拿到的 `ids` 正是"本轮开始前"的记录集合;工具里的 revise
+        # 只改写既有记录(id 不变),不改变 ids 集合。
+        await self._snapshot_narrative_history(session, turn, event_key)
+        # 同步快照 RPG 数值状态:内容已在 LLM 调用前抓取(rpg_capture),
+        # 即 pre-turn 状态,这里只补 turn 号提交。
+        if rpg_capture is not None:
+            rpg_snaps = session.setdefault("rpg_snapshots", [])
+            rpg_snaps.append({"turn": turn, **rpg_capture})
+            # 限制最多保留 25 个快照(每个可能含多角色,避免 KV 膨胀)
+            if len(rpg_snaps) > 25:
+                del rpg_snaps[: len(rpg_snaps) - 25]
+            # 去重:chars/sessions 内容寻址收敛到 `_rpg_versions` 索引表
+            _compact_rpg_versions(session)
+
+        # 给本轮 user 消息盖上 turn 戳,`/undo N` 按戳精确定位回滚目标轮
+        # (消息与轮次一一对应,不受失败轮/压缩/摘要影响)。
+        for _m in new_msgs:
+            if isinstance(_m, dict) and _m.get("role") == "user":
+                _m["turn"] = turn
+                break
 
         messages.extend(new_msgs)
         session["messages"] = messages
@@ -2853,21 +2870,38 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         返回展示统计 dict;没有可回滚的 user 消息时返回 None。
         """
         messages = session.get("messages", [])
-        user_indices = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+        # 只统计真实用户轮次:历史压缩产生的摘要消息(_summary)不是一轮 /do,
+        # 混入会把 take 数错(进而算错回滚目标轮)。
+        user_indices = [
+            i
+            for i, m in enumerate(messages)
+            if m.get("role") == "user" and not m.get("_summary")
+        ]
         if not user_indices:
             return None
 
         take = min(n, len(user_indices))
         cut_idx = user_indices[-take]
+        cut_msg = messages[cut_idx]
         removed = messages[cut_idx:]
         messages = messages[:cut_idx]
 
         # 回滚持久化 lore:用 turn 计数,不受压缩影响
         current_turn = session.get("lore_turn", 0)
-        # target_turn = 当前 turn - take + 1 = 第一个被回滚的 turn;
-        # 该 turn 的快照 = "该 turn 尚未执行任何工具调用"的状态,正好是我们要恢复到的状态。
-        # max(1, ...) 防止 target_turn=0 时找不到快照(从 turn=1 开始计数)。
-        target_turn = max(1, current_turn - take + 1)
+        # 目标 turn = 第一个被回滚的 turn 的"开始前"状态。
+        # 优先用被截断首条 user 消息上盖的 turn 戳:新会话每轮 /do 都会盖章,
+        # 消息与轮次一一对应,即使历史里有失败/空输出轮导致 lore_turn 虚高也不受影响;
+        # 老会话(无 turn 戳)用快照指纹推断(见 _legacy_rollback_target_turn),
+        # 仍无法推断才按 lore_turn 倒推(旧行为)。
+        stamped_turn = cut_msg.get("turn") if isinstance(cut_msg, dict) else None
+        if isinstance(stamped_turn, int) and not isinstance(stamped_turn, bool) and stamped_turn >= 1:
+            target_turn = stamped_turn
+        else:
+            target_turn = self._legacy_rollback_target_turn(
+                session, take, len(user_indices)
+            )
+            if target_turn is None:
+                target_turn = max(1, current_turn - take + 1)
         snapshots = session.get("lore_snapshots") or []
         target_snapshot = next(
             (s for s in reversed(snapshots) if s["turn"] == target_turn),
@@ -2956,6 +2990,103 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 await self.narrative_store.list(scope, _narrative_branch(session))
             ),
         }
+
+    @staticmethod
+    def _legacy_rollback_target_turn(
+        session: dict, take: int, user_turns: int
+    ) -> int | None:
+        """老会话(消息上没有 turn 戳)的回滚目标轮定位:用快照指纹推断。
+
+        背景:旧版在每次 /do 进入 LLM 调用前就递增 lore_turn 并拍快照;
+        若当轮调用失败/返回空文本(不落 user 消息、不产生剧情记录),
+        lore_turn 会虚高 —— /undo N 按 user 消息数回滚,却按 lore_turn 倒推目标轮,
+        导致目标轮偏晚、剧情历史只删了一条。
+
+        原理(不需要消息上的 turn 戳):
+        - 每个 /do(成功或失败)都会在 narrative_snapshots 追加一条(轮号=turn);
+        - 成功的一轮要么新建了剧情记录(narrative ids / lore / rpg 指纹变化,
+          体现在**下一条**快照),要么调用了 revise(本条快照的 `revised` 非空);
+        - 失败的一轮两者都不沾 → 快照指纹与上一条完全相同。
+        因此「真实轮」= 有指纹变化或有 revised 的快照轮;失败轮不会计入。
+        把真实轮按轮号升序与 user 消息一一对应,即可得到每条消息归属的轮号。
+
+        唯一例外:最后一轮若是普通成功轮,它的"新建记录"证据落在不存在的
+        下一条快照上 —— 此时真实轮数比消息数少 1,把最后一条快照的轮号补上即可。
+
+        返回:要回滚到的目标轮(即被撤销的第一条 user 消息的轮号);
+        无法可靠推断时返回 None(调用方回退到 lore_turn 倒推)。
+        """
+        narr_snaps = [
+            s for s in (session.get("narrative_snapshots") or []) if isinstance(s, dict)
+        ]
+        if not narr_snaps or take < 1 or user_turns < 1:
+            return None
+        narr_snaps.sort(key=lambda s: s.get("turn", 0))
+
+        def _j(obj) -> str:
+            return json.dumps(obj or [], sort_keys=True, ensure_ascii=False)
+
+        # 按 turn 建 lore / rpg 指纹查找表(新格式为 version 索引,旧格式内联内容)
+        lore_by_turn: dict = {}
+        for s in session.get("lore_snapshots") or []:
+            if not isinstance(s, dict) or not isinstance(s.get("turn"), int):
+                continue
+            vi = s.get("version")
+            lore_by_turn[s["turn"]] = (
+                ("v", vi) if isinstance(vi, int)
+                else (_j(s.get("world_lore")), _j(s.get("character_lore")))
+            )
+        rpg_by_turn: dict = {}
+        for s in session.get("rpg_snapshots") or []:
+            if not isinstance(s, dict) or not isinstance(s.get("turn"), int):
+                continue
+            vi = s.get("version")
+            rpg_by_turn[s["turn"]] = (
+                ("v", vi) if isinstance(vi, int)
+                else _j({k: s.get(k) for k in ("chars", "sessions") if k in s})
+            )
+
+        def _fp(snap: dict):
+            t = snap.get("turn")
+            return (
+                lore_by_turn.get(t),
+                _j(snap.get("ids")),
+                rpg_by_turn.get(t),
+            )
+
+        real_turns: set[int] = set()
+        for i, snap in enumerate(narr_snaps):
+            t = snap.get("turn")
+            if not isinstance(t, int):
+                continue
+            if snap.get("revised"):
+                real_turns.add(t)
+            if i + 1 < len(narr_snaps) and _fp(narr_snaps[i + 1]) != _fp(snap):
+                # 下一张快照与本章不同 → 本轮新建了记录 / lore / rpg 数据 → 本轮真实
+                real_turns.add(t)
+        real_list = sorted(real_turns)
+        if not real_list:
+            return None
+
+        missing = user_turns - len(real_list)
+        if missing < 0:
+            return None  # 指纹比消息还多(历史被压缩/摘要等异常),放弃推断
+        if missing:
+            last_turn = narr_snaps[-1].get("turn")
+            if not isinstance(last_turn, int):
+                return None
+            # 最后一轮普通成功轮的"新建记录"证据落在不存在的下一条快照上,
+            # 需要按消息数把它补成真实轮(首个缺失名额给最新的轮)。
+            real_list = sorted(set(real_list) | {last_turn})
+            if len(real_list) != user_turns:
+                return None
+
+        if take > len(real_list):
+            return None
+        k = user_turns - take  # 被撤销的第一条消息在真实轮列表中的下标(0-based)
+        if k < 0 or k >= len(real_list):
+            return None
+        return real_list[k]
 
     async def _cmd_undo_body(self, event: AstrMessageEvent):
         arg = self._extract_after_cmd(event, "undo").strip()

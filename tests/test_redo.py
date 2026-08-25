@@ -64,6 +64,10 @@ class _FakePlugin:
         return {"restored_chars": 0, "restored_sessions": 0,
                 "deleted_chars": 0, "deleted_sessions": 0}
 
+    @staticmethod
+    def _legacy_rollback_target_turn(session, take, user_turns):
+        return LifeSimPlugin._legacy_rollback_target_turn(session, take, user_turns)
+
     async def _restore_narrative_history(self, scope, snap, all_snaps=None, branch=''):
         return await LifeSimPlugin._restore_narrative_history(self, scope, snap, all_snaps, branch)
 
