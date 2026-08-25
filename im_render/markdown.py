@@ -65,7 +65,7 @@ class Dialogue(Block):
         super().__init__("dialogue")
         self.speaker = speaker.strip()
         self.protagonist = bool(protagonist)
-        # LLM 可通过「角色名@头像名」显式指定该气泡使用哪张已有头像(默认按角色名匹配)
+        # LLM 可通过 av 属性显式指定该气泡使用名单里哪张已有头像(默认按角色名匹配)
         self.avatar = (avatar or "").strip() or None
         self.spans = parse_inline(content.strip())
 
@@ -137,6 +137,11 @@ def parse_inline(text: str) -> list[Span]:
     if not text:
         return []
     spans: list[Span] = []
+
+    # 0. 兑底清理:残缺/未闭合的结构化标签不进画面
+    text = _STRAY_TAG_RE.sub("", text)
+    if not text:
+        return []
 
     # 1. 提取行内代码
     tmp: list[Span] = []
@@ -233,86 +238,59 @@ _IMG_LINE_RE = re.compile(r"^!\[([^\]]*)\]\(([^)\s]+)\)\s*$")
 _TABLE_ROW_RE = re.compile(r"^\s*\|.*\|\s*$")
 _TABLE_SEP_RE = re.compile(r"^\s*\|?[\s:|-]+\|?\s*$")
 
-# 角色名对白:名字(不含标点) + 冒号 + 内容
-# 主角标记:名字前加 `*`(由 LLM 按剧情判断谁是主角)
-_DIALOGUE_RE = re.compile(r"^(.{1,24}?)[:：]\s*(.+)$", re.DOTALL)
-_DIALOGUE_BAD_PREFIX = ("http", "https", "www.")
+# ════════════════════════════════════════════════════════════════════
+# 结构化标签(聊天卡片模式)
+# ════════════════════════════════════════════════════════════════════
+# 对白气泡: <d name="角色名" av="头像名" me>台词</d>
+#   - name 必填;av 可选(借用名单里另一张已有头像);me 可选(主角标记)
+# 短旁白胶囊: <c>短旁白文字</c>
+# 其余行一律按普通 markdown 解析 —— 不再做「冒号前缀」启发式猜测,
+# 从根上杜绝把叙述句误识别成对白、短段落被自动折成胶囊。
+_DLG_TAG_RE = re.compile(
+    r"^<\s*d(?:lg)?\b([^>]*)>\s*(.*?)\s*</\s*(?:dlg|d)\s*>\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+_CAP_TAG_RE = re.compile(
+    r"^<\s*c\b[^>]*>\s*(.*?)\s*</\s*c\s*>\s*$", re.IGNORECASE | re.DOTALL
+)
+_ATTR_NAME_RE = re.compile(r'name\s*=\s*"([^"]*)"', re.IGNORECASE)
+_ATTR_AV_RE = re.compile(r'av\s*=\s*"([^"]*)"', re.IGNORECASE)
+# 主角标记:独立的 me 属性(me 或 me=true);\b 保证不会匹配到 name 里的 me
+_ATTR_ME_RE = re.compile(r"\bme\b(?=\s|$|=)", re.IGNORECASE)
+
+# 兑底清理:未闭合 / 残缺的标签不允许原样漏进画面
+_STRAY_TAG_RE = re.compile(r"</?\s*(?:dlg|d|c)\b[^>]*>", re.IGNORECASE)
 
 
-def _looks_like_dialogue(
-    line: str,
-) -> tuple[str, str, bool, str | None] | None:
-    """如果一行像 `角色名: 对白`,返回 (角色名, 内容, 是否主角, 头像覆盖)。
+def _parse_dialogue_tag(line: str) -> Dialogue | None:
+    """解析 <d name="角色名" av="头像名" me>台词</d>;不匹配返回 None。
 
-    主角标记:``*角色名: 台词`` —— 名字前加一个星号,渲染时靠右显示蓝色气泡。
-    每个阶段的主角由 LLM 根据剧情判断,不硬编码名字。
-
-    头像覆盖:``角色名@头像名: 台词`` —— 说话人仍是 `角色名`,但气泡强制借用
-    `头像名` 那张已有头像(默认按角色名匹配)。头像名不存在时不指定。
+    属性顺序任意;name 必填;av 可选(借用名单里另一张已有头像);
+    me 可选(主角标记,气泡靠右显示)。
     """
-    line = line.rstrip("\n")
-    stripped = line.strip()
-    if not stripped:
-        return None
-    # 排除以 http 开头的
-    low = stripped.lower()
-    if any(low.startswith(p) for p in _DIALOGUE_BAD_PREFIX):
-        return None
-    m = _DIALOGUE_RE.match(stripped)
+    m = _DLG_TAG_RE.match(line.strip())
     if not m:
         return None
-    who_raw = m.group(1).strip()
-    content = m.group(2).strip()
-    if not who_raw or not content:
+    attrs, content = m.group(1), m.group(2).strip()
+    name_m = _ATTR_NAME_RE.search(attrs)
+    if not name_m or not name_m.group(1).strip() or not content:
         return None
+    av_m = _ATTR_AV_RE.search(attrs)
+    protagonist = bool(_ATTR_ME_RE.search(attrs))
+    return Dialogue(
+        name_m.group(1).strip(),
+        _strip_quotes(content),
+        protagonist,
+        avatar=(av_m.group(1) if av_m else None),
+    )
 
-    # 排除系统/元信息行:剧情ID标记、emoji标记行、方括号开头的标签
-    if (
-        stripped.startswith(("📝", "["))
-        or "剧情ID" in stripped
-        or "narrative_ref" in stripped.lower()
-        or repr(who_raw).startswith("'📝")
-    ):
-        return None
 
-    protagonist = False
-    who = who_raw
-    if who_raw.startswith("*") and len(who_raw) > 1:
-        protagonist = True
-        who = who_raw[1:].strip()
-
-    # 头像覆盖标记:「角色名@头像名」→ 该气泡借用另一张已有头像(默认按角色名匹配)
-    # 例: 阿龙@汐见小亚: ... → 说话人显示「阿龙」,但气泡用「汐见小亚」的头像
-    avatar_key = None
-    if "@" in who:
-        base, _, av = who.partition("@")
-        base = base.strip()
-        avatar_key = av.strip()
-        if not base:
-            return None
-        who = base
-
-    # 角色名不允许包含超长 / 标点
-    if not who or len(who) > 12:
+def _parse_capsule_tag(line: str) -> Block | None:
+    """解析 <c>短旁白文字</c>(居中灰胶囊);不匹配返回 None。"""
+    m = _CAP_TAG_RE.match(line.strip())
+    if not m or not m.group(1).strip():
         return None
-    # 角色名若含句子内标点(逗号/顿号/句号/分号/冒号/叹号/问号) → 多半是 LLM
-    # 把「阿龙思索片刻，点头」这类动作咒拼进了名字,直接判为旁白,不要当作气泡。
-    if any(c in who for c in "，,、。;；:：!！?？"):
-        return None
-    # 角色名不能包含明显不是名字的字符,排除含方括号/反引号的系统标签
-    if any(c in who for c in "[]`"):
-        return None
-    # 角色名不能包含明显不是名字的字符
-    if " " in who:
-        # 中文名不该有空格(「阿龙 点头」「林 晓」在中文语境多为 动作/短语混入)。
-        # 只有纯英文字母名(如 Mr. Smith)允许带空格。
-        if re.search(r"[\u4e00-\u9fff\u3000-\u303f]", who):
-            return None
-        if not all(part.strip() for part in who.split()):
-            return None
-    if "\n" in who or "  " in who:
-        return None
-    return who, content, protagonist, avatar_key
+    return Block("capsule", parse_inline(m.group(1).strip()))
 
 
 def _strip_quotes(text: str) -> str:
@@ -378,18 +356,17 @@ def parse_blocks(text: str) -> list[Block]:
             i += 1
             continue
 
-        # 对白(需在段落之前)
-        if i == n - 1 or not lines[i + 1].strip() or _DIALOGUE_RE.match(stripped):
-            diag = _looks_like_dialogue(line)
-            if diag:
-                who, content, protagonist, avatar_key = diag
-                blocks.append(
-                    Dialogue(
-                        who, _strip_quotes(content), protagonist, avatar=avatar_key
-                    )
-                )
-                i += 1
-                continue
+        # 结构化对白 / 胶囊标签(需在段落之前;不匹配则按普通文本处理)
+        dlg = _parse_dialogue_tag(stripped)
+        if dlg is not None:
+            blocks.append(dlg)
+            i += 1
+            continue
+        cap = _parse_capsule_tag(stripped)
+        if cap is not None:
+            blocks.append(cap)
+            i += 1
+            continue
 
         # 无序列表(连续收集)
         if _UL_RE.match(line):

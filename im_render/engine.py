@@ -241,19 +241,12 @@ class ChatRenderer:
                 )
             )
         elif blk.type == "paragraph":
+            # 段落一律按正文渲染;灰胶囊只能由 <c> 标签产生,不再自动折行
+            self._append_rich_paragraph(blk.spans)
+        elif blk.type == "capsule":
             plain = md.plain_text(blk.spans).strip()
-            # 短旁白(穿插在对话间的情形描写)→ 居中灰色胶囊;
-            # 长段落 / 含链接 / 含换行 → 保持左对齐段落
-            is_short = (
-                len(plain) <= 60
-                and not hasattr(blk, "_linebreak")
-                and "\n" not in plain
-                and not any(s.link for s in blk.spans)
-            )
-            if is_short:
+            if plain:
                 self._rows.append(PillRow(self, plain))
-            else:
-                self._append_rich_paragraph(blk.spans)
         elif blk.type == "dialogue":
             # 主角判定:LLM 的 `*名字:` 标记优先;配置的 is_self 函数兜底
             is_self_row = bool(

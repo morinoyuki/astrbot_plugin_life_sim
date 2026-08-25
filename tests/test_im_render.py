@@ -23,8 +23,8 @@ SAMPLE = """她的目光扫过柜台，落在那个熟悉的身影上。
 
 ## 相遇
 
-阿龙:「下午好呀，今天怎么来了？」
-我:嗯，老样子就好。
+<d name="阿龙">「下午好呀，今天怎么来了？」</d>
+<d name="我" me>嗯，老样子就好。</d>
 
 > 她轻声说道。
 
@@ -40,11 +40,16 @@ def test_parse_blocks():
     assert "heading" in types
     assert "quote" in types
 
-    # 头像自选:角色名@头像名 → speaker=前段,avatar=后段;无 @ 时 avatar=None
-    a, b2 = md.parse_blocks("汐见小亚: 阿姐。\n\n阿龙@汐见小亚: 你是谁?\n")
+    # 头像自选:<d name="..." av="..."> → speaker=name, avatar=av;无 av 时 avatar=None
+    a, b2 = md.parse_blocks(
+        '<d name="汐见小亚">阿姐。</d>\n\n<d name="阿龙" av="汐见小亚">你是谁?</d>\n'
+    )
     assert getattr(a, "avatar", None) is None
     assert getattr(b2, "avatar", None) == "汐见小亚"
     assert getattr(b2, "speaker", None) == "阿龙"
+    # 主角标记 me 属性
+    p = md.parse_blocks('<d name="凌霜" me>我一直都记得。</d>')[0]
+    assert getattr(p, "protagonist", False) is True
     return blocks
 
 
@@ -70,7 +75,7 @@ def test_render_with_avatar_file(tmp_path=None):
     PILImage.new("RGB", (64, 64), (255, 0, 0)).save(avatar_path)
 
     imgs = render_narrative(
-        "阿龙:看头像", theme="light", avatars={"阿龙": avatar_path}
+        '<d name="阿龙">看头像</d>', theme="light", avatars={"阿龙": avatar_path}
     )
     assert len(imgs) == 1
 
@@ -98,7 +103,7 @@ def test_too_many_pages():
     r = ChatRenderer(width=400, max_pages=2)
 
     # 构造大量内容
-    long_text = "\n".join(f"阿龙:第{i}条消息,这是一段比较长的内容" for i in range(50))
+    long_text = "\n".join(f'<d name="阿龙">第{i}条消息,这是一段比较长的内容</d>' for i in range(50))
     blocks = md.parse_blocks(long_text)
     try:
         r.render(blocks, title="分页")
@@ -154,3 +159,39 @@ if __name__ == "__main__":
                 print(f"  \u2717 {name}: {e}")
     print(f"\n{'PASS' if failed == 0 else f'{failed} FAILED'}")
     sys.exit(1 if failed else 0)
+
+
+def test_narration_line_without_tag_is_paragraph():
+    """叙述句(如「牌子冒号」行)没有 <d>/<c> 标签 → 普通段落,绝不出气泡。"""
+    text = "旁边还立着一块牌子:「巡逻中」。\n\n桌上的茶杯: 还温着。"
+    blocks = md.parse_blocks(text)
+    assert all(b.type != "dialogue" for b in blocks)
+    assert all(b.type != "capsule" for b in blocks)
+
+
+def test_dialogue_and_capsule_tags():
+    """结构化标签:对白/胶囊/主角/头像属性解析正确;残缺标签不漏进画面。"""
+    blocks = md.parse_blocks(
+        "<d name=\"阿龙\">你来了啊。</d>\n"
+        "<c>旁边还立着一块牌子,上面写着「巡逻中」。</c>\n"
+        "<d name=\"凌霜\" me>我一直都记得。</d>\n"
+    )
+    assert [b.type for b in blocks] == ["dialogue", "capsule", "dialogue"]
+    d0, cap, d1 = blocks
+    assert d0.speaker == "阿龙" and d0.protagonist is False and d0.avatar is None
+    assert d1.speaker == "凌霜" and d1.protagonist is True
+
+    # 未闭合 / 缺 name 的残缺标签 → 不当对白,且标签文本不会漏进段落
+    bad = md.parse_blocks("<d name=\"阿龙\">没闭合\n<d>缺name</d>")
+    for b in bad:
+        for sp in getattr(b, "spans", []):
+            assert "<d" not in sp.text
+
+
+def test_parse_blocks_narration_sign():
+    """完整解析:无标签的牌子行落入段落,只有带标签的台词产生对话气泡。"""
+    blocks = md.parse_blocks(
+        "旁边还立着一块牌子:「巡逻中」。\n\n<d name=\"阿龙\">收到。</d>"
+    )
+    dialogues = [b for b in blocks if isinstance(b, md.Dialogue)]
+    assert len(dialogues) == 1 and dialogues[0].speaker == "阿龙"
