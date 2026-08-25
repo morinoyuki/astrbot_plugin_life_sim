@@ -13,6 +13,8 @@ import os
 import re
 import shutil
 import time
+from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 
 import docstring_parser
 from astrbot.api import logger
@@ -33,7 +35,7 @@ from astrbot.core.agent.tool import ToolSet
 from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.message.components import Image
-from astrbot.core.provider.entities import LLMResponse
+from astrbot.core.provider.entities import LLMResponse, TokenUsage
 from astrbot.core.provider.func_tool_manager import PY_TO_JSON_TYPE
 from astrbot.core.star.star_tools import StarTools
 from astrbot.core.utils.quoted_message.extractor import QuotedMessageExtractor
@@ -617,6 +619,52 @@ def _narrative_branch(session: dict | None) -> str:
     return b
 
 
+# ══════════════════════════════════════════════════════════════
+# LLM 用量统计上报
+#
+# 本插件通过 context.llm_generate() / context.tool_loop_agent() 直接调用 LLM,
+# 不经过 AstrBot 内部 agent 子阶段(pipeline),因此 token 消耗不会被写入
+# 全局 provider_stats 表 —— WebUI「数据统计」页的调用量/Token 曲线读的就是这张表。
+#
+# 方案:给 provider 实例挂一个幂等的 text_chat 包装器,配合 ContextVar 作用域标记,
+# 只累计本插件发起的调用;每轮结束后通过 db_helper.insert_provider_stat()
+# 以 agent_type="internal" 写入同一张表,从而完整融入系统级数据统计。
+# ══════════════════════════════════════════════════════════════
+
+_LLM_STATS_CTX: ContextVar[dict | None] = ContextVar("life_sim_llm_stats", default=None)
+
+
+def _ensure_provider_stats_hook(prov) -> bool:
+    """给 provider 实例安装 text_chat 统计包装器(幂等)。返回是否成功。"""
+    if getattr(prov, "_life_sim_stats_hooked", False):
+        return True
+    orig = getattr(prov, "text_chat", None)
+    if not callable(orig):
+        return False
+
+    async def hooked(*args, **kwargs):
+        resp = await orig(*args, **kwargs)
+        ctx = _LLM_STATS_CTX.get()
+        if ctx is not None:
+            ctx["calls"] += 1
+            if getattr(resp, "role", "") == "err":
+                ctx["errors"] += 1
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                try:
+                    ctx["usage"] = ctx["usage"] + usage
+                except (AttributeError, TypeError):
+                    pass
+        return resp
+
+    try:
+        prov.text_chat = hooked  # type: ignore[method-assign]
+    except (AttributeError, TypeError):
+        return False
+    prov._life_sim_stats_hooked = True
+    return True
+
+
 class _LifeSimToolHooks(BaseAgentRunHooks[AstrAgentContext]):
     """从 run_context.messages 中提取本轮 agent 新增的工具调用上下文。
 
@@ -1117,11 +1165,15 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             f"请判断最适合的模式(只输出字母 A / B / C):"
         )
 
-        llm_resp = await self.context.llm_generate(
-            chat_provider_id=pid,
-            system_prompt=MODE_DETECT_SYSTEM_PROMPT,
-            contexts=[],
-            prompt=user_msg,
+        llm_resp = await self._run_llm_with_stats(
+            event,
+            pid,
+            lambda: self.context.llm_generate(
+                chat_provider_id=pid,
+                system_prompt=MODE_DETECT_SYSTEM_PROMPT,
+                contexts=[],
+                prompt=user_msg,
+            ),
         )
         text = (getattr(llm_resp, "completion_text", "") or "").strip().upper()
         for ch in text:
@@ -1151,11 +1203,15 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         contexts = bind_checkpoint_messages(head_msgs)
         prompt = "请将上方历史对话压缩成简洁摘要,保留关键叙事线、人物关系、人生走向与结局标记。"
 
-        llm_resp = await self.context.llm_generate(
-            chat_provider_id=pid,
-            system_prompt=SUMMARY_SYSTEM_PROMPT,
-            contexts=contexts,
-            prompt=prompt,
+        llm_resp = await self._run_llm_with_stats(
+            event,
+            pid,
+            lambda: self.context.llm_generate(
+                chat_provider_id=pid,
+                system_prompt=SUMMARY_SYSTEM_PROMPT,
+                contexts=contexts,
+                prompt=prompt,
+            ),
         )
         text = (getattr(llm_resp, "completion_text", "") or "").strip()
         if not text:
@@ -1251,6 +1307,102 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
     # ════════════════════════════════════════════════════════════════
     # LLM 调用 — 按模式选择 llm_generate / tool_loop_agent
     # ════════════════════════════════════════════════════════════════
+
+    async def _run_llm_with_stats(
+        self,
+        event: AstrMessageEvent | None,
+        provider_id: str,
+        fn: Callable[[], Awaitable[LLMResponse]],
+    ) -> LLMResponse:
+        """执行一次(或一轮 agent loop)LLM 调用,并把 token 用量写入 AstrBot 全局统计表。
+
+        原理:在 ContextVar 作用域内调用 provider.text_chat 的统计包装器,
+        累计本插件本轮所有请求的 usage;结束后通过 db_helper.insert_provider_stat()
+        以 agent_type="internal" 写入 provider_stats 表 —— 与 WebUI「数据统计」页
+        同一数据源,因此调用量/Token 曲线会把本插件的消耗计入。
+        统计失败不影响主流程。旧版 AstrBot 无此接口时静默跳过。
+        """
+        # 确保 provider 实例已安装 text_chat 统计包装器(幂等)
+        if self._cfg("record_llm_stats", True):
+            try:
+                prov = await self.context.provider_manager.get_provider_by_id(
+                    provider_id
+                )
+                if prov is not None:
+                    _ensure_provider_stats_hook(prov)
+            except Exception as e:
+                logger.debug(f"life-sim: 安装 LLM 用量统计钩子失败: {e}")
+
+        ctx = {
+            "calls": 0,
+            "errors": 0,
+            "usage": TokenUsage(),
+            "start_time": time.time(),
+            "end_time": 0.0,
+        }
+        token = _LLM_STATS_CTX.set(ctx)
+        errored = False
+        try:
+            llm_resp = await fn()
+            errored = getattr(llm_resp, "role", "") == "err"
+            return llm_resp
+        except Exception:
+            errored = True
+            raise
+        finally:
+            _LLM_STATS_CTX.reset(token)
+            ctx["end_time"] = time.time()
+            if self._cfg("record_llm_stats", True):
+                status = "error" if errored else "completed"
+                try:
+                    await self._flush_llm_provider_stat(
+                        event, provider_id, ctx, status
+                    )
+                except Exception as e:
+                    logger.debug(f"life-sim: 写入 LLM 用量统计失败(不影响功能): {e}")
+
+    async def _flush_llm_provider_stat(
+        self,
+        event: AstrMessageEvent | None,
+        provider_id: str,
+        ctx: dict,
+        status: str,
+    ) -> None:
+        """把一轮累计的用量写入 AstrBot 全局 provider_stats 表(WebUI 数据统计页数据源)。"""
+        from astrbot.core import db_helper  # 局部导入避免启动顺序问题
+
+        insert = getattr(db_helper, "insert_provider_stat", None)
+        if insert is None:
+            return  # 旧版 AstrBot,无此接口
+
+        u = ctx.get("usage") or TokenUsage()
+        provider_model = None
+        try:
+            prov = await self.context.provider_manager.get_provider_by_id(provider_id)
+            get_model = getattr(prov, "get_model", None)
+            provider_model = get_model() if callable(get_model) else None
+        except Exception:
+            provider_model = None
+
+        await insert(
+            umo=event.unified_msg_origin if event is not None else "",
+            provider_id=provider_id or "",
+            provider_model=provider_model,
+            conversation_id=None,
+            status=status if ctx.get("calls") else "error",
+            stats={
+                "token_usage": {
+                    "input_other": int(getattr(u, "input_other", 0) or 0),
+                    "input_cached": int(getattr(u, "input_cached", 0) or 0),
+                    "output": int(getattr(u, "output", 0) or 0),
+                },
+                "start_time": float(ctx.get("start_time") or 0.0),
+                "end_time": float(ctx.get("end_time") or 0.0),
+                # 非流式调用拿不到真实 TTFT,置 0(统计页会忽略为 0 的样本)
+                "time_to_first_token": 0.0,
+            },
+            agent_type="internal",
+        )
 
     async def _generate(
         self,
@@ -1350,28 +1502,36 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         tool_hooks: _LifeSimToolHooks | None = None
         try:
             if mode == "A":
-                llm_resp = await self.context.llm_generate(
-                    chat_provider_id=provider_id,
-                    system_prompt=system_prompt,
-                    image_urls=image_urls,
-                    contexts=contexts,
-                    prompt=user_input,
+                llm_resp = await self._run_llm_with_stats(
+                    event,
+                    provider_id,
+                    lambda: self.context.llm_generate(
+                        chat_provider_id=provider_id,
+                        system_prompt=system_prompt,
+                        image_urls=image_urls,
+                        contexts=contexts,
+                        prompt=user_input,
+                    ),
                 )
             else:
                 # 传 tools 让 LLM 知道 rpg_*/roll_dice 可用(否则 tool_loop_agent 不会调任何工具)
                 tools = self._build_my_tool_set()
                 tool_hooks = _LifeSimToolHooks()
-                llm_resp = await self.context.tool_loop_agent(
-                    event=event,
-                    chat_provider_id=provider_id,
-                    system_prompt=system_prompt,
-                    image_urls=image_urls,
-                    contexts=contexts,
-                    prompt=user_input,
-                    tools=tools,
-                    max_steps=tool_max_steps,
-                    tool_call_timeout=tool_call_timeout,
-                    agent_hooks=tool_hooks,
+                llm_resp = await self._run_llm_with_stats(
+                    event,
+                    provider_id,
+                    lambda: self.context.tool_loop_agent(
+                        event=event,
+                        chat_provider_id=provider_id,
+                        system_prompt=system_prompt,
+                        image_urls=image_urls,
+                        contexts=contexts,
+                        prompt=user_input,
+                        tools=tools,
+                        max_steps=tool_max_steps,
+                        tool_call_timeout=tool_call_timeout,
+                        agent_hooks=tool_hooks,
+                    ),
                 )
         except (ValueError, KeyError, TimeoutError, OSError, ConnectionError) as e:
             logger.error(f"life-sim: LLM 调用失败: {e}")

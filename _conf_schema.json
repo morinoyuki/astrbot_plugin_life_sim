@@ -57,6 +57,12 @@
     "hint": "开启后,超长历史会调用 LLM 压缩成摘要(质量更好,稍慢);关闭则用纯规则抽取标题与世界观(快但粗)。LLM 调用失败会自动回退到规则抽取",
     "default": true
   },
+  "record_llm_stats": {
+    "description": "上报 LLM 用量到系统数据统计(默认开)",
+    "type": "bool",
+    "hint": "开启后,本插件的所有 LLM 调用(叙事生成/工具循环/模式识别/历史压缩)的 token 消耗与调用量会写入 AstrBot 全局统计,在 WebUI「数据统计」页可见",
+    "default": true
+  },
   "compress_provider_id": {
     "description": "压缩任务专用模型(可路由到便宜/快速的模型)",
     "type": "string",
