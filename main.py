@@ -3802,7 +3802,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
     @filter.command("lore", alias={"设定", "角色设定", "人物设定"})
     async def cmd_lore(self, event: AstrMessageEvent):
-        """/lore [角色名|世界观] - 查看角色/世界观持久化设定"""
+        """/lore [角色名|世界观] - 查看角色/世界观持久化设定
+
+        /lore 删除 <角色名> - 删除指定角色的当前持久化设定(不动快照,/undo 可恢复)
+        """
         session = await self._load_sim(event)
         if not session:
             yield event.plain_result(
@@ -3815,6 +3818,33 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         ).strip()
         char_lore = self._normalize_character_lore(session.get("character_lore"))
         world_lore = session.get("world_lore") or []
+
+        # ── 删除角色 ──
+        tokens = arg.split(None, 1)
+        if tokens and tokens[0] in ("删除", "del", "delete", "remove"):
+            target = (tokens[1] if len(tokens) > 1 else "").strip()
+            if not target:
+                yield event.plain_result("❌ 用法:`/lore 删除 <角色名>`")
+                return
+            matched_keys = _match_lore_characters(char_lore, target)
+            if not matched_keys:
+                available = "、".join(n for n in char_lore if char_lore[n])
+                yield event.plain_result(
+                    f"❌ 未找到角色「{target}」。"
+                    + (f"现有角色:{available}" if available else "暂无角色设定")
+                    + "\n💡 /lore 查看总览 · /lore 删除 <角色名>"
+                )
+                return
+            removed = {mn: len(char_lore.pop(mn) or []) for mn in matched_keys}
+            session["character_lore"] = char_lore
+            await self._save_sim(event, session)
+            total = sum(removed.values())
+            lines = [f"🗑️ 已删除 {len(matched_keys)} 个角色 key、共 {total} 条设定:"]
+            for mn in matched_keys:
+                lines.append(f"  👤 {mn}: {removed.get(mn, 0)} 条")
+            lines.append("   💡 lore 快照未动,误删可用 /undo 回滚恢复。")
+            yield event.plain_result("\n".join(lines))
+            return
 
         # ── 总览 ──
         if not arg:
@@ -3832,6 +3862,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             lines += [
                 "",
                 "💡 /lore <角色名> 查看该角色全部设定 · /lore 世界观 查看世界设定",
+                "💡 /lore 删除 <角色名> 删除该角色全部设定",
             ]
             yield event.plain_result("\n".join(lines))
             return
