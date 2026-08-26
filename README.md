@@ -181,11 +181,24 @@ WebUI → 插件管理 → 转生模拟器 → 配置,共 30 项:
 - 历史压缩 → 最便宜的模型(只是抽取要点)
 - 模式识别 → 便宜的分类模型(简单 A/B/C 选择)
 
+## 插件页面(WebUI 数据管理)
+
+插件自带一个 WebUI 页面:`插件管理 → 转生模拟器 → 页面 → manage`(需 AstrBot 版本支持插件页面)。功能:
+
+- **总览**:各存储的文件数/体积统计;
+- **模拟会话**:列表(模式/创建者/轮数/Lore 条数/大小),支持查看详情、编辑世界观设定与创建者、导出 JSON、删除(可选连带剧情记录);
+- **Lore 编辑**:世界观 lore 与分角色 character_lore 逐条编辑(seq/分类/内容),可增删条目与角色,保存时自动清洗非法字段、补齐 seq;
+- **消息回滚**:按消息粒度回滚(删除该条及之后全部),并同步修剪 turn 快照;
+- **剧情历史**:主线/分支线的剧情记录查看、修订全文、删除;
+- **分支存档 / RPG 存档**:查看与删除。
+
+所有变更操作复用聊天命令同一把会话锁,不会与群内 /do 并发冲突;接口仅登录后的 dashboard 可调用。旧版 AstrBot 无插件页面能力时自动跳过注册,不影响聊天指令。
+
 ## 文件结构
 
 ```
 astrbot_plugin_life_sim/
-├── _conf_schema.json    # WebUI 配置 schema(25 项)
+├── _conf_schema.json    # WebUI 配置 schema(30 项)
 ├── metadata.yaml         # 插件元数据
 ├── requirements.txt      # 第三方依赖:pillowmd(聊天卡片渲染)
 ├── README.md             # 本文档
@@ -214,6 +227,9 @@ astrbot_plugin_life_sim/
 ├── pillowmd_patch.py     # 上游 pillowmd 库的兼容补丁(导入时自动应用)
 ├── im_render/            # 聊天卡片渲染引擎(实验性)
 │                         #   - engine.py 块布局/分页/绘制,markdown.py 解析,rows.py 行绘制,style.py 样式
+├── pages/manage/         # WebUI 插件页面:数据管理(bridge SDK + 原生 JS)
+│                         #   - index.html 入口,app.js 逻辑,style.css 双主题样式
+│                         #   - 对应 main.py 里 _register_web_apis 注册的 /api/* REST 接口
 ├── storage_base.py       # JSON 文件存储公共原语
 │                         #   - read_json / write_json_atomic(原子写)
 │                         #   - safe_remove / ensure_dir

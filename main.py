@@ -8,6 +8,7 @@
 
 import asyncio
 import copy
+import functools
 import json
 import os
 import re
@@ -57,12 +58,21 @@ from .prompts import (
     _parse_mode_prefix,
 )
 from .rpg_tools import RPGMixin
+from .storage_base import list_json_stems
 from .storage_branch import BranchStore
 
 try:  # AstrBot ≥ 4.x 提供图片压缩工具;旧版缺失时优雅降级为不压缩
     from astrbot.core.utils.media_utils import compress_image
 except ImportError:  # pragma: no cover
     compress_image = None
+
+try:  # 插件 Web API / 插件页面(较新版本提供);旧版缺失时跳过页面接口注册
+    from astrbot.api.web import error_response as _web_error
+    from astrbot.api.web import file_response as _web_file
+    from astrbot.api.web import json_response as _web_json
+    from astrbot.api.web import request as _web_request
+except ImportError:  # pragma: no cover
+    _web_error = _web_file = _web_json = _web_request = None
 
 from .storage_narrative import NarrativeStore
 from .storage_rpg import RpgStore
@@ -795,6 +805,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         self.rpg_store = RpgStore(self.data_dir)
         self.narrative_store = NarrativeStore(self.data_dir)
         self.branch_store = BranchStore(self.data_dir)
+        # WebUI 插件页面(数据管理)的 REST 接口
+        self._register_web_apis()
         # AstrBot 在配置存在时传入,缺失时为 None
         self.config = config
         # 每个会话(group/user)一把 asyncio.Lock,防止同一会话并发触发 _generate 造成竞态
@@ -1041,6 +1053,541 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
     def _busy_message(self) -> str:
         return "⏳ 上一条消息还在处理中,请稍候再试..."
+
+    # ════════════════════════════════════════════════════════════
+    # WebUI 插件页面:数据管理 REST 接口
+    #
+    # 页面本体在 pages/manage/index.html,由 dashboard 自动发现并
+    # 以 iframe + bridge SDK 方式加载;这里只注册 JSON 接口。
+    # 路由必须带插件名前缀(dashboard 按 /plugins/extensions/<插件名>/<路由>
+    # 匹配 registered_web_apis)。所有变更操作复用聊天命令同一把会话锁,
+    # 避免与 /do 并发改坏存档。
+    # ════════════════════════════════════════════════════════════
+
+    def _register_web_apis(self) -> None:
+        if _web_json is None or not hasattr(self.context, "register_web_api"):
+            logger.debug("life-sim: 当前 AstrBot 无插件 Web API,跳过页面接口注册")
+            return
+        base = "/astrbot_plugin_life_sim"
+        routes = (
+            (f"{base}/api/overview", self._web_overview, ["GET"], "总览统计"),
+            (f"{base}/api/scopes", self._web_scopes, ["GET"], "全部会话 scope 列表"),
+            (f"{base}/api/sessions", self._web_sessions, ["GET"], "模拟会话列表"),
+            (f"{base}/api/session/<key>", self._web_session_detail, ["GET"], "会话详情"),
+            (f"{base}/api/session/update", self._web_session_update, ["POST"], "编辑会话(世界观/lore/主人名)"),
+            (f"{base}/api/session/delete", self._web_session_delete, ["POST"], "删除会话"),
+            (f"{base}/api/messages/truncate", self._web_messages_truncate, ["POST"], "回滚消息到指定条数"),
+            (f"{base}/api/export/<key>", self._web_export, ["GET"], "导出会话 JSON"),
+            (f"{base}/api/narrative", self._web_narrative_list, ["GET"], "剧情记录列表"),
+            (f"{base}/api/narrative/detail", self._web_narrative_detail, ["GET"], "剧情记录详情"),
+            (f"{base}/api/narrative/update", self._web_narrative_update, ["POST"], "修订剧情内容"),
+            (f"{base}/api/narrative/delete", self._web_narrative_delete, ["POST"], "删除剧情记录"),
+            (f"{base}/api/branches", self._web_branches, ["GET"], "分支快照列表"),
+            (f"{base}/api/branch/delete", self._web_branch_delete, ["POST"], "删除分支快照"),
+            (f"{base}/api/rpg", self._web_rpg, ["GET"], "RPG 存档列表"),
+            (f"{base}/api/rpg/char/delete", self._web_rpg_char_delete, ["POST"], "删除 RPG 角色存档"),
+            (f"{base}/api/rpg/session/delete", self._web_rpg_session_delete, ["POST"], "删除 RPG 会话存档"),
+        )
+        for route, handler, methods, desc in routes:
+            try:
+                self.context.register_web_api(route, handler, methods, f"life-sim: {desc}")
+            except Exception as e:
+                logger.warning(f"life-sim: 注册 Web API {route} 失败: {e}")
+
+    @staticmethod
+    def _web_handler(func):
+        """包装插件 Web API handler:统一异常 → error envelope。"""
+
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            if _web_json is None:
+                return {"ok": False, "message": "AstrBot 版本过低,无插件 Web API"}
+            try:
+                return await func(*args, **kwargs)
+            except ValueError as e:
+                return _web_error(str(e), status_code=400)
+            except Exception as e:
+                logger.error(f"life-sim: Web API {func.__name__} 失败: {e}")
+                return _web_error("内部错误,请查看日志", status_code=500)
+
+        return wrapper
+
+    # ── web 公共小工具 ───────────────────────────────────────────
+
+    @staticmethod
+    async def _web_body() -> dict:
+        try:
+            body = await _web_request.json(default=None)
+        except Exception:  # 无绑定上下文(测试直调)时取不到 body
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    @staticmethod
+    def _web_query(name: str, default: str = "") -> str:
+        try:
+            val = _web_request.query.get(name)
+        except Exception:  # 同上
+            return default
+        return str(val).strip() if val is not None else default
+
+    @staticmethod
+    def _dir_stats(path: str) -> tuple[int, int]:
+        files = size = 0
+        if os.path.isdir(path):
+            for root, _, fs in os.walk(path):
+                for f in fs:
+                    files += 1
+                    try:
+                        size += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+        return files, size
+
+    @classmethod
+    def _sanitize_lore_entries(cls, entries) -> list[dict]:
+        """清洗 lore 条目列表:list[dict] 且只保留合法字段,seq 缺失时两遍扫描自动补号。"""
+        kept: list[tuple[int, dict]] = []
+        for e in entries or []:
+            if not isinstance(e, dict):
+                continue
+            content = str(e.get("content") or "").strip()
+            if not content:
+                continue
+            try:
+                seq = int(e.get("seq") or 0)
+            except (TypeError, ValueError):
+                seq = 0
+            kept.append(
+                (
+                    seq,
+                    {
+                        "section": str(e.get("section") or "general").strip() or "general",
+                        "content": content,
+                        "updated_at": str(e.get("updated_at") or "").strip(),
+                    },
+                )
+            )
+        # 两遍扫描:先收集显式 seq 的最大值,再给缺失项从 max+1 起连续补号
+        explicit_max = max((s for s, _ in kept if s > 0), default=0)
+        next_seq = explicit_max + 1
+        out: list[dict] = []
+        for seq, entry in kept:
+            if seq <= 0:
+                seq = next_seq
+                next_seq += 1
+            out.append({"seq": seq, **entry})
+        out.sort(key=lambda d: d["seq"])
+        return out
+
+    @classmethod
+    def _sanitize_message_for_web(cls, msg: dict, include_images: bool) -> dict:
+        """消息深拷贝并把 base64 图片替换为占位符(base64 太大不宜进页面)。"""
+        m = copy.deepcopy(msg) if isinstance(msg, dict) else msg
+        if not include_images and isinstance(m, dict) and isinstance(m.get("content"), list):
+            for part in m["content"]:
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") == "image_url"
+                    and isinstance(part.get("image_url"), dict)
+                    and str(part["image_url"].get("url") or "").startswith("data:image")
+                ):
+                    part["image_url"]["url"] = "[图片数据已省略]"
+        return m
+
+    # ── web handlers ─────────────────────────────────────────────
+
+    @_web_handler
+    async def _web_overview(self):
+        import concurrent.futures
+
+        d = self.data_dir
+        sim_dir = os.path.join(d, "sim_sessions")
+        narr_dir = os.path.join(d, "narrative_history")
+        br_dir = os.path.join(d, "sim_branches")
+        avatars_dir = os.path.join(d, "avatars")
+
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            sim_f = loop.run_in_executor(pool, self._dir_stats, sim_dir)
+            narr_f = loop.run_in_executor(pool, self._dir_stats, narr_dir)
+            br_f = loop.run_in_executor(pool, self._dir_stats, br_dir)
+            av_f = loop.run_in_executor(pool, self._dir_stats, avatars_dir)
+            sim_files, sim_size = await sim_f
+            narr_files, narr_size = await narr_f
+            br_files, br_size = await br_f
+            av_files, _ = await av_f
+
+        scopes = set(list_json_stems(sim_dir))
+        if os.path.isdir(narr_dir):
+            scopes |= {x for x in os.listdir(narr_dir) if os.path.isdir(os.path.join(narr_dir, x))}
+        rpg_chars = len(self.rpg_store.list_chars())
+        rpg_sessions = len(self.rpg_store.list_sessions())
+
+        return {
+            "ok": True,
+            "data_dir": d,
+            "sessions": {
+                "count": len(list_json_stems(sim_dir)),
+                "files": sim_files,
+                "size": sim_size,
+            },
+            "narrative": {
+                "scopes": len([x for x in os.listdir(narr_dir) if os.path.isdir(os.path.join(narr_dir, x))]) if os.path.isdir(narr_dir) else 0,
+                "files": narr_files,
+                "size": narr_size,
+            },
+            "branches": {"files": br_files, "size": br_size},
+            "rpg": {"chars": rpg_chars, "sessions": rpg_sessions},
+            "avatars": {"files": av_files},
+            "scope_count": len(scopes),
+        }
+
+    @_web_handler
+    async def _web_scopes(self):
+        """全部 scope(sim key == narrative scope == branch scope):给下拉框用。"""
+        d = self.data_dir
+        keys = set(list_json_stems(os.path.join(d, "sim_sessions")))
+        narr_dir = os.path.join(d, "narrative_history")
+        if os.path.isdir(narr_dir):
+            keys |= {x for x in os.listdir(narr_dir) if os.path.isdir(os.path.join(narr_dir, x))}
+        br_dir = os.path.join(d, "sim_branches")
+        if os.path.isdir(br_dir):
+            keys |= {x for x in os.listdir(br_dir) if os.path.isdir(os.path.join(br_dir, x))}
+        out = []
+        for key in sorted(keys):
+            branches = list((await self.branch_store.list(key)).keys())
+            out.append({"key": key, "has_session": key in set(list_json_stems(os.path.join(d, "sim_sessions"))), "branches": branches})
+        return {"ok": True, "scopes": out}
+
+    @_web_handler
+    async def _web_sessions(self):
+        sim_dir = os.path.join(self.data_dir, "sim_sessions")
+        out = []
+        for key in list_json_stems(sim_dir):
+            session = await self.sim_store.load(key)
+            path = os.path.join(sim_dir, f"{key}.json")
+            try:
+                size = os.path.getsize(path)
+                mtime = int(os.path.getmtime(path))
+            except OSError:
+                size = mtime = 0
+            msgs = session.get("messages") or []
+            mode = session.get("mode", "A")
+            wl = session.get("world_lore") or []
+            cl = LifeSimPlugin._normalize_character_lore(session.get("character_lore"))
+            out.append(
+                {
+                    "key": key,
+                    "mode": mode,
+                    "mode_name": MODE_NAMES.get(mode, mode),
+                    "owner": session.get("owner_name", ""),
+                    "world_setting": (session.get("world_setting") or "")[:120],
+                    "turn": int(session.get("lore_turn", 0) or 0),
+                    "msg_count": len(msgs),
+                    "current_branch": session.get("current_branch") or "",
+                    "lore_entries": len(wl) + sum(len(v) for v in cl.values()),
+                    "size": size,
+                    "mtime": mtime,
+                }
+            )
+        out.sort(key=lambda x: -x["mtime"])
+        return {"ok": True, "sessions": out}
+
+    @_web_handler
+    async def _web_session_detail(self, key: str = ""):
+        session = await self.sim_store.load(key)
+        if session is None:
+            return _web_error(f"会话不存在: {key}", status_code=404)
+        include_images = self._web_query("with_images") in ("1", "true")
+        messages = [
+            self._sanitize_message_for_web(m, include_images)
+            for m in (session.get("messages") or [])
+        ]
+        cl = LifeSimPlugin._normalize_character_lore(session.get("character_lore"))
+        snaps = {
+            k: len(session.get(k) or [])
+            for k in ("lore_snapshots", "narrative_snapshots", "rpg_snapshots")
+        }
+        return {
+            "ok": True,
+            "session": {
+                "key": key,
+                "mode": session.get("mode", "A"),
+                "mode_name": MODE_NAMES.get(session.get("mode", "A"), ""),
+                "owner": session.get("owner_name", ""),
+                "created_at": session.get("created_at", 0),
+                "lore_turn": int(session.get("lore_turn", 0) or 0),
+                "current_branch": session.get("current_branch") or "",
+                "last_narrative_id": session.get("last_narrative_id") or "",
+                "world_setting": session.get("world_setting") or "",
+                "world_lore": self._sanitize_lore_entries(session.get("world_lore")),
+                "character_lore": {
+                    name: self._sanitize_lore_entries(entries)
+                    for name, entries in cl.items()
+                },
+                "snapshot_counts": snaps,
+                "messages": messages,
+                "message_count": len(messages),
+            },
+        }
+
+    @staticmethod
+    def _apply_session_edits(session: dict, body: dict) -> list[str]:
+        changed: list[str] = []
+        if "world_setting" in body:
+            ws = str(body.get("world_setting") or "").strip()
+            session["world_setting"] = ws
+            changed.append("世界观设定")
+        if "owner" in body:
+            owner = str(body.get("owner") or "").strip()
+            session["owner_name"] = owner
+            changed.append("创建者")
+        if "world_lore" in body:
+            raw = body.get("world_lore")
+            if raw is not None and not isinstance(raw, list):
+                raise ValueError("world_lore 必须是数组")
+            session["world_lore"] = LifeSimPlugin._sanitize_lore_entries(raw)
+            changed.append(f"世界观 lore({len(session['world_lore'])} 条)")
+        if "character_lore" in body:
+            raw = body.get("character_lore")
+            if raw is not None and not isinstance(raw, dict):
+                raise ValueError("character_lore 必须是对象 {角色名: [条目]}")
+            cleaned: dict[str, list[dict]] = {}
+            for name, entries in (raw or {}).items():
+                cleaned[str(name).strip()] = LifeSimPlugin._sanitize_lore_entries(entries)
+            session["character_lore"] = {k: v for k, v in cleaned.items() if v} or {"主角": []}
+            changed.append(
+                f"角色 lore({len(session['character_lore'])} 人)"
+            )
+        return changed
+
+    @_web_handler
+    async def _web_session_update(self):
+        body = await self._web_body()
+        key = str(body.get("key") or "").strip()
+        if not key:
+            raise ValueError("缺少 key")
+        lock = self._get_sim_lock(key)
+        async with lock:
+            session = await self.sim_store.load(key)
+            if session is None:
+                return _web_error(f"会话不存在: {key}", status_code=404)
+            changed = self._apply_session_edits(session, body)
+            if not changed:
+                return _web_error("没有需要保存的字段", status_code=400)
+            await self.sim_store.save(key, session)
+        return {"ok": True, "changed": changed}
+
+    @_web_handler
+    async def _web_session_delete(self):
+        body = await self._web_body()
+        key = str(body.get("key") or "").strip()
+        if not key:
+            raise ValueError("缺少 key")
+        purge_narrative = bool(body.get("purge_narrative"))
+        lock = self._get_sim_lock(key)
+        async with lock:
+            existed = await self.sim_store.load(key) is not None
+            await self.sim_store.delete(key)
+            self.avatar_store.clear_scope(key)
+            n_branches = await self.branch_store.delete_scope(key)
+            n_records = await self.narrative_store.delete_scope(key) if purge_narrative else 0
+        if not existed and not n_branches and not n_records:
+            return _web_error(f"scope 不存在或已为空: {key}", status_code=404)
+        return {
+            "ok": True,
+            "deleted": {"session": existed, "branches": n_branches, "records": n_records},
+        }
+
+    @_web_handler
+    async def _web_messages_truncate(self):
+        """回滚消息到前 keep_messages 条,并同步修剪 turn 快照(供 WebUI 撤销轮次)。"""
+        body = await self._web_body()
+        key = str(body.get("key") or "").strip()
+        keep = int(body.get("keep_messages", -1))
+        if not key:
+            raise ValueError("缺少 key")
+        lock = self._get_sim_lock(key)
+        async with lock:
+            session = await self.sim_store.load(key)
+            if session is None:
+                return _web_error(f"会话不存在: {key}", status_code=404)
+            msgs = session.get("messages") or []
+            if not 0 <= keep < len(msgs):
+                raise ValueError(f"keep_messages 越界(当前共 {len(msgs)} 条)")
+            removed = len(msgs) - keep
+            session["messages"] = msgs[:keep]
+            turns = [
+                int(m.get("turn") or 0)
+                for m in session["messages"]
+                if isinstance(m, dict) and m.get("turn")
+            ]
+            new_turn = max(turns) if turns else 0
+            session["lore_turn"] = new_turn
+            for sk in ("lore_snapshots", "narrative_snapshots", "rpg_snapshots"):
+                snaps = session.get(sk)
+                if isinstance(snaps, list):
+                    kept = [s for s in snaps if isinstance(s, dict) and int(s.get("turn", 0) or 0) <= new_turn]
+                    session[sk] = kept
+            await self.sim_store.save(key, session)
+        return {"ok": True, "removed": removed, "kept": keep, "lore_turn": new_turn}
+
+    @_web_handler
+    async def _web_export(self, key: str = ""):
+        from .storage_base import sanitize_key
+
+        safe = sanitize_key(key)
+        path = os.path.join(self.data_dir, "sim_sessions", f"{safe}.json")
+        if not os.path.exists(path):
+            return _web_error("会话文件不存在", status_code=404)
+        return _web_file(path, filename=f"life_sim_{safe}.json", content_type="application/json")
+
+    @_web_handler
+    async def _web_narrative_list(self):
+        scope = self._web_query("scope")
+        branch = self._web_query("branch")
+        records = await self.narrative_store.list(scope, branch)
+        items = [
+            {
+                "id": r.get("id", ""),
+                "created_at": r.get("created_at", ""),
+                "summary": (r.get("summary") or "")[:200],
+                "user_action": (r.get("user_action") or "")[:120],
+                "mode": r.get("mode", ""),
+                "turn": r.get("turn", ""),
+                "revised_count": int(r.get("revised_count", 0) or 0),
+                "revised_at": r.get("revised_at", ""),
+                "narrative_len": len(r.get("narrative") or ""),
+            }
+            for r in records
+        ]
+        return {"ok": True, "records": items}
+
+    @_web_handler
+    async def _web_narrative_detail(self):
+        scope = self._web_query("scope")
+        branch = self._web_query("branch")
+        record_id = self._web_query("id")
+        record = await self.narrative_store.get(scope, record_id, branch)
+        if record is None:
+            return _web_error("剧情记录不存在", status_code=404)
+        return {
+            "ok": True,
+            "record": {
+                "id": record.get("id", ""),
+                "branch": branch,
+                "scope": scope,
+                "created_at": record.get("created_at", ""),
+                "summary": record.get("summary", ""),
+                "user_action": record.get("user_action", ""),
+                "narrative": record.get("narrative", ""),
+                "revised_at": record.get("revised_at", ""),
+                "revised_count": int(record.get("revised_count", 0) or 0),
+            },
+        }
+
+    @_web_handler
+    async def _web_narrative_update(self):
+        body = await self._web_body()
+        scope = str(body.get("scope") or "").strip()
+        record_id = str(body.get("id") or "").strip()
+        narrative = str(body.get("narrative") or "")
+        branch = str(body.get("branch") or "")
+        if not scope or not record_id:
+            raise ValueError("缺少 scope 或 id")
+        if not narrative.strip():
+            raise ValueError("剧情内容不能为空")
+        ok = await self.narrative_store.revise(scope, record_id, narrative, branch)
+        if not ok:
+            return _web_error("剧情记录不存在", status_code=404)
+        return {"ok": True}
+
+    @_web_handler
+    async def _web_narrative_delete(self):
+        body = await self._web_body()
+        scope = str(body.get("scope") or "").strip()
+        record_id = str(body.get("id") or "").strip()
+        branch = str(body.get("branch") or "")
+        if not scope or not record_id:
+            raise ValueError("缺少 scope 或 id")
+        ok = await self.narrative_store.delete(scope, record_id, branch)
+        if not ok:
+            return _web_error("剧情记录不存在", status_code=404)
+        return {"ok": True}
+
+    @_web_handler
+    async def _web_branches(self):
+        scope = self._web_query("scope")
+        data = await self.branch_store.list(scope)
+        out = []
+        for name, b in data.items():
+            scalars = {}
+            for k, v in b.items():
+                if isinstance(v, (str, int, float, bool)) and k != "name":
+                    scalars[k] = str(v)[:120]
+            out.append({"name": name, "fields": scalars})
+        return {"ok": True, "branches": out}
+
+    @_web_handler
+    async def _web_branch_delete(self):
+        body = await self._web_body()
+        scope = str(body.get("scope") or "").strip()
+        name = str(body.get("name") or "").strip()
+        if not scope or not name:
+            raise ValueError("缺少 scope 或 name")
+        ok = await self.branch_store.delete(scope, name)
+        if not ok:
+            return _web_error("分支不存在", status_code=404)
+        return {"ok": True}
+
+    @_web_handler
+    async def _web_rpg(self):
+        chars = []
+        for uid in self.rpg_store.list_chars():
+            c = self.rpg_store.load_char(uid) or {}
+            chars.append(
+                {
+                    "uid": uid,
+                    "name": c.get("name") or c.get("nickname") or c.get("char_name") or "",
+                    "level": c.get("level", ""),
+                    "hp": c.get("hp", c.get("hp_now", "")),
+                    "group_id": c.get("group_id", ""),
+                    "raw": json.dumps(c, ensure_ascii=False)[:6000],
+                }
+            )
+        sessions = []
+        for sid in self.rpg_store.list_sessions():
+            s = self.rpg_store.load_session(sid) or {}
+            sessions.append(
+                {
+                    "sid": sid,
+                    "game_system": s.get("game_system", ""),
+                    "group_id": s.get("group_id", ""),
+                    "members": s.get("members") or [],
+                    "raw": json.dumps(s, ensure_ascii=False)[:6000],
+                }
+            )
+        return {"ok": True, "chars": chars, "sessions": sessions}
+
+    @_web_handler
+    async def _web_rpg_char_delete(self):
+        body = await self._web_body()
+        uid = str(body.get("uid") or "").strip()
+        if not uid:
+            raise ValueError("缺少 uid")
+        if not self.rpg_store.delete_char(uid):
+            return _web_error("角色存档不存在", status_code=404)
+        return {"ok": True}
+
+    @_web_handler
+    async def _web_rpg_session_delete(self):
+        body = await self._web_body()
+        sid = str(body.get("sid") or "").strip()
+        if not sid:
+            raise ValueError("缺少 sid")
+        if not self.rpg_store.delete_session(sid):
+            return _web_error("会话存档不存在", status_code=404)
+        return {"ok": True}
 
     def _extract_after_cmd(
         self, event: AstrMessageEvent, cmds: str | tuple[str, ...] | list[str]
