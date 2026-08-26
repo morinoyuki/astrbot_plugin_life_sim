@@ -58,6 +58,12 @@ from .prompts import (
 )
 from .rpg_tools import RPGMixin
 from .storage_branch import BranchStore
+
+try:  # AstrBot ≥ 4.x 提供图片压缩工具;旧版缺失时优雅降级为不压缩
+    from astrbot.core.utils.media_utils import compress_image
+except ImportError:  # pragma: no cover
+    compress_image = None
+
 from .storage_narrative import NarrativeStore
 from .storage_rpg import RpgStore
 from .storage_sim import SimStore
@@ -383,6 +389,31 @@ async def _extract_image(event: AstrMessageEvent) -> list[Image]:
     return images
 
 
+# 图片转述默认提示词(主模型不支持多模态时,由转述模型把图变成文字注入剧情)
+_DEFAULT_IMG_DESC_PROMPT = (
+    "请客观、详细地描述图片内容,供后续剧情生成使用:画面主体与场景环境;"
+    "出场人物的外貌(发色/发型/瞳色/服饰/表情/动作);画面中出现的文字;"
+    "整体画风与氛围。不要评价图片质量,只输出描述本身。"
+)
+
+
+def _provider_allows_image(prov) -> bool:
+    """判定 provider 是否接受图片输入(AstrBot 同款约定):
+
+    - modalities 未配置(None / [])→ 视为支持全部模态(向后兼容);
+    - 显式配置为列表 → 必须包含 "image" 才算支持多模态。
+    """
+    try:
+        modalities = prov.provider_config.get("modalities", None)
+    except AttributeError:
+        return True
+    return (not modalities) or (isinstance(modalities, list) and "image" in modalities)
+
+
+def _build_img_desc_tag(text: str) -> str:
+    return f"<Image Description>\n{text}\n</Image Description>"
+
+
 async def _extract_image_with_quoted(event: AstrMessageEvent) -> list[Image]:
     """取图片,当前消息无图时回退到**引用消息**的图片。
 
@@ -604,6 +635,7 @@ def _resolve_rpg_snapshot(session: dict, snapshot: dict) -> dict:
                 body["scope"] = scope
             return body
     return dict(snapshot)
+
 
 def _narrative_branch(session: dict | None) -> str:
     """从会话取当前剧情线(分支)名;空 = 主线(history.json)。
@@ -854,10 +886,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             "但你能从名单中判断出对应哪一张 → 必须加 `av` 属性显式指定。"
             "判断依据:头像名是对白名的子串(如对白「小龟」↔ 名单「龟」)、"
             "对白名是头像名的省略(如「小亚」↔「汐见小亚」)、或语义上明显同一人。"
-            "\n   例:名单里有「龟」而对白叫它「小龟」 → `<d name=\"小龟\" av=\"龟\">主人你回来啦~</d>`"
+            '\n   例:名单里有「龟」而对白叫它「小龟」 → `<d name="小龟" av="龟">主人你回来啦~</d>`'
             " —— 气泡显示「小龟」,头像用「龟」;"
             "\n3. **自选借用**:让任意角色使用名单中某张头像(即使两者毫无关系),"
-            "同样用 `av`,如 `<d name=\"阴影少女\" av=\"汐见小亚\">你是谁?</d>`;"
+            '同样用 `av`,如 `<d name="阴影少女" av="汐见小亚">你是谁?</d>`;'
             "\n4. **确实无关**:与名单所有项都对不上 → 正常写 name,不要硬套 `av`,也不要使用名单以外的头像名。"
             "\n注意:`av` 后面的头像名必须是名单中的原文,不可自创;宁可多写 `av` 也不要让名字出入的头像匹配失败。"
             "\n可用头像名单：" + lines + "\n"
@@ -1359,9 +1391,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             if self._cfg("record_llm_stats", True):
                 status = "error" if errored else "completed"
                 try:
-                    await self._flush_llm_provider_stat(
-                        event, provider_id, ctx, status
-                    )
+                    await self._flush_llm_provider_stat(event, provider_id, ctx, status)
                 except Exception as e:
                     logger.debug(f"life-sim: 写入 LLM 用量统计失败(不影响功能): {e}")
 
@@ -1408,6 +1438,171 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             agent_type="internal",
         )
 
+    # ════════════════════════════════════════════════
+    # 图片预处理:压缩 → 多模态检测 → 不支持时用转述模型
+    # ════════════════════════════════════════════════
+
+    async def _compress_imgs(
+        self, event: AstrMessageEvent, imgs: list[Image]
+    ) -> list[Image]:
+        """把每张图统一落到本地文件并按配置压缩(等比缩放 + 重编码)。
+
+        - 压缩失败/无需压缩的图保留原样,绝不因压缩失败阻断叙事;
+        - 压缩产物是临时文件,登记到 event 以便框架统一回收;
+        - 动图(GIF)由 compress_image 内部跳过,保持原样。
+        """
+        if compress_image is None:
+            logger.debug("life-sim: 当前 AstrBot 无 compress_image,跳过图片压缩")
+            return imgs
+        if not self._cfg("image_compress_enable", True):
+            return imgs
+        try:
+            max_size = max(64, min(8192, int(self._cfg("image_max_size", 1280))))
+            quality = max(1, min(100, int(self._cfg("image_quality", 90))))
+        except (TypeError, ValueError):
+            max_size, quality = 1280, 90
+
+        out: list[Image] = []
+        for img in imgs:
+            try:
+                src_path = await img.convert_to_file_path()
+                compressed = await compress_image(
+                    src_path, max_size=max_size, quality=quality
+                )
+                if compressed and compressed != src_path and os.path.exists(compressed):
+                    out.append(Image.fromFileSystem(compressed))
+                    try:
+                        event.track_temporary_local_file(compressed)
+                    except AttributeError:
+                        pass  # 旧版 AstrBot 无此接口,临时文件交给系统清理
+                    logger.debug(f"life-sim: 图片已压缩 {src_path} -> {compressed}")
+                else:
+                    out.append(img)  # 无需压缩或压缩被跳过(GIF/过小图)
+            except Exception as e:
+                logger.warning(f"life-sim: 图片压缩失败,使用原图: {e}")
+                out.append(img)
+        return out
+
+    async def _get_img_desc_provider(self):
+        """选图片转述 provider。优先级:插件配置 > AstrBot 系统默认转述模型。
+
+        返回 (provider 实例 | None, provider_id),未配置时返回 (None, "")。
+        """
+        pid = str(self._cfg("img_desc_provider_id", "") or "").strip()
+        source = "插件配置"
+        if not pid:
+            try:
+                ps = self.context.get_config().get("provider_settings", {}) or {}
+                pid = str(ps.get("default_image_caption_provider_id", "") or "").strip()
+            except Exception as e:
+                logger.debug(f"life-sim: 读取系统默认图片转述模型失败: {e}")
+                pid = ""
+            source = "系统默认"
+        if not pid:
+            return None, ""
+        try:
+            prov = await self.context.provider_manager.get_provider_by_id(pid)
+        except Exception as e:
+            prov = None
+            logger.warning(f"life-sim: 获取图片转述模型 {pid} 失败: {e}")
+        if prov is None:
+            logger.warning(f"life-sim: 图片转述模型不存在({source}: {pid}),请检查配置")
+            return None, ""
+        return prov, pid
+
+    async def _caption_images(self, event, prov, desc_pid, imgs) -> str:
+        """调用转述模型把本轮全部图片转成一段文字描述。
+
+        单次调用带全部图(常见就一张);失败抛异常由上层兜底。
+        """
+        urls: list[str] = []
+        for img in imgs:
+            try:
+                p = await img.convert_to_file_path()
+                if p:
+                    urls.append(p)
+            except Exception as e:
+                logger.warning(f"life-sim: 转述前解析图片路径失败,跳过该图: {e}")
+        if not urls:
+            return ""
+        prompt = (
+            str(self._cfg("img_desc_prompt", "") or "").strip()
+            or _DEFAULT_IMG_DESC_PROMPT
+        )
+        llm_resp = await self._run_llm_with_stats(
+            event,
+            desc_pid,
+            lambda: prov.text_chat(prompt=prompt, image_urls=urls),
+        )
+        return (getattr(llm_resp, "completion_text", "") or "").strip()
+
+    async def _prepare_images(
+        self,
+        event: AstrMessageEvent,
+        provider_id: str,
+        imgs: list[Image] | None,
+    ) -> tuple[list[Image], str]:
+        """图片进入 LLM 前的统一入口(被 /创建 /do /redo 的 _generate 共用):
+
+        1. 先压缩(image_compress_enable / image_max_size / image_quality);
+        2. 检测主模型是否支持图片输入(modalities 未配置视为支持);
+        3. 不支持时改走「图片转述」:插件 img_desc_provider_id 或 AstrBot 系统默认
+           转述模型把图变成 <Image Description> 文字块,追加到本轮 user 输入;
+           两处都未配置则只注入占位提示,避免非多模态模型收到 image part 报错。
+
+        返回 (处理后的 imgs, 需追加到 user_input 的文字)。不支持多模态时 imgs 置空,
+        下游不再传 image_urls、消息历史也不落 base64(省 KV 且对纯文本模型安全)。
+        """
+        if not imgs:
+            return [], ""
+
+        # ── 1) 压缩(两种通道都受益:直传给视觉模型 / 交给转述模型)──
+        imgs = await self._compress_imgs(event, list(imgs))
+
+        # ── 2) 主模型多模态能力检测 ──
+        main_prov = None
+        try:
+            main_prov = await self.context.provider_manager.get_provider_by_id(
+                provider_id
+            )
+        except Exception as e:
+            logger.debug(f"life-sim: 获取主 provider 实例失败(跳过多模态检测): {e}")
+        if main_prov is None or _provider_allows_image(main_prov):
+            return imgs, ""
+
+        n_imgs = len(imgs)
+        plural = f"{n_imgs} 张图片" if n_imgs > 1 else "1 张图片"
+
+        # ── 3a) 走转述模型 ──
+        desc_prov, desc_pid = await self._get_img_desc_provider()
+        if desc_prov is not None:
+            try:
+                caption = await self._caption_images(event, desc_prov, desc_pid, imgs)
+            except Exception as e:
+                caption = ""
+                logger.error(f"life-sim: 图片转述失败({desc_pid}): {e}")
+            if caption:
+                logger.info(
+                    f"life-sim: 主模型不支持图片输入,已用转述模型 {desc_pid} "
+                    f"处理 {plural}"
+                )
+                return [], "\n\n" + _build_img_desc_tag(caption)
+            logger.warning(
+                f"life-sim: 图片转述无输出(模型 {desc_pid}),本轮以占位提示替代"
+            )
+
+        # ── 3b) 兜底:无可用转述模型 → 占位提示,丢弃原图 ──
+        note = (
+            f"[用户发送了{plural},但当前叙事模型不支持图片输入"
+            + (
+                ",且未配置图片转述模型(img_desc_provider_id 或 AstrBot 默认转述模型)"
+                if desc_prov is None
+                else ",转述失败"
+            )
+            + "]"
+        )
+        return [], f"\n\n<image_note>{note}</image_note>"
+
     async def _generate(
         self,
         event: AstrMessageEvent,
@@ -1419,6 +1614,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         provider_id, err = await self._get_provider_id(event, mode)
         if err:
             return err
+
+        # 图片预处理:压缩 → 多模态检测 → 不支持时转述为文字(追加到本轮输入)
+        imgs, img_desc_text = await self._prepare_images(event, provider_id, imgs)
+        if img_desc_text:
+            user_input += img_desc_text
 
         # 为本轮开一个 staging 槽位:工具 handler 写到 self._pending_lore[event_key],
         # 本函数末尾统一合并到 session 并落库(成功路径)。失败路径在 finally 释放。
@@ -1470,9 +1670,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         # 却按 lore_turn 倒推目标轮,导致目标轮偏晚、剧情历史只删了一条。
         # 现在:RPG 快照内容(存档文件会被本轮工具就地修改)必须在调用前抓取;
         # lore / 剧情历史快照与 turn 递增移到 LLM 成功后统一提交(见下)。
-        rpg_capture = (
-            self._rpg_snapshot(event, mode) if mode in ("B", "C") else None
-        )
+        rpg_capture = self._rpg_snapshot(event, mode) if mode in ("B", "C") else None
 
         contexts = bind_checkpoint_messages(messages)
 
@@ -2245,9 +2443,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                     content = content[:max_content_chars] + "…"
                 line = f"{indent}[#{seq} | {ts}] **{sec}** — {content}"
                 if sec != prev_section and sec in hard_sections:
-                    warn = (
-                        f"{indent}> 🔒 **「{sec}」为硬性约束 — 发色/瞳色/服装/配饰等严禁凭印象脑补,叙事必须照写。**"
-                    )
+                    warn = f"{indent}> 🔒 **「{sec}」为硬性约束 — 发色/瞳色/服装/配饰等严禁凭印象脑补,叙事必须照写。**"
                     if max_total_chars and total_chars + len(warn) > max_total_chars:
                         truncated = True
                         break
@@ -2264,7 +2460,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         # 截断提示:内容过长时告知总条数与已显示条数
         if truncated:
             all_ = sum(len(g) for g in groups.values())
-            lines.append(f"{indent}…(内容过长,已截断,共 {all_} 条,显示 {len(lines)} 条)")
+            lines.append(
+                f"{indent}…(内容过长,已截断,共 {all_} 条,显示 {len(lines)} 条)"
+            )
         return lines
 
     async def life_sim_save_world_lore(
@@ -2447,7 +2645,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 "revised_at": existing.get("revised_at", ""),
             }
 
-        ok = await self.narrative_store.revise(scope, resolved_id, narrative, branch=branch)
+        ok = await self.narrative_store.revise(
+            scope, resolved_id, narrative, branch=branch
+        )
         if ok:
             # 标记本轮已 revise — 避免 _auto_record_narrative 把修订后的
             # 文本再次当成"新一轮"记录,造成内容几乎相同的重复记录
@@ -2483,7 +2683,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 yield event.plain_result("📭 还没有设置任何头像")
             else:
                 yield event.plain_result(
-                    "已设置头像:\n" + "\n".join(f"• {n}" for n in names)
+                    "已设置头像:\n"
+                    + "\n".join(f"• {n}" for n in names)
                     + f"\n💡 共 {len(names)} 个, `/头像 查看 <角色名>` 看具体图片"
                 )
             return
@@ -2894,7 +3095,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         # 老会话(无 turn 戳)用快照指纹推断(见 _legacy_rollback_target_turn),
         # 仍无法推断才按 lore_turn 倒推(旧行为)。
         stamped_turn = cut_msg.get("turn") if isinstance(cut_msg, dict) else None
-        if isinstance(stamped_turn, int) and not isinstance(stamped_turn, bool) and stamped_turn >= 1:
+        if (
+            isinstance(stamped_turn, int)
+            and not isinstance(stamped_turn, bool)
+            and stamped_turn >= 1
+        ):
             target_turn = stamped_turn
         else:
             target_turn = self._legacy_rollback_target_turn(
@@ -3033,7 +3238,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 continue
             vi = s.get("version")
             lore_by_turn[s["turn"]] = (
-                ("v", vi) if isinstance(vi, int)
+                ("v", vi)
+                if isinstance(vi, int)
                 else (_j(s.get("world_lore")), _j(s.get("character_lore")))
             )
         rpg_by_turn: dict = {}
@@ -3042,7 +3248,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 continue
             vi = s.get("version")
             rpg_by_turn[s["turn"]] = (
-                ("v", vi) if isinstance(vi, int)
+                ("v", vi)
+                if isinstance(vi, int)
                 else _j({k: s.get(k) for k in ("chars", "sessions") if k in s})
             )
 
@@ -3263,9 +3470,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
         scope = self._sim_session_key(event)
         session = await self._load_sim(event)
-        records = await self.narrative_store.list(
-            scope, _narrative_branch(session)
-        )
+        records = await self.narrative_store.list(scope, _narrative_branch(session))
         if not records:
             yield event.plain_result("📭 当前会话暂无剧情历史(每轮 /do 输出会自动记录)")
             return
@@ -3322,9 +3527,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             )
             scope_label = "all"
         else:
-            records = await self.narrative_store.list(
-                scope, _narrative_branch(session)
-            )
+            records = await self.narrative_store.list(scope, _narrative_branch(session))
             scope_label = scope
 
         if not records:

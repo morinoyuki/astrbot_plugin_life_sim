@@ -112,7 +112,7 @@
 
 ## 配置
 
-WebUI → 插件管理 → 转生模拟器 → 配置,共 25 项:
+WebUI → 插件管理 → 转生模拟器 → 配置,共 30 项:
 
 ### 模型路由
 
@@ -124,6 +124,7 @@ WebUI → 插件管理 → 转生模拟器 → 配置,共 25 项:
 | `provider_mode_c`         | `""` | 模式 C 专属 — 推荐能力强模型                    |
 | `compress_provider_id`    | `""` | 压缩任务专用 — 路由到便宜模型省成本             |
 | `mode_detect_provider_id` | `""` | 模式识别专用 — 路由到便宜分类模型               |
+| `img_desc_provider_id`    | `""` | 图片转述专用 — 主模型不支持多模态时用它把图变文字;留空用 AstrBot 系统默认转述模型 |
 
 优先级(每个字段):`field 专属 > provider_id > 会话默认(provider_id 空时)`
 
@@ -136,6 +137,16 @@ WebUI → 插件管理 → 转生模拟器 → 配置,共 25 项:
 | `max_history_chars`  | 60000 | —      | 叙事历史最大字符数,超过时压缩成摘要 |
 | `keep_tail_messages` | 20    | —      | 压缩后保留的最近消息条数            |
 | `lore_active_rounds` | 6     | —      | 活跃角色检测窗口(轮)              |
+| `image_max_size`     | 1280  | 64-8192| 图片压缩后最长边(px),仅超限时缩放   |
+| `image_quality`      | 90    | 1-100  | JPEG 压缩质量(透明图不受影响)        |
+
+### 图片处理
+
+`/创建`、`/do`(含 `/redo`)传入图片时统一走以下管线:
+
+1. **先压缩**(`image_compress_enable`,默认开):等比缩放到最长边 `image_max_size` 并重编码(JPEG 质量 `image_quality`;透明图保持 PNG;GIF 动图跳过),大幅降低多模态 token 与上传耗时。压缩失败自动回退原图;
+2. **多模态检测**:主模型的 `modalities` 未配置视为支持;显式配置且不含 `image` 时判定为不支持;
+3. **不支持时自动转述**:改调「图片转述专用模型」(插件 `img_desc_provider_id` > AstrBot 系统设置「默认图片转述模型」)把图片描述为 `<Image Description>` 文字注入本轮剧情上下文,消息历史也不再落 base64(省存储);两者都未配置时仅注入占位提示。
 
 ### 开关
 
@@ -144,6 +155,8 @@ WebUI → 插件管理 → 转生模拟器 → 配置,共 25 项:
 | `use_llm_compress`       | `true`  | 关闭则用纯规则抽取标题与世界观(快但粗)                                     |
 | `use_llm_mode_detect`    | `true`  | 关闭则只用关键词匹配(快但简陋)                                             |
 | `record_llm_stats`       | `true`  | 上报 LLM 用量到系统数据统计                                                 |
+| `image_compress_enable`  | `true`  | 图片先压缩再发给 LLM(见「图片处理」)                                       |
+| `img_desc_prompt`        | `""`     | 图片转述提示词(留空用内置:侧重人物外观/服饰/场景细节)                     |
 | `lore_selective_load`    | `true`  | 选择性加载 lore(默认开,减少 system prompt 占用,见「持久化 lore」)         |
 | `output_as_image`        | `false` | 开启后 `/创建` `/do` 的叙事输出自动渲染为图片(失败自动回退纯文本)           |
 | `output_image_style_path`| `""`     | pillowmd 模板样式目录;样式带 `page>0` 多帧动画背景时输出 GIF(如独角兽gif)  |

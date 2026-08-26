@@ -27,6 +27,37 @@
     "hint": "可选覆盖。规则多 + 掷骰多,推荐能力强的模型",
     "default": ""
   },
+  "image_compress_enable": {
+    "description": "图片先压缩再发给模型(默认开)",
+    "type": "bool",
+    "hint": "/创建、/do 收到图片时,先等比缩放 + 重编码(JPEG/PNG),再传给 LLM。大幅降低多模态 token 消耗与上传耗时;压缩失败自动回退原图。动图(GIF)跳过压缩保持原样",
+    "default": true
+  },
+  "image_max_size": {
+    "description": "图片压缩后最长边(px)",
+    "type": "int",
+    "hint": "等比缩放的最长边像素上限,超过才缩放。默认 1280(与 AstrBot 内置压缩一致)。范围 64-8192",
+    "default": 1280
+  },
+  "image_quality": {
+    "description": "JPEG 压缩质量(1-100)",
+    "type": "int",
+    "hint": "重编码质量,越低文件越小。默认 90。透明图(PNG)不受此项影响",
+    "default": 90
+  },
+  "img_desc_provider_id": {
+    "description": "图片转述专用模型(主模型不支持多模态时用)",
+    "type": "string",
+    "_special": "select_provider",
+    "hint": "当叙事主模型不支持图片输入(modalities 未勾选 image)时,/创建、/do 的图片会先经此模型转述为文字描述再注入剧情上下文。留空则使用 AstrBot 系统设置里的「默认图片转述模型」(provider_settings.default_image_caption_provider_id);两者都未配置时图片仅以占位提示告知模型",
+    "default": ""
+  },
+  "img_desc_prompt": {
+    "description": "图片转述提示词(可选)",
+    "type": "string",
+    "hint": "调用图片转述模型时使用的提示词。留空用内置提示词(侧重人物外观/服饰/场景细节,便于剧情延续)",
+    "default": ""
+  },
   "tool_max_steps": {
     "description": "模式 B/C 单次 LLM 调用最大工具步数",
     "type": "int",
