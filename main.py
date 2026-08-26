@@ -1693,20 +1693,45 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         self._cached_tool_set = tool_set
         return tool_set
 
+    @staticmethod
+    def _split_tail_by_turns(messages: list, keep_turns: int) -> tuple[list, list]:
+        """按「用户输入 = 一轮」从尾部切出最近 keep_turns 轮,返回 (head, tail)。
+
+        - 一轮 = 该用户消息 + 其后所有 assistant 回复 / tool 结果 / 中间步骤,
+          即切分边界永远落在真实用户消息上;
+        - `_summary` 标记的合成消息(旧压缩产物)不算用户输入,归入 head
+          参与下次重新摘要;
+        - 历史里没有任何真实用户输入时返回 ([], 全部),避免误删。
+        """
+        tail_start = None
+        seen = 0
+        for idx in range(len(messages) - 1, -1, -1):
+            m = messages[idx]
+            if not isinstance(m, dict) or m.get("_summary"):
+                continue
+            if str(m.get("role")) == "user":
+                seen += 1
+                if seen >= max(1, keep_turns):
+                    tail_start = idx
+                    break
+        if tail_start is None:
+            return [], list(messages)
+        return list(messages[:tail_start]), list(messages[tail_start:])
+
     async def _compress_history(self, messages: list, event=None) -> list:
         """压缩叙事历史:
-        - 总长 ≤ max_history_chars 或 messages ≤ keep_tail_messages → 原样返回
-        - 否则把前面的消息压缩为一段【叙事历史摘要】(优先 LLM,失败回退规则抽取),保留尾部 keep_tail 条原文
+        - 总长 ≤ max_history_chars 或「用户输入轮数」≤ keep_tail_messages → 原样返回
+        - 否则把前面的消息压缩为一段【叙事历史摘要】(优先 LLM,失败回退规则抽取),
+          尾部保留最近 keep_tail_messages **轮**原文 —— 以用户输入计一轮,
+          该轮的回复与工具调用随所属用户消息一起保留/压缩(不再按消息条数切分)。
         下次压缩时,旧摘要会被纳入"前面",重新生成新摘要 — 摘要不会无限增长。
         """
         max_chars = int(self._cfg("max_history_chars", 60000))
-        keep_tail = int(self._cfg("keep_tail_messages", 20))
+        keep_tail = int(self._cfg("keep_tail_messages", 10))
         total = sum(len(_content_to_text(m.get("content"))) for m in messages)
-        if total <= max_chars or len(messages) <= keep_tail:
+        head, tail = self._split_tail_by_turns(messages, keep_tail)
+        if not head or total <= max_chars:
             return messages
-
-        head = messages[:-keep_tail]
-        tail = list(messages[-keep_tail:])
 
         use_llm = bool(self._cfg("use_llm_compress", True))
         summary_text = None

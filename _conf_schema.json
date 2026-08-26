@@ -73,14 +73,14 @@
   "max_history_chars": {
     "description": "叙事历史最大字符数",
     "type": "int",
-    "hint": "超过此长度时,前面的消息会压缩为【叙事历史摘要】,仅保留最近 keep_tail_messages 条原文。默认 60000",
+    "hint": "超过此长度时,前面的消息会压缩为【叙事历史摘要】,仅保留最近 keep_tail_messages 轮原文。默认 60000",
     "default": 60000
   },
   "keep_tail_messages": {
-    "description": "压缩后保留的最近消息条数",
+    "description": "压缩后保留的最近轮数(以用户输入计)",
     "type": "int",
-    "hint": "默认 20。建议保持偶数 (user + assistant 算一对)",
-    "default": 20
+    "hint": "一次 /do 用户输入算一轮(其后的回复与工具调用随属同轮)。超长时保留最近 N 轮原文,更早内容压缩为摘要。默认 10。注意 v1.1 起单位已由「条」改为「轮」,升级后如觉得上下文变多/变少可适当调整",
+    "default": 10
   },
   "use_llm_compress": {
     "description": "历史压缩使用 LLM(默认开)",
