@@ -59,7 +59,7 @@ from .prompts import (
     _parse_mode_prefix,
 )
 from .rpg_tools import RPGMixin
-from .storage_base import list_json_stems
+from .storage_base import list_json_stems, write_json_atomic
 from .storage_branch import BranchStore
 
 try:  # AstrBot ≥ 4.x 提供图片压缩工具;旧版缺失时优雅降级为不压缩
@@ -1107,6 +1107,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             (f"{base}/api/rpg", self._web_rpg, ["GET"], "RPG 存档列表"),
             (f"{base}/api/rpg/char/delete", self._web_rpg_char_delete, ["POST"], "删除 RPG 角色存档"),
             (f"{base}/api/rpg/session/delete", self._web_rpg_session_delete, ["POST"], "删除 RPG 会话存档"),
+            (f"{base}/api/memory", self._web_memory_list, ["GET"], "向量记忆列表"),
+            (f"{base}/api/memory/delete", self._web_memory_delete, ["POST"], "删除向量记忆"),
+            (f"{base}/api/memory/export", self._web_memory_export, ["GET"], "导出向量记忆"),
         )
         for route, handler, methods, desc in routes:
             try:
@@ -1131,6 +1134,25 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 return _web_error("内部错误,请查看日志", status_code=500)
 
         return wrapper
+
+    @staticmethod
+    def _count_memory_entries(mem_dir: str) -> int:
+        """统计向量记忆目录下所有文件的条目数(在线程池中调用)。"""
+        total = 0
+        if not os.path.isdir(mem_dir):
+            return 0
+        import json as _json
+
+        for fname in os.listdir(mem_dir):
+            if not fname.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(mem_dir, fname), "r", encoding="utf-8") as f:
+                    data = _json.load(f)
+                total += len(data.get("entries") or [])
+            except Exception:
+                pass
+        return total
 
     # ── web 公共小工具 ───────────────────────────────────────────
 
@@ -1225,6 +1247,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         narr_dir = os.path.join(d, "narrative_history")
         br_dir = os.path.join(d, "sim_branches")
         avatars_dir = os.path.join(d, "avatars")
+        mem_dir = os.path.join(d, "vector_memory")
 
         loop = asyncio.get_running_loop()
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -1232,10 +1255,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             narr_f = loop.run_in_executor(pool, self._dir_stats, narr_dir)
             br_f = loop.run_in_executor(pool, self._dir_stats, br_dir)
             av_f = loop.run_in_executor(pool, self._dir_stats, avatars_dir)
+            mem_f = loop.run_in_executor(pool, self._dir_stats, mem_dir)
+            memcnt_f = loop.run_in_executor(pool, self._count_memory_entries, mem_dir)
             sim_files, sim_size = await sim_f
             narr_files, narr_size = await narr_f
             br_files, br_size = await br_f
             av_files, _ = await av_f
+            mem_files, mem_size = await mem_f
+            mem_entries = await memcnt_f
 
         scopes = set(list_json_stems(sim_dir))
         if os.path.isdir(narr_dir):
@@ -1259,6 +1286,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             "branches": {"files": br_files, "size": br_size},
             "rpg": {"chars": rpg_chars, "sessions": rpg_sessions},
             "avatars": {"files": av_files},
+            "memory": {"files": mem_files, "size": mem_size, "entries": mem_entries},
             "scope_count": len(scopes),
         }
 
@@ -1608,6 +1636,118 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         if not self.rpg_store.delete_session(sid):
             return _web_error("会话存档不存在", status_code=404)
         return {"ok": True}
+
+    @_web_handler
+    async def _web_memory_list(self):
+        """向量记忆列表:按 scope 分组展示全部记忆条目(供后台管理)。"""
+        scopes = []
+        mem_dir = os.path.join(self.data_dir, "vector_memory")
+        if os.path.isdir(mem_dir):
+            for fname in sorted(os.listdir(mem_dir)):
+                if not fname.endswith(".json"):
+                    continue
+                key = fname[:-5]
+                entries = await self.memory_store.recent(key, 100000)  # 全量
+                scopes.append({
+                    "scope": key,
+                    "count": len(entries),
+                    "embed_source": self.memory_store.embed_source,
+                    "entries": [
+                        {
+                            "id": e.get("id"),
+                            "content": e.get("content"),
+                            "turn": e.get("turn"),
+                            "importance": e.get("importance", 1),
+                            "created_at": e.get("created_at"),
+                        }
+                        for e in entries
+                    ],
+                })
+        return {"ok": True, "scopes": scopes}
+
+    @_web_handler
+    async def _web_memory_delete(self):
+        """删除向量记忆:scope 全删 / 按 id 单删 / 按关键字批量删。"""
+        body = await self._web_body()
+        scope = str(body.get("scope") or "").strip()
+        if not scope:
+            raise ValueError("缺少 scope")
+
+        mode = str(body.get("mode") or "all")
+        ids = body.get("ids") or []
+        keyword = str(body.get("keyword") or "").strip()
+        if not isinstance(ids, list):
+            ids = []
+        idset = {str(x) for x in ids if x}
+
+        if mode == "ids" and idset:
+            removed = await self.memory_store.delete_entries_by_id(scope, list(idset))
+            return {"ok": True, "removed": removed}
+
+        entries = await self.memory_store.recent(scope, 100000)
+        if mode == "keyword" and keyword:
+            kw = keyword.lower()
+            remaining = [
+                e
+                for e in entries
+                if kw not in str(e.get("content") or "").lower()
+            ]
+            removed = len(entries) - len(remaining)
+            if removed:
+                await self.memory_store.replace_entries(scope, remaining)
+            return {"ok": True, "removed": removed}
+
+        # all:清空该 scope
+        removed = await self.memory_store.delete_scope(scope)
+        return {"ok": True, "removed": removed}
+
+    @_web_handler
+    async def _web_memory_export(self):
+        """导出向量记忆为 JSON 文件。"""
+        scope = self._web_query("scope", "")
+        if not scope:
+            raise ValueError("缺少 scope")
+        entries = await self.memory_store.recent(scope, 100000)
+        cnt = len(entries)
+        if not entries:
+            raise ValueError("该 scope 没有记忆")
+
+        import tempfile
+
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="lsim_mem_")
+        os.close(fd)
+        try:
+            payload = {
+                "_meta": {
+                    "format": "vector_memory",
+                    "format_version": 1,
+                    "scope": scope,
+                    "record_count": cnt,
+                    "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "embed_source": self.memory_store.embed_source,
+                },
+                "entries": [
+                    {
+                        "id": e.get("id"),
+                        "content": e.get("content"),
+                        "turn": e.get("turn"),
+                        "importance": e.get("importance", 1),
+                        "created_at": e.get("created_at"),
+                    }
+                    for e in entries
+                ],
+            }
+            await asyncio.to_thread(lambda: write_json_atomic(path, payload))
+        except Exception as e:
+            logger.warning(f"life-sim: 导出向量记忆失败: {e}")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return _web_error("导出失败,请查看日志", status_code=500)
+
+        safe = scope.replace("/", "_").replace("\\", "_")
+        return _web_file(path, filename=f"life_sim_memory_{safe}.json", content_type="application/json")
 
     def _extract_after_cmd(
         self, event: AstrMessageEvent, cmds: str | tuple[str, ...] | list[str]
@@ -3898,6 +4038,17 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
         session["messages"] = messages
 
+        # 回滚向量记忆:删除 turn > target_turn 的记忆(被撤销轮次产生的剧情记忆)。
+        # 与 lore/RPG/剧情历史同一步骤同步回滚,避免 /undo 后残留被否定的未来记忆。
+        mem_removed = 0
+        if self._cfg("memory_enable", True):
+            try:
+                mem_removed = await self.memory_store.delete_entries_after_turn(
+                    scope, target_turn
+                )
+            except Exception as e:
+                logger.debug(f"life-sim: 回滚向量记忆失败(跳过): {e}")
+
         # 统计(给展示用)
         _resolved_lore = (
             _resolve_snapshot_lore(session, target_snapshot)
@@ -3920,6 +4071,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             },
             "rpg_stats": rpg_stats,
             "narr_stats": narr_stats,
+            "mem_removed": mem_removed,
             "remaining_narr": len(
                 await self.narrative_store.list(scope, _narrative_branch(session))
             ),
@@ -4107,6 +4259,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 lines.append("   📖 剧情历史已回滚(无变化)")
         else:
             lines.append("   ⚠️ 未找到该 turn 的剧情快照(剧情历史未回滚)")
+        if stats.get("mem_removed"):
+            lines.append(f"   🧠 向量记忆已删除 {stats['mem_removed']} 条")
+        # 预览被撤销的最后一个 user 输入(去掉 <system_reminder>、<Quoted Message> 等标签)
         # 预览被撤销的最后一个 user 输入(去掉 <system_reminder>、<Quoted Message> 等标签)
         last_user = next(
             (m for m in reversed(removed) if m.get("role") == "user"), None

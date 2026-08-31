@@ -100,6 +100,72 @@ async def main():
     assert mid is not None
     h = await store.search(scope, "provider 故障回退")
     assert h
+
+    # 8. 删除管理接口
+    # 准备数据
+    await store.delete_scope(scope)
+    id_a = await store.add(scope, "勇者救下少女", turn=1, importance=3)
+    id_b = await store.add(scope, "勇者击败魔王", turn=2, importance=2)
+    id_c = await store.add(scope, "商店里买了几瓶药水", turn=3, importance=1)
+    assert await store.count(scope) == 3
+
+    # 按 id 删除:删 b
+    removed = await store.delete_entries_by_id(scope, [id_b])
+    assert removed == 1
+    assert await store.count(scope) == 2
+    entries = await store.recent(scope, 100)
+    ids = {e["id"] for e in entries}
+    assert id_b not in ids and id_a in ids and id_c in ids
+
+    # 按关键字删除(模拟 keyword 模式逻辑)
+    entries = await store.recent(scope, 100)
+    kw = "少女"
+    remaining = [e for e in entries if kw not in e["content"]]
+    expect_remove = len(entries) - len(remaining)
+    await store.replace_entries(scope, remaining)
+    assert expect_remove == 1
+    after = await store.recent(scope, 100)
+    assert len(after) == 1 and "少女" not in after[0]["content"]
+
+    # 清空
+    removed = await store.delete_scope(scope)
+    assert removed == 1 and await store.count(scope) == 0
+
+    # 9. /undo 回滚:按 turn 删除
+    await store.add(scope, "童年发现剑冢", turn=5, importance=2)
+    await store.add(scope, "少年拜师学剑", turn=8, importance=2)
+    await store.add(scope, "青年夺得比武冠军", turn=12, importance=3)
+    assert await store.count(scope) == 3
+    # 回滚到 turn=8:删除 turn>8 的记忆(即 turn=12 那条)
+    removed = await store.delete_entries_after_turn(scope, 8)
+    assert removed == 1
+    entries = await store.recent(scope, 100)
+    turns = {e.get("turn") for e in entries}
+    assert turns == {5, 8}, turns
+    # 回滚到 turn=5:再删 turn>5 的(即 turn=8 那条)
+    removed = await store.delete_entries_after_turn(scope, 5)
+    assert removed == 1
+    entries = await store.recent(scope, 100)
+    turns = {e.get("turn") for e in entries}
+    assert turns == {5}, turns
+    # 回滚到 turn=5(无变化)
+    removed = await store.delete_entries_after_turn(scope, 5)
+    assert removed == 0
+    await store.delete_scope(scope)
+
+    # 10. 多步回滚 /undo 4:一次删除连续 4 轮产生的记忆
+    # 模拟连续 4 轮成功 /do,每轮各存一条(turn=1,2,3,4)
+    for t in range(1, 5):
+        await store.add(scope, f"第{t}轮发生的剧情事件内容", turn=t, importance=1)
+    # 另加一条手动 memorize(重要度 3,也属 turn 4)
+    await store.add(scope, "关键伏笔:某组织的秘密", turn=4, importance=3)
+    assert await store.count(scope) == 5
+    # undo 4:回滚到 target_turn=1,应删掉 turn>1 的全部 4 条(含 turn4 的两条)
+    removed = await store.delete_entries_after_turn(scope, 1)
+    assert removed == 4, removed
+    entries = await store.recent(scope, 100)
+    turns = sorted(e.get("turn") for e in entries)
+    assert turns == [1], turns
     await store.delete_scope(scope)
 
     print("✅ 全部通过")

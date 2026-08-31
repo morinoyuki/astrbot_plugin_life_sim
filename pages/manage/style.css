@@ -56,6 +56,10 @@ main { padding: 14px 16px 40px; max-width: 1200px; margin: 0 auto; }
 
 .toolbar { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
 .toolbar label { display: flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; }
+.toolbar select, .toolbar input { width: auto; }
+.toolbar input[type="text"] { width: 200px; }
+.spacer { flex: 1; }
+.mute-id { color: var(--muted); }
 
 .table-wrap {
   background: var(--panel); border: 1px solid var(--line); border-radius: 12px;

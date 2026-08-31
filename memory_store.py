@@ -391,6 +391,63 @@ class MemoryStore:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._trim_sync, scope, max_entries)
 
+    async def replace_entries(self, scope: str, entries: list) -> None:
+        """用给定条目列表整体覆盖该 scope 的记忆库(后台管理用)。
+
+        条目须保留原 ``vector`` / 字段结构(通常取自 recent/search 返回)。
+        """
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._replace_entries_sync, scope, list(entries))
+
+    def _replace_entries_sync(self, scope: str, entries: list) -> None:
+        with self._lock:
+            self._persist_unlocked(scope, entries)
+
+    async def delete_entries_by_id(self, scope: str, ids: list) -> int:
+        """按 id 删除 scope 内的若干条记忆,返回删除条数。"""
+        idset = {str(x) for x in ids if x}
+        if not idset:
+            return 0
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._delete_by_id_sync, scope, idset)
+
+    def _delete_by_id_sync(self, scope: str, idset: set) -> int:
+        with self._lock:
+            entries = self._load_unlocked(scope)
+            before = len(entries)
+            entries = [e for e in entries if str(e.get("id")) not in idset]
+            removed = before - len(entries)
+            if removed:
+                self._persist_unlocked(scope, entries)
+            return removed
+
+    async def delete_entries_after_turn(self, scope: str, target_turn: int) -> int:
+        """删除 turn 严格大于 target_turn 的记忆条目(供 /undo 回滚用)。
+
+        记忆条目在写入时带 turn(且同轮命中去重会更新 turn),因此可按轮次
+        精确清除被回滚掉的剧情产生的记忆。返回删除条数。
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._delete_after_turn_sync, scope, int(target_turn))
+
+    def _delete_after_turn_sync(self, scope: str, target_turn: int) -> int:
+        with self._lock:
+            entries = self._load_unlocked(scope)
+            before = len(entries)
+            entries = [
+                e
+                for e in entries
+                if not (
+                    isinstance(e.get("turn"), int)
+                    and not isinstance(e.get("turn"), bool)
+                    and e["turn"] > target_turn
+                )
+            ]
+            removed = before - len(entries)
+            if removed:
+                self._persist_unlocked(scope, entries)
+            return removed
+
     def _trim_sync(self, scope: str, max_entries: int) -> int:
         with self._lock:
             entries = self._load_unlocked(scope)

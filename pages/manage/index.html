@@ -16,6 +16,7 @@
   <button class="tab active" data-tab="overview">📊 总览</button>
   <button class="tab" data-tab="sessions">💾 模拟会话</button>
   <button class="tab" data-tab="narrative">📜 剧情历史</button>
+  <button class="tab" data-tab="memory">🧠 向量记忆</button>
   <button class="tab" data-tab="branches">🌿 分支存档</button>
   <button class="tab" data-tab="rpg">⚔️ RPG 存档</button>
 </nav>
@@ -47,6 +48,25 @@
       <thead><tr><th>ID</th><th>时间</th><th>摘要</th><th>用户行动</th><th>字数</th><th>修订</th><th>操作</th></tr></thead>
       <tbody></tbody>
     </table></div>
+  </section>
+
+  <!-- ── 向量记忆 ── -->
+  <section class="panel" id="tab-memory">
+    <div class="toolbar">
+      <label>scope <select id="m-scope"></select></label>
+      <button class="btn ghost" id="m-load">载入</button>
+      <button class="btn ghost" id="m-export">导出 JSON</button>
+      <span class="spacer"></span>
+      <input id="m-keyword" placeholder="按关键字删…">
+      <button class="btn ghost" id="m-del-kw">删匹配</button>
+      <button class="btn danger" id="m-del-all">清空该 scope</button>
+    </div>
+    <p class="hint muted" id="m-meta"></p>
+    <div class="table-wrap"><table class="tbl" id="mem-tbl">
+      <thead><tr><th style="width:2.5em"><input type="checkbox" id="m-checkall"></th><th>ID</th><th>重要度</th><th>轮</th><th>时间</th><th>内容</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <div class="row-end"><button class="btn danger" id="m-del-sel">删除选中</button></div>
   </section>
 
   <!-- ── 分支存档 ── -->

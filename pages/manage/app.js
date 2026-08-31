@@ -105,6 +105,7 @@
       ["RPG 角色", o.rpg.chars],
       ["RPG 会话", o.rpg.sessions],
       ["头像文件", o.avatars.files],
+      ["向量记忆", o.memory?.entries ?? 0, `${fmtSize(o.memory?.size)} · ${o.memory?.files} 文件`],
     ];
     $("#ov-cards").innerHTML = cards.map(([lbl, num, sub]) => `
       <div class="card"><div class="num">${esc(num)}</div>
@@ -425,6 +426,90 @@
     });
   }
 
+  // ── 向量记忆 ──
+  let MEM_DATA = { scopes: [] };
+  async function loadMemory() {
+    MEM_DATA = await apiGet("/api/memory");
+    const sel = $("#m-scope");
+    sel.innerHTML =
+      MEM_DATA.scopes.map((s) => `<option value="${esc(s.scope)}">${esc(s.scope)} (${s.count})</option>`).join("")
+      || `<option value="">(无记忆)</option>`;
+    await fetchMemoryList();
+  }
+  async function fetchMemoryList() {
+    const scope = $("#m-scope").value;
+    const tbody = $("#mem-tbl tbody");
+    $("#m-checkall").checked = false;
+    if (!scope) {
+      tbody.innerHTML = `<tr><td colspan="7" class="muted">无向量记忆</td></tr>`;
+      $("#m-meta").textContent = ""; return;
+    }
+    const s = MEM_DATA.scopes.find((x) => x.scope === scope);
+    $("#m-meta").textContent = `${scope} · 共 ${s?.count ?? 0} 条 · 嵌入源:${s?.embed_source ?? "-"}`;
+    if (!s?.entries?.length) {
+      tbody.innerHTML = `<tr><td colspan="7" class="muted">该 scope 暂无记忆(每轮 /do 自动写入,或用 life_sim_memorize 保存)</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = s.entries.map((e) => `
+      <tr data-id="${esc(e.id)}">
+        <td><input type="checkbox" class="mem-chk" value="${esc(e.id)}"></td>
+        <td><code class="mute-id" title="${esc(e.id)}">${esc(String(e.id).slice(0, 8))}…</code></td>
+        <td>${esc((e.importance || 1) >= 3 ? "★★★" : (e.importance || 1) === 2 ? "★★" : "★")}</td>
+        <td>${e.turn ?? "-"}</td>
+        <td class="muted">${fmtTime(e.created_at)}</td>
+        <td><div class="cell-pre" title="${esc(e.content)}">${esc(e.content || "-")}</div></td>
+        <td style="white-space:nowrap"><button class="btn tiny danger mem-del">删除</button></td>
+      </tr>`).join("");
+
+    tbody.querySelectorAll("tr[data-id]").forEach((tr) => {
+      tr.querySelector(".mem-del").onclick = () =>
+        confirmAction("删除记忆", `确定删除该条记忆?`, async () => {
+          const r = await apiPost("/api/memory/delete", { scope, mode: "ids", ids: [tr.dataset.id] });
+          toast(`🗑️ 已删除 ${r.removed} 条`);
+          await loadMemory();
+        });
+    });
+  }
+  $("#m-load").onclick = () => fetchMemoryList().catch((e) => toast("❌ " + e.message));
+  $("#m-scope").onchange = () => fetchMemoryList().catch((e) => toast("❌ " + e.message));
+  $("#m-checkall").onchange = (ev) =>
+    $$(".mem-chk").forEach((c) => (c.checked = ev.target.checked));
+  $("#m-del-sel").onclick = () => {
+    const ids = $$(".mem-chk").filter((c) => c.checked).map((c) => c.value);
+    if (!ids.length) return toast("未勾选任何条目");
+    confirmAction("删除选中", `确定删除选中的 ${ids.length} 条记忆?`, async () => {
+      const r = await apiPost("/api/memory/delete", { scope: $("#m-scope").value, mode: "ids", ids });
+      toast(`🗑️ 已删除 ${r.removed} 条`);
+      await loadMemory();
+    });
+  };
+  $("#m-del-kw").onclick = () => {
+    const kw = $("#m-keyword").value.trim();
+    if (!kw) return toast("请输入关键字");
+    confirmAction("按关键字删除", `删除所有内容含「${kw}」的记忆?`, async () => {
+      const r = await apiPost("/api/memory/delete", { scope: $("#m-scope").value, mode: "keyword", keyword: kw });
+      toast(`🗑️ 已删除 ${r.removed} 条`);
+      await loadMemory();
+    });
+  };
+  $("#m-del-all").onclick = () => {
+    const scope = $("#m-scope").value;
+    if (!scope) return;
+    confirmAction("清空记忆", `确定清空 ${scope} 的全部向量记忆?`, async () => {
+      const r = await apiPost("/api/memory/delete", { scope, mode: "all" });
+      toast(`🗑️ 已清空 ${r.removed} 条`);
+      await loadMemory();
+    });
+  };
+  $("#m-export").onclick = () => {
+    const scope = $("#m-scope").value;
+    if (!scope) return toast("无 scope");
+    if (!P?.download) return toast("bridge SDK 未加载");
+    P.download("/api/memory/export", { scope }, `life_sim_memory_${scope}.json`)
+      .then(() => toast("📦 已开始下载"))
+      .catch((e) => toast("❌ " + e.message));
+  };
+
   // ── RPG 存档 ──
   async function loadRpg() {
     const data = await apiGet("/api/rpg");
@@ -487,6 +572,7 @@
   TAB_LOADERS.overview = loadOverview;
   TAB_LOADERS.sessions = loadSessions;
   TAB_LOADERS.narrative = loadNarrativeTab;
+  TAB_LOADERS.memory = loadMemory;
   TAB_LOADERS.branches = loadBranches;
   TAB_LOADERS.rpg = loadRpg;
 
