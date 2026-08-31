@@ -150,13 +150,14 @@ def _strip_xml_tags(text: str) -> str:
 
 
 def _strip_meta_tags(text: str) -> str:
-    """只剥掉系统注入标签(<system_reminder> / <narrative_ref>),保留用户真实输入。
+    """只剥掉系统注入标签(<system_reminder> / <narrative_ref> / <memory_recall>),保留用户真实输入。
 
     用于 /redo 恢复上一轮的原始输入:system_reminder 是运行时注入的(重新生成会
-    再注入),narrative_ref 里的剧情 ID 已随回滚失效;而 <Quoted Message> 是用户
-    引用的上下文,重新生成时应当保留。
+    再注入),narrative_ref 里的剧情 ID 已随回滚失效,memory_recall 是运行时召回的
+    向量记忆(重新生成会重新召回);而 <Quoted Message> 是用户引用的上下文,
+    重新生成时应当保留。
     """
-    for tag in ("system_reminder", "narrative_ref"):
+    for tag in ("system_reminder", "narrative_ref", "memory_recall"):
         text = re.sub(rf"<{tag}>[\s\S]*?</{tag}>", "", text, flags=re.DOTALL)
     return text.strip()
 
@@ -3249,9 +3250,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 break
         if not parts:
             return None
+        inner = "\n".join(parts)
+        # 用 XML 标签 <memory_recall> 包裹(与 <system_reminder>/<narrative_ref> 一致),
+        # 这样 _strip_xml_tags / _strip_meta_tags 能识别剥离,不会污染
+        # 剧情历史的 user_action、向量记忆的“用户行动”、/redo 重放等下游。
         block = (
-            "## 📖 相关回忆(往昔发生过的事,延续剧情 / 设定时参照,勿与当前冲突)\n"
-            + "\n".join(parts)
+            "<memory_recall>以下为与当前剧情相关的往昔回忆,供延续剧情 / 设定时参照,勿与当前冲突:\n"
+            + inner
+            + "</memory_recall>"
         )
         return block
 
@@ -3335,11 +3341,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         """
         永久保存世界观信息
 
-        适用场景:
+        适用场景(**只存世界设定与规则,不存剧情事件/记忆**):
         - 世界规则(魔法体系 / 科技水平 / 宗教等)
         - 政治格局 / 势力分布 / 重要国家或组织
-        - 地理 / 历史背景 / 重要事件
+        - 地理 / 历史背景(稳定的世界观背景)
         - 已确认的重要 NPC 设定
+
+        注意:某个具体剧情事件发生了什么属于向量记忆(自动记录),不要存这里。
 
         Args:
             content(string): 世界观内容(详细描述,一段或多段)
@@ -3359,13 +3367,16 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         """
         永久保存角色设定(支持多角色,按 character 分组累积)
 
-        适用场景:
+        适用场景(**只存角色设定,不存剧情事件/记忆**):
         - 形态变化(变身 / 进化 / 解锁新形态 / 退化)
         - 外貌变化(受伤 / 服装 / 装饰 / 年龄增长)
         - 性格变化(觉醒 / 黑化 / 成长 / 信念改变)
-        - 重要记忆 / 关系变化
+        - 关系 / 定位变化
         - 习得技能 / 称号 / 职业变更
         - 重要 NPC 的设定
+
+        注意:战斗中发生了什么、说了什么话、旅途细节属于向量记忆(自动记录),
+        不要存进这里。若某事件值得长期记住,用 life_sim_memorize。
 
         Args:
             content(string): 角色设定内容(详细描述)

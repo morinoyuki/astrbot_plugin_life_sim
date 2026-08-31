@@ -21,7 +21,29 @@ _pkg = importlib.util.module_from_spec(_spec)
 sys.modules["lsim_pkg"] = _pkg
 _spec.loader.exec_module(_pkg)
 
+from lsim_pkg.main import _strip_meta_tags, _strip_xml_tags
 from lsim_pkg.memory_store import MemoryStore
+
+
+def test_recall_tag_isolated():
+    """回忆注入用 <memory_recall> XML 标签包裹,下游剥离函数必须能完整剥掉,
+    避免污染剧情历史 user_action / 向量记忆『用户行动』/ /redo 重放。"""
+    recall = (
+        "<memory_recall>以下为与当前剧情相关的往昔回忆:\n"
+        "- 用户行动:勇者救下少女 → ...\n"
+        "- 用户行动:击败魔王 → ...\n"
+        "</memory_recall>"
+    )
+    user_input = (
+        "我继续前进\n"
+        + "<system_reminder>User ID: 1</system_reminder>\n"
+        + "<narrative_ref>n_abc</narrative_ref>\n"
+        + recall
+    )
+    # _strip_meta_tags(/redo 用)
+    assert _strip_meta_tags(user_input) == "我继续前进", _strip_meta_tags(user_input)
+    # _strip_xml_tags(剧情历史 user_action / 向量记忆 action / /undo 预览 用)
+    assert _strip_xml_tags(user_input) == "我继续前进", _strip_xml_tags(user_input)
 
 
 def approx(a, b, tol=1e-6):
@@ -173,4 +195,7 @@ async def main():
 
 
 if __name__ == "__main__":
+    # 同步测试(标签剥离)
+    test_recall_tag_isolated()
+    print("✓ 回忆标签可被剥离")
     asyncio.run(main())
