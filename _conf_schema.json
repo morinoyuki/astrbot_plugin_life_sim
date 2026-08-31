@@ -217,10 +217,10 @@
     "default": 1600
   },
   "memory_content_chars": {
-    "description": "每轮自动记录的记忆文本最大长度",
+    "description": "每轮自动记录的剧情摘要长度",
     "type": "int",
-    "hint": "自动记录时叙事超过此长度会截断,避免记忆库膨胀。默认 600",
-    "default": 600
+    "hint": "自动记录(模式 A 兜底 / 模式 B·C 时 LLM 未主动记忆)存的精简剧情进展摘要最大字数。摘要而非全文,避免记忆库被描述词撑爆。默认 200",
+    "default": 200
   },
   "memory_max_entries": {
     "description": "每会话向量记忆最大条数",

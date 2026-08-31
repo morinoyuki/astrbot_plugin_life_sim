@@ -21,8 +21,130 @@ _pkg = importlib.util.module_from_spec(_spec)
 sys.modules["lsim_pkg"] = _pkg
 _spec.loader.exec_module(_pkg)
 
-from lsim_pkg.main import _strip_meta_tags, _strip_xml_tags
+from lsim_pkg.main import (
+    LifeSimPlugin,
+    _clean_narrative_for_memory,
+    _escape_memory_content,
+    _strip_meta_tags,
+    _strip_xml_tags,
+)
 from lsim_pkg.memory_store import MemoryStore
+
+
+def test_compact_turn_summary():
+    """自动记忆应为精简摘要而非整段叙事原文,避免过长 + 描述词堆砌。"""
+    narr = (
+        "阿龙晃了晃药剂瓶。\n"
+        "阿龙:放心，交给我。\n"
+        "凌霜:那就拜托你了。\n"
+        "他们一起离开了城门,往北境而去。\n"
+        "月光洒下,晚风轻拂。"
+    )
+    s = LifeSimPlugin._compact_turn_summary(narr, 200)
+    assert len(s) <= 210
+    assert "他们一起离开了城门" in s or "阿龙" in s
+    # 截断
+    long_narr = "描述词 " * 40
+    s2 = LifeSimPlugin._compact_turn_summary(long_narr, 60)
+    assert len(s2) <= 65
+
+
+def test_called_memorize():
+    """判断本轮 agent loop 是否已调 life_sim_memorize(避免自动记录重复)。"""
+
+    class HooksYes:
+        def __init__(self):
+            self.steps = [
+                {"tool_calls": [{"name": "rpg_get_status"}]},
+                {"tool_calls": [{"name": "life_sim_memorize"}]},
+            ]
+
+    class HooksNo:
+        def __init__(self):
+            self.steps = [{"tool_calls": [{"name": "rpg_get_status"}]}]
+
+    assert LifeSimPlugin._called_memorize(HooksYes()) is True
+    assert LifeSimPlugin._called_memorize(HooksNo()) is False
+    assert LifeSimPlugin._called_memorize(None) is False
+    """注入记忆时,内容里的尖括号等非法字符应被转义,避免破坏 <memory_recall> 标签闭合。"""
+    assert _escape_memory_content("a<b 且 c>d") == "a〈b 且 c〉d"
+    assert _escape_memory_content("残留 </d>") == "残留 〈/d〉"
+    assert _escape_memory_content("普通 正常") == "普通 正常"
+    assert _escape_memory_content("") == ""
+    # 闭环:历史旧记忆含不配对尖括号 → 注入转义 → 包进 memory_recall → 剥离干净
+    mem = "伤害公式 a<b 且 c>d,旧数据<龙息>残留"
+    esc = _escape_memory_content(mem)
+    assert "<" not in esc and ">" not in esc
+    block = "<memory_recall>回忆:\n- " + esc + "\n</memory_recall>"
+    user = "继续\n" + block
+    assert _strip_xml_tags(user) == "继续", _strip_xml_tags(user)
+    assert _strip_meta_tags(user) == "继续"
+
+
+def test_escape_memory_content():
+    """注入记忆时,内容里的尖括号等非法字符应被转义,避免破坏 <memory_recall> 标签闭合。"""
+    assert _escape_memory_content("a<b 且 c>d") == "a〈b 且 c〉d"
+    assert _escape_memory_content("残留 </d>") == "残留 〈/d〉"
+    assert _escape_memory_content("普通 正常") == "普通 正常"
+    assert _escape_memory_content("") == ""
+    # 闭环:历史旧记忆含不配对尖括号 → 注入转义 → 包进 memory_recall → 剥离干净
+    mem = "伤害公式 a<b 且 c>d,旧数据<龙息>残留"
+    esc = _escape_memory_content(mem)
+    assert "<" not in esc and ">" not in esc
+    block = "<memory_recall>回忆:\n- " + esc + "\n</memory_recall>"
+    user = "继续\n" + block
+    assert _strip_xml_tags(user) == "继续", _strip_xml_tags(user)
+    assert _strip_meta_tags(user) == "继续"
+
+
+def test_clean_narrative_strips_tags():
+    """记忆内容必须清洗掉聊天卡片标签(<d>/<c>/<t>),避免注入后 _strip_xml_tags 误剥。"""
+    narr = (
+        "# 深夜的抉择\n\n"
+        "<c>阿龙晃了晃药剂瓶。</c>\n\n"
+        "<d name=\"阿龙\">放心，交给我。</d>\n"
+        "<d name=\"凌霜\" me>那就拜托你了。</d>\n\n"
+        "<t>HP 78/100</t><t>🔥 灼烧</t>\n\n"
+        "1. 冲上去救她\n2. 撤退\n\n他们一起离开了城门。\n"
+    )
+    clean = _clean_narrative_for_memory(narr)
+    assert "<d" not in clean and "<c" not in clean and "<t" not in clean, clean
+    assert "阿龙:放心，交给我。" in clean, clean
+    assert "凌霜:那就拜托你了。" in clean, clean
+    assert "他们一起离开了城门" in clean, clean
+
+    comment = "我的输入\n<memory_recall>回忆:\n" + clean + "\n</memory_recall>"
+    assert _strip_xml_tags(comment) == "我的输入", _strip_xml_tags(comment)
+    assert _strip_meta_tags(comment) == "我的输入", _strip_meta_tags(comment)
+
+    assert _clean_narrative_for_memory("   ") == ""
+    assert _clean_narrative_for_memory("<d name=\"x\"> </d>") == ""
+
+
+def test_strip_xml_strips_recall_with_inner_tags():
+    """核心修复:记忆里即使残留聊天卡片标签/不成对尖括号,<memory_recall> 也
+    必须被 _strip_xml_tags 完整剔除,不残留任何片段(否则污染剧情历史/重放)。"""
+    cases = [
+        (# 记忆含成对 <d> 标签 —— 旧逻辑会把 <memory_recall> 错配剥坏
+         '我的输入\n<memory_recall>回忆:<d name="阿龙">你好</d> 我们离开了</memory_recall>',
+         "我的输入"),
+        (# 记忆含孤立 </d> 结束标记
+         '输入\n<memory_recall>残留 </d> 结束</memory_recall>', "输入"),
+        (# 记忆含未闭合 <d 开标签
+         '<system_reminder>User: 1</system_reminder>我的输入\n<memory_recall>提到 <d name="x"> 未闭合</memory_recall>',
+         "我的输入"),
+        (# 正常无内标签
+         '我的输入\n<memory_recall>回忆: 普通</memory_recall>', "我的输入"),
+        (# 记忆在开头
+         '<memory_recall>只有回忆</memory_recall>普通文本', "普通文本"),
+    ]
+    for raw, expect in cases:
+        r = _strip_xml_tags(raw)
+        assert r == expect, (raw, r, expect)
+        assert "<memory_recall>" not in r and "</memory_recall>" not in r, r
+    # 普通环境标签仍被通用剥离
+    assert _strip_xml_tags("a<Quoted Message>引用</Quoted Message>b") == "ab"
+    assert _strip_xml_tags("你好<system_reminder>x</system_reminder>") == "你好"
 
 
 def test_recall_tag_isolated():
@@ -40,9 +162,7 @@ def test_recall_tag_isolated():
         + "<narrative_ref>n_abc</narrative_ref>\n"
         + recall
     )
-    # _strip_meta_tags(/redo 用)
     assert _strip_meta_tags(user_input) == "我继续前进", _strip_meta_tags(user_input)
-    # _strip_xml_tags(剧情历史 user_action / 向量记忆 action / /undo 预览 用)
     assert _strip_xml_tags(user_input) == "我继续前进", _strip_xml_tags(user_input)
 
 
@@ -153,25 +273,24 @@ async def main():
     removed = await store.delete_scope(scope)
     assert removed == 1 and await store.count(scope) == 0
 
-    # 9. /undo 回滚:按 turn 删除
+    # 9. /undo 回滚:按 turn 删除(turn >= target,含 target 轮自身)
     await store.add(scope, "童年发现剑冢", turn=5, importance=2)
     await store.add(scope, "少年拜师学剑", turn=8, importance=2)
     await store.add(scope, "青年夺得比武冠军", turn=12, importance=3)
     assert await store.count(scope) == 3
-    # 回滚到 turn=8:删除 turn>8 的记忆(即 turn=12 那条)
-    removed = await store.delete_entries_after_turn(scope, 8)
-    assert removed == 1
-    entries = await store.recent(scope, 100)
-    turns = {e.get("turn") for e in entries}
-    assert turns == {5, 8}, turns
-    # 回滚到 turn=5:再删 turn>5 的(即 turn=8 那条)
-    removed = await store.delete_entries_after_turn(scope, 5)
-    assert removed == 1
+    # 回滚到 turn=8:删 turn>=8 的记忆(turn 8 与 12 都删)
+    removed = await store.delete_entries_from_turn(scope, 8)
+    assert removed == 2
     entries = await store.recent(scope, 100)
     turns = {e.get("turn") for e in entries}
     assert turns == {5}, turns
-    # 回滚到 turn=5(无变化)
-    removed = await store.delete_entries_after_turn(scope, 5)
+    # 回滚到 turn=5:再删 turn>=5 的(即 turn=5 那条)
+    removed = await store.delete_entries_from_turn(scope, 5)
+    assert removed == 1
+    entries = await store.recent(scope, 100)
+    assert entries == []
+    # 无可删
+    removed = await store.delete_entries_from_turn(scope, 5)
     assert removed == 0
     await store.delete_scope(scope)
 
@@ -182,12 +301,10 @@ async def main():
     # 另加一条手动 memorize(重要度 3,也属 turn 4)
     await store.add(scope, "关键伏笔:某组织的秘密", turn=4, importance=3)
     assert await store.count(scope) == 5
-    # undo 4:回滚到 target_turn=1,应删掉 turn>1 的全部 4 条(含 turn4 的两条)
-    removed = await store.delete_entries_after_turn(scope, 1)
-    assert removed == 4, removed
-    entries = await store.recent(scope, 100)
-    turns = sorted(e.get("turn") for e in entries)
-    assert turns == [1], turns
+    # undo 4:回滚到 target_turn=1,应删掉 turn>=1 的所有 5 条(含 turn1-4 全部)
+    removed = await store.delete_entries_from_turn(scope, 1)
+    assert removed == 5, removed
+    assert await store.count(scope) == 0
     await store.delete_scope(scope)
 
     print("✅ 全部通过")
@@ -198,4 +315,14 @@ if __name__ == "__main__":
     # 同步测试(标签剥离)
     test_recall_tag_isolated()
     print("✓ 回忆标签可被剥离")
+    test_clean_narrative_strips_tags()
+    print("✓ 记忆内容清洗掉聊天卡片标签")
+    test_strip_xml_strips_recall_with_inner_tags()
+    print("✓ 记忆含内标签时 <memory_recall> 仍被完整清除")
+    test_escape_memory_content()
+    print("✓ 注入记忆时非法字符被转义")
+    test_compact_turn_summary()
+    print("✓ 自动记忆存精简摘要(非整段原文)")
+    test_called_memorize()
+    print("✓ 检测本轮是否已调 life_sim_memorize")
     asyncio.run(main())

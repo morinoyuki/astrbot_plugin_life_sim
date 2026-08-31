@@ -421,16 +421,17 @@ class MemoryStore:
                 self._persist_unlocked(scope, entries)
             return removed
 
-    async def delete_entries_after_turn(self, scope: str, target_turn: int) -> int:
-        """删除 turn 严格大于 target_turn 的记忆条目(供 /undo 回滚用)。
+    async def delete_entries_from_turn(self, scope: str, target_turn: int) -> int:
+        """删除 turn 大于等于 target_turn 的记忆条目(供 /undo 回滚用)。
 
-        记忆条目在写入时带 turn(且同轮命中去重会更新 turn),因此可按轮次
-        精确清除被回滚掉的剧情产生的记忆。返回删除条数。
+        /undo 回滚到 target_turn 意味着「回到第 target_turn 轮开始前」,
+        因此**第 target_turn 轮及之后**产生的记忆(含 target_turn 轮自身的
+        自动记录与 life_sim_memorize)都应清除。返回删除条数。
         """
         loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self._delete_after_turn_sync, scope, int(target_turn))
+        return await loop.run_in_executor(None, self._delete_from_turn_sync, scope, int(target_turn))
 
-    def _delete_after_turn_sync(self, scope: str, target_turn: int) -> int:
+    def _delete_from_turn_sync(self, scope: str, target_turn: int) -> int:
         with self._lock:
             entries = self._load_unlocked(scope)
             before = len(entries)
@@ -440,7 +441,7 @@ class MemoryStore:
                 if not (
                     isinstance(e.get("turn"), int)
                     and not isinstance(e.get("turn"), bool)
-                    and e["turn"] > target_turn
+                    and e["turn"] >= target_turn
                 )
             ]
             removed = before - len(entries)

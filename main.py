@@ -43,6 +43,7 @@ from astrbot.core.utils.quoted_message.extractor import QuotedMessageExtractor
 
 from .avatar_store import AvatarStore
 from .dice import DiceMixin
+from .im_render import markdown as _md
 from .im_render.engine import render_narrative
 from .md_to_image import MdToImageMixin
 from .memory_store import MemoryStore
@@ -132,21 +133,33 @@ def _chain_to_content_parts(chain) -> list:
 
 
 def _strip_xml_tags(text: str) -> str:
-    """去除 <xxx>...</xxx> 标签块(包括内部内容),只保留用户真实输入。
+    """去除系统注入标签块及环境标签,只保留用户真实输入。
 
-    用于 /undo 预览时去掉 <system_reminder>、<Quoted Message>、<environment_details>
-    等噪声。
+    用于 /undo 预览、剧情历史 user_action、历史摘要等去掉 <system_reminder>、
+    <Quoted Message>、<environment_details> 等噪声。
+
+    先**具名精确剔除** system_reminder / narrative_ref / memory_recall:
+    这三个是插件注入的标签,内部可能含聊天卡片标签(<d>/<c>/<t>)甚至不成对的
+    尖括号 —— 若用通用正则匹配成对标签,内部标签会错配成闭合标记,
+    导致外层标签剥不干净、残留内容。具名方式把整块整体删掉,内部再乱也不影响。
+    然后再用通用正则兜底处理其余普通环境标签。
     """
-    cleaned = re.sub(
+    if not text:
+        return ""
+    # 第一步:具名精确剔除插件注入标签(整体删除,内部标签不干扰)
+    for tag in ("system_reminder", "narrative_ref", "memory_recall"):
+        text = re.sub(rf"<{tag}>[\s\S]*?</{tag}>", "", text, flags=re.DOTALL)
+    # 第二步:通用剥离其余环境标签块
+    text = re.sub(
         r"<[A-Za-z_][\w\- ]*?>([\s\S]*?)</[A-Za-z_][\w\- ]*?>",
         "",
         text,
         flags=re.DOTALL,
     )
-    cleaned = re.sub(r"</?[A-Za-z_][\w\- ]*?/?>", "", cleaned)
-    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
+    text = re.sub(r"</?[A-Za-z_][\w\- ]*?/?>", "", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _strip_meta_tags(text: str) -> str:
@@ -160,6 +173,81 @@ def _strip_meta_tags(text: str) -> str:
     for tag in ("system_reminder", "narrative_ref", "memory_recall"):
         text = re.sub(rf"<{tag}>[\s\S]*?</{tag}>", "", text, flags=re.DOTALL)
     return text.strip()
+
+
+def _escape_memory_content(content: str) -> str:
+    """转义记忆内容里可能破坏 XML 标签结构的非法字符。
+
+    记忆内容虽然落库前经 _clean_narrative_for_memory 清洗,但仍可能含
+    不配对的尖括号(如纯文本里的 `a<b`、单个 `<`)或历史旧数据残留。若这些
+    原样被包进 <memory_recall>,会干扰标签闭合匹配(甚至让 _strip_xml_tags 剥不干净)。
+
+    这里把 `<` 和 `>` 转义为全角字符:既不破坏标签结构,又能保留原意
+    (LLM 仍能读懂,且不会再被当成标签)。
+    """
+    content = (content or "")
+    content = content.replace("<", "〈")
+    content = content.replace(">", "〉")
+    return content
+
+
+def _clean_narrative_for_memory(narrative: str) -> str:
+    """把叙事文本清洗成适合存入向量记忆的干净纯文本。
+
+    叙事输出可能含聊天卡片标签(<d>/<c>/<t>)、markdown 标题/列表等。
+    若原样存入记忆库,这些标签会被带入;之后注入 <memory_recall> 时,
+    _strip_xml_tags 的通用正则会把记忆里的 <d>…</d> 等当作系统标签块剥掉,
+    破坏记忆内容(甚至把记忆内容以外的东西误剥)。
+
+    这里用 markdown 解析把叙事拆成块,再逐块提取纯文本:
+    - 对白 <d name="某人">…</d> → 保留为「某人:台词」
+    - 胶囊 <c>…</c> / 标签 <t>…</t> → 保留其文字
+    - 标题 / 列表 / 段落 → 保留纯文本
+    最终合并为一段干净的事件描述(移除重复空行)。
+    """
+    narrative = (narrative or "").strip()
+    if not narrative:
+        return ""
+    try:
+        blocks = _md.parse_blocks(narrative)
+        parts: list[str] = []
+        for b in blocks:
+            if b.type == "dialogue":
+                sp = getattr(b, "speaker", "") or ""
+                txt = _md.plain_text(b.spans).strip()
+                if txt:
+                    parts.append(f"{sp}:{txt}" if sp else txt)
+            elif b.type == "list":
+                for it in getattr(b, "items", []):
+                    t = _md.plain_text(it).strip()
+                    if t:
+                        parts.append(t)
+            elif getattr(b, "spans", None):
+                t = _md.plain_text(b.spans).strip()
+                if t:
+                    parts.append(t)
+            elif b.type == "code":
+                c = (getattr(b, "code", "") or "").strip()
+                if c:
+                    parts.append(c)
+        return _md_join_clean(parts)
+    except Exception:
+        # 解析失败回退:手动剥掉标签
+        cleaned = re.sub(r"<[^>]+>", "", narrative)
+        cleaned = re.sub(r"[ \t]\n", "\n", cleaned)
+        cleaned = re.sub(r"\n{2,}", "\n", cleaned)
+        return cleaned.strip()
+
+
+def _md_join_clean(parts: list[str]) -> str:
+    """把清洗后的片段合并为一段连续文本(去重空行)。"""
+    seen: list[str] = []
+    for p in parts:
+        p = (p or "").strip()
+        if not p:
+            continue
+        seen.append(p)
+    return "\n".join(seen)
 
 
 _CHAR_ALIAS_PATTERN = re.compile(r"[（(【]\s*([^）)】]+?)\s*[）)】]")
@@ -2553,7 +2641,15 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             text += f"\n\n📝 [剧情ID: `{record_id}`]"
 
         # 向量记忆:把本轮「用户行动 → 发生的事」写入记忆库(失败静默)
-        await self._record_turn_memory(event_key, session, user_input, text, turn)
+        await self._record_turn_memory(
+            event_key,
+            session,
+            user_input,
+            text,
+            turn,
+            mode=mode,
+            tool_hooks=tool_hooks,
+        )
 
         return text
 
@@ -3243,6 +3339,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             content = (h.get("content") or "").strip()
             if not content:
                 continue
+            # 转义非法字符:记忆可能含不配对尖括号等,包进 <memory_recall> 会破坏标签闭合
+            content = _escape_memory_content(content)
             line = f"- {content}"
             used += len(line) + 1
             parts.append(line)
@@ -3268,23 +3366,39 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         user_input: str,
         narrative: str,
         turn: int,
+        mode: str = "A",
+        tool_hooks: "_LifeSimToolHooks | None" = None,
     ) -> None:
-        """每轮 LLM 成功后,把本轮「用户行动 → 发生的事」写入向量记忆。
+        """记录本轮「用户行动 → 发生的剧情进展」到向量记忆。
 
-        纯写(一次嵌入 + 落盘),不打断主流程;失败静默跳过。
-        与 lore(角色/世界观设定)完全解耦 —— 本模块只记剧情事件。
+        方案 A 分工(避免冗余 + 避免逐字存全文):
+        - **模式 B/C**(有工具):以 LLM 主动调 `life_sim_memorize` 为准。
+          若本轮已调过 → 直接跳过(不重复);否则存一条**精简摘要**作为兑底。
+        - **模式 A**(无工具):LLM 无法主动调,存一条**精简摘要**作为兑底。
+
+        存的是**精简剧情进展摘要**(用户行动 + 一句剧情动向),而非整段叙事原文 ——
+        避免记忆库被上千字描述词、对白、氛围渲染撑爆。
         """
         if not self._cfg("memory_enable", True):
             return
         if not self._cfg("memory_auto_record", True):
             return
-        narr = (narrative or "").strip()
+
+        # 模式 B/C:若本轮 LLM 已主动调 life_sim_memorize,则不重复自动记录
+        if mode in ("B", "C") and self._called_memorize(tool_hooks):
+            return
+
+        narr = _clean_narrative_for_memory(narrative)
         if not narr:
             return
-        content_chars = max(50, int(self._cfg("memory_content_chars", 600)))
-        body = narr if len(narr) <= content_chars else narr[:content_chars] + "..."
+        # 精简摘要:用户行动 + 一句剧情动向(取清洗后叙事的关键段)
         action = _strip_xml_tags(user_input).strip()[:120]
-        content = f"用户行动:{action} → {body}" if action else body
+        limit = max(60, int(self._cfg("memory_content_chars", 200)))
+        summary = self._compact_turn_summary(narr, limit)
+        if action:
+            content = f"用户行动:{action} → {summary}"
+        else:
+            content = summary
         try:
             await self.memory_store.add(
                 event_key, content, turn=turn, importance=1, dedup_threshold=0.95
@@ -3294,6 +3408,37 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 await self.memory_store.set_max_entries(event_key, max_store)
         except Exception as e:
             logger.debug(f"life-sim: 写入向量记忆失败(跳过): {e}")
+
+    @staticmethod
+    def _called_memorize(tool_hooks) -> bool:
+        """本轮 agent loop 是否调用过 life_sim_memorize。"""
+        if tool_hooks is None:
+            return False
+        for step in getattr(tool_hooks, "steps", []) or []:
+            for tc in step.get("tool_calls") or []:
+                if tc.get("name") == "life_sim_memorize":
+                    return True
+        return False
+
+    @staticmethod
+    def _compact_turn_summary(narr: str, limit: int = 160) -> str:
+        """把清洗后的叙事压成一句精炼的剧情进展摘要。
+
+        取第一段(通常是开场/主事件)+ 若有对白拼关键的几句,截断到 limit。
+        目标:短且承载剧情实质,不要整段描述词。
+        """
+        if not narr:
+            return ""
+        # 取包含“行动/结果”信息量高的段落:优先非纯氛围的第一段
+        lines = [ln.strip() for ln in narr.split("\n") if ln.strip()]
+        if not lines:
+            return ""
+        body = "；".join(lines[1:5]) if len(lines) > 1 else lines[0]
+        # 合并压缩多余空白
+        body = re.sub(r"\s+", " ", body)
+        if len(body) > limit:
+            body = body[:limit] + "…"
+        return body
 
     async def life_sim_memorize(
         self, event, content: str = "", importance: int = 2
@@ -3318,7 +3463,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         """
         if not self.config or not self._cfg("memory_enable", True):
             return "记忆功能未开启,已忽略。"
-        content = (content or "").strip()
+        content = _clean_narrative_for_memory(content)
         if not content:
             return "内容为空,未保存。"
         importance = max(1, min(3, int(importance or 2)))
@@ -3326,7 +3471,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         turn = 0
         try:
             session = await self._load_sim(event)
-            turn = session.get("lore_turn", 0) if session else 0
+            # 工具在 agent loop 内、lore_turn 递增**之前**执行,磁盘上的 lore_turn
+            # 仍是上一轮旧值。本轮的新 turn = 磁盘值 + 1(与 _generate 末尾
+            # session["lore_turn"]+1 后 _record_turn_memory 使用的 turn 一致),否则
+            # 记忆 turn 偏早一轮,导致 /undo 回滚时删不掉这条手动记忆。
+            turn = (session.get("lore_turn", 0) if session else 0) + 1
             await self.memory_store.add(
                 event_key, content, turn=turn, importance=importance, dedup_threshold=0.95
             )
@@ -4049,12 +4198,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
         session["messages"] = messages
 
-        # 回滚向量记忆:删除 turn > target_turn 的记忆(被撤销轮次产生的剧情记忆)。
+        # 回滚向量记忆:删除 turn >= target_turn 的记忆(第 target_turn 轮及之后
+        # 产生的剧情记忆,含该轮自动记录与 life_sim_memorize)。
         # 与 lore/RPG/剧情历史同一步骤同步回滚,避免 /undo 后残留被否定的未来记忆。
         mem_removed = 0
         if self._cfg("memory_enable", True):
             try:
-                mem_removed = await self.memory_store.delete_entries_after_turn(
+                mem_removed = await self.memory_store.delete_entries_from_turn(
                     scope, target_turn
                 )
             except Exception as e:

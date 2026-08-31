@@ -167,11 +167,11 @@ WebUI → 插件管理 → 转生模拟器 → 配置,共 37 项:
 | 字段                   | 默认  | 说明                                                                       |
 | ---------------------- | ----- | -------------------------------------------------------------------------- |
 | `memory_enable`        | `true`| 向量记忆总开关                                                              |
-| `memory_auto_record`   | `true`| 每轮自动把「用户行动→发生的事」写入向量记忆;关闭后仅靠 LLM 调 `life_sim_memorize` 保存 |
+| `memory_auto_record`   | `true`| 每轮把「用户行动→剧情进展」的**精简摘要**写入向量记忆;模式 B/C 下若本轮 LLM 已主动调 `life_sim_memorize` 则不重复。关闭后仅靠 LLM 调 `life_sim_memorize` 保存 |
 | `memory_top_k`         | 5     | 每轮按相关度召回的历史事件条数(范围 1-20)                                  |
 | `memory_min_score`     | 0.10  | 召回相似度阈值,低于不计入(避免注入无关记忆)                                |
 | `memory_recall_chars`  | 1600  | 召回块最大字符数,超长截断控制 token 占用                                   |
-| `memory_content_chars` | 600   | 每轮自动记录的记忆文本最大长度                                              |
+| `memory_content_chars` | 200   | 每轮自动记录的剧情摘要长度(默认原文截断改为精简摘要)                    |
 | `memory_max_entries`   | 400   | 每会话记忆最大条数,超出丢最旧(仅长期会话安全阀)                           |
 
 召回结果注入**当轮 user 消息**(而非 system prompt),保住 system prompt 前缀缓存。嵌入优先用 AstrBot 配置的 Embedding Provider,未配置时回退到稳健的本地 n-gram 哈希嵌入(零依赖、跨重启稳定)。
