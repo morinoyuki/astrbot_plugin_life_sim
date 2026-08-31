@@ -639,6 +639,122 @@ class ImageRow(Row):
         canvas.alpha_composite(self._img, (x, y))
 
 
+class ChoiceRow(Row):
+    """行动选项卡:圆形序号徽章 + 选项文字 + 可选后果暗示。
+
+    用于聊天卡片模式下的「1 2 3 4 … 行动选项」(对应准确有序列表)。
+    """
+
+    def __init__(self, r, idx: int, label: str, hint: str = ""):
+        super().__init__(r)
+        fs = r.font_size
+        self.fs = fs
+        self.idx = int(idx)
+        self.label = (label or "").strip()
+        self.hint = (hint or "").strip()
+        self.f = load_font(fs)
+        self.hint_f = load_font(int(fs * 0.72))
+        self.badge_d = int(fs * 1.05)
+        self.pad_v = max(8, int(fs * 0.28))
+        self.pad_h = int(fs * 0.55)
+        avail = r.width - r.h_pad * 2 - self.badge_d - 14 - self.pad_h * 2
+        draw = ImageDraw.Draw(Image.new("RGB", (4, 4)))
+        if self.hint:
+            # 用 emoji 感知测量,与 _paint_on 里 _draw_fallback 一致(含 emoji 的 hint 不溢出)
+            avail -= int(_measure_fallback(draw, self.hint, int(fs * 0.72))) + 14
+        label = self.label
+        while _measure_fallback(draw, label, self.fs) > avail and len(label) > 2:
+            label = label[:-1]
+        if label != self.label:
+            self.label = label + "…"
+        self.height = max(self.badge_d, font_metrics(self.f)) + self.pad_v * 2
+
+    def _paint_on(self, canvas: Image.Image, y: int) -> None:
+        r = self.r
+        draw = ImageDraw.Draw(canvas)
+        x0 = r.h_pad
+        x1 = r.width - r.h_pad
+        draw.rounded_rectangle(
+            [x0, y, x1, y + self.height],
+            radius=min(14, self.height // 2),
+            fill=_rgba(r.t.card_bg),
+            outline=_rgba(r.t.card_border),
+            width=2,
+        )
+        bd = self.badge_d
+        bx = x0 + self.pad_h + 4
+        by = y + (self.height - bd) // 2
+        draw.ellipse([bx, by, bx + bd, by + bd], fill=_rgba(r.t.bubble_self))
+        badge_f = load_font(int(bd * 0.55), bold=True)
+        num = str(self.idx)
+        tw = badge_f.getlength(num)
+        draw.text(
+            (bx + (bd - tw) / 2, by + (bd - (badge_f.getmetrics()[0] + badge_f.getmetrics()[1])) / 2),
+            num,
+            font=badge_f,
+            fill=_rgba(r.t.bubble_self_text),
+        )
+        tx = bx + bd + 14
+        ty = y + (self.height - font_metrics(self.f)) // 2
+        _draw_fallback(canvas, (tx, ty), self.label, self.fs, _rgba(r.t.bubble_other_text), bold=True)
+        if self.hint:
+            hw = _measure_fallback(draw, self.hint, int(self.fs * 0.72))
+            hx = x1 - self.pad_h - hw
+            hty = y + (self.height - font_metrics(self.hint_f)) // 2
+            _draw_fallback(canvas, (hx, hty), self.hint, int(self.fs * 0.72), _rgba(r.t.text_muted))
+
+
+class TagRow(Row):
+    """横向换行的小标签胶囊。(效果 / 状态 / 系统标记等)"""
+
+    def __init__(self, r, tags, bg=None, fg=None):
+        super().__init__(r)
+        fs = int(r.font_size * 0.72)
+        self.fs = fs
+        self.f = load_font(fs)
+        self.line_h = font_metrics(self.f) + 10
+        self.pad_h = 10
+        self.gap = 8
+        self.bg = bg
+        self.fg = fg
+        # 用与 _draw_fallback 一致的 emoji 感知测量(否则含 emoji 的标签会量得过窄,
+        # 文字溢出胶囊一个字符宽)
+        _draw = ImageDraw.Draw(Image.new("RGB", (4, 4)))
+        max_w = r.width - r.h_pad * 2
+        lines = [[]]
+        cur_w = 0
+        for t in tags:
+            t = str(t).strip()
+            if not t:
+                continue
+            w = int(_measure_fallback(_draw, t, fs)) + self.pad_h * 2
+            if lines[-1] and cur_w + self.gap + w > max_w:
+                lines.append([])
+                cur_w = 0
+            if lines[-1]:
+                cur_w += self.gap
+            lines[-1].append((t, w))
+            cur_w += w
+        self.lines = lines
+        self.height = len(lines) * (self.line_h + 6)
+
+    def _paint_on(self, canvas: Image.Image, y: int) -> None:
+        r = self.r
+        draw = ImageDraw.Draw(canvas)
+        ty = y
+        bg = _rgba(self.bg or r.t.pill_bg)
+        fg = _rgba(self.fg or r.t.pill_text)
+        for line in self.lines:
+            x = r.h_pad
+            for t, w in line:
+                draw.rounded_rectangle(
+                    [x, ty, x + w, ty + self.line_h], radius=self.line_h // 2, fill=bg
+                )
+                _draw_fallback(canvas, (x + self.pad_h, ty + 5), t, self.fs, fg)
+                x += w + self.gap
+            ty += self.line_h + 6
+
+
 class DialogueRow(Row):
     """聊天气泡行:momotalk 风格。
 

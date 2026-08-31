@@ -259,7 +259,13 @@ _ATTR_AV_RE = re.compile(r'av\s*=\s*"([^"]*)"', re.IGNORECASE)
 _ATTR_ME_RE = re.compile(r"\bme\b(?=\s|$|=)", re.IGNORECASE)
 
 # 兑底清理:未闭合 / 残缺的标签不允许原样漏进画面
-_STRAY_TAG_RE = re.compile(r"</?\s*(?:dlg|d|c)\b[^>]*>", re.IGNORECASE)
+_STRAY_TAG_RE = re.compile(r"</?\s*(?:dlg|d|c|t)\b[^>]*>", re.IGNORECASE)
+
+# 标签行:一行内一个或多个 `<t>xxx</t>`,渲染为小标签胶囊(TagRow)
+_TAG_LINE_RE = re.compile(
+    r"^(?:\s*<\s*t\b[^>]*>\s*.*?\s*</\s*t\s*>\s*)+$", re.IGNORECASE | re.DOTALL
+)
+_TAG_ONE_RE = re.compile(r"<\s*t\b[^>]*>\s*(.*?)\s*</\s*t\s*>", re.IGNORECASE | re.DOTALL)
 
 
 def _parse_dialogue_tag(line: str) -> Dialogue | None:
@@ -365,6 +371,16 @@ def parse_blocks(text: str) -> list[Block]:
         cap = _parse_capsule_tag(stripped)
         if cap is not None:
             blocks.append(cap)
+            i += 1
+            continue
+
+        # 标签行:<t>a</t><t>b</t> → Block("tags")
+        if _TAG_LINE_RE.match(stripped):
+            tb = Block("tags")
+            tb.items = [
+                parse_inline(m.group(1).strip()) for m in _TAG_ONE_RE.finditer(stripped)
+            ]
+            blocks.append(tb)
             i += 1
             continue
 

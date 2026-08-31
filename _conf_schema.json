@@ -185,5 +185,47 @@
     "type": "int",
     "hint": "最近 N 轮对话中出场过的角色视为活跃角色,完整注入其设定;窗口外的角色只显示名字,需要时由 LLM 按需读取。默认 6",
     "default": 6
+  },
+  "memory_enable": {
+    "description": "向量记忆(剧情事件记忆)开关",
+    "type": "bool",
+    "hint": "开启后:每轮自动把「用户行动→发生的事」写入向量记忆库,并在后续轮次按语义召回与当前剧情相关的历史事件,注入当轮 user 消息(不写入 system prompt,不破坏前缀缓存)。**只记录剧情事件,与角色/世界观设定(lore)完全解耦**——设定仍全部注入 system prompt。记忆生命周期 = 当前会话,/删除 或 /创建 覆盖时自动清空",
+    "default": true
+  },
+  "memory_auto_record": {
+    "description": "每轮自动记录剧情事件到向量记忆",
+    "type": "bool",
+    "hint": "关闭后仍可手动经 LLM 调 life_sim_memorize 工具保存关键事件。默认开",
+    "default": true
+  },
+  "memory_top_k": {
+    "description": "向量记忆每轮召回条数",
+    "type": "int",
+    "hint": "按与当前输入的相关度召回最多 N 条历史事件注入本轮。范围 1-20,默认 5",
+    "default": 5
+  },
+  "memory_min_score": {
+    "description": "向量记忆召回相似度阈值",
+    "type": "float",
+    "hint": "相似度低于此值的历史事件不召回(避免注入无关记忆)。范围 0-1,默认 0.10",
+    "default": 0.10
+  },
+  "memory_recall_chars": {
+    "description": "向量记忆召回块最大字符数",
+    "type": "int",
+    "hint": "召回的回忆块累计超过此长度即截断,控制 token 占用。默认 1600",
+    "default": 1600
+  },
+  "memory_content_chars": {
+    "description": "每轮自动记录的记忆文本最大长度",
+    "type": "int",
+    "hint": "自动记录时叙事超过此长度会截断,避免记忆库膨胀。默认 600",
+    "default": 600
+  },
+  "memory_max_entries": {
+    "description": "每会话向量记忆最大条数",
+    "type": "int",
+    "hint": "超出时丢弃最旧记忆(仅长期会话安全阀;正常生命周期随会话删除)。默认 400",
+    "default": 400
   }
 }

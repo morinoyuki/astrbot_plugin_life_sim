@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw
 
 from . import markdown as md
 from .rows import (
+    ChoiceRow,
     CodeRow,
     DialogueRow,
     EmptyRow,
@@ -20,6 +21,7 @@ from .rows import (
     PillRow,
     RichTextRow,
     Row,
+    TagRow,
     _draw_fallback,
     _measure_fallback,
 )
@@ -265,20 +267,33 @@ class ChatRenderer:
                 )
             )
         elif blk.type == "list":
-            for i, item in enumerate(blk.items):
-                prefix = f"{i + 1}. " if blk.ordered else "•  "
-                if not blk.ordered and len(blk.items) > 1 and i == len(blk.items) - 1:
-                    pass
-                span = [md.Span(prefix)] + item
-                self._rows.append(
-                    RichTextRow(
-                        self,
-                        span,
-                        font_size=int(self.font_size * 0.95),
-                        color=self.t.text_secondary,
-                        margin=(0, 2, 0, 2),
+            if blk.ordered:
+                # 有序列表 → 行动选项卡(1 2 3 4 …),支持「选项 — 后果暗示」拆分
+                for i, item in enumerate(blk.items):
+                    text = md.plain_text(item).strip()
+                    hint = ""
+                    for sep in (" — ", " - ", "：", ": "):
+                        if sep in text:
+                            text, _, hint = text.partition(sep)
+                            break
+                    self._rows.append(
+                        ChoiceRow(self, i + 1, text, hint)
                     )
-                )
+            else:
+                for i, item in enumerate(blk.items):
+                    span = [md.Span("•  ")] + item
+                    self._rows.append(
+                        RichTextRow(
+                            self,
+                            span,
+                            font_size=int(self.font_size * 0.95),
+                            color=self.t.text_secondary,
+                            margin=(0, 2, 0, 2),
+                        )
+                    )
+        elif blk.type == "tags":
+            tags = [md.plain_text(item) for item in blk.items]
+            self._rows.append(TagRow(self, tags))
         elif blk.type == "quote":
             self._rows.append(
                 RichTextRow(

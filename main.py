@@ -45,6 +45,7 @@ from .avatar_store import AvatarStore
 from .dice import DiceMixin
 from .im_render.engine import render_narrative
 from .md_to_image import MdToImageMixin
+from .memory_store import MemoryStore
 from .prompts import (
     CHAT_CARD_PROMPT,
     HELP_TEXT,
@@ -805,6 +806,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         self.rpg_store = RpgStore(self.data_dir)
         self.narrative_store = NarrativeStore(self.data_dir)
         self.branch_store = BranchStore(self.data_dir)
+        # 向量记忆存储:记录「发生过的事情」(剧情/事件记忆),生命周期 = 当前会话
+        self.memory_store = MemoryStore(self.data_dir)
+        self._setup_memory_embedding()
         # WebUI 插件页面(数据管理)的 REST 接口
         self._register_web_apis()
         # AstrBot 在配置存在时传入,缺失时为 None
@@ -820,8 +824,22 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         # 本轮 revise 暂存:{event_key: [修订前记录状态, ...]} — 本轮 LLM 是否调用过
         # life_sim_revise_narrative(列表非空即有);兼作 /undo 回滚修订的 pre-revision 数据
         self._pending_revise: dict[str, list] = {}
+        # 最近一次 _clear_sim 清理掉的向量记忆条数(用于 /删除 /创建 提示)
+        self._last_clear_mem_count = 0
         # Markdown → 图片渲染引擎(config 驱动,惰性加载样式)
         self._md_init()
+
+    def _setup_memory_embedding(self) -> None:
+        """把 AstrBot 配置的 Embedding Provider 接入向量记忆(若可用),否则用本地嵌入。"""
+        try:
+            pm = getattr(self.context, "provider_manager", None)
+            if pm is None:
+                return
+            insts = getattr(pm, "embedding_provider_insts", None) or []
+            if insts and hasattr(insts[0], "get_embeddings"):
+                self.memory_store.set_embedding_provider(insts[0])
+        except Exception as e:
+            logger.debug(f"life-sim: 向量记忆接入 Embedding Provider 失败(回退本地嵌入): {e}")
 
     # ─── 配置读取助手 ────────────────────────────────────────
 
@@ -1049,6 +1067,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         await self.sim_store.delete(key)
         # 头像按 scope 分区,随会话一起清除(默认头像在根目录,不动)
         self.avatar_store.clear_scope(key)
+        n_mem = await self.memory_store.delete_scope(key)
+        self._last_clear_mem_count = n_mem
         return await self.branch_store.delete_scope(key)
 
     def _busy_message(self) -> str:
@@ -1636,6 +1656,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 "life_sim_save_world_lore",
                 "life_sim_get_character_lore",
                 "life_sim_revise_narrative",
+                "life_sim_memorize",
             }
         )
 
@@ -2262,6 +2283,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             if last_nid:
                 user_input += _build_narrative_ref_tag(last_nid)
 
+        # 向量记忆召回:把与当前输入相关的「历史事件」注入到本轮 user 消息
+        # (不写入 system prompt,保住前缀缓存;每轮本就不同,零额外成本)
+        recall = await self._build_memory_recall(event_key, session, user_input)
+        if recall:
+            if not user_input.endswith("\n"):
+                user_input += "\n"
+            user_input += recall
+
         image_urls = [(img.url or img.path) for img in (imgs or [])]
         tool_hooks: _LifeSimToolHooks | None = None
         try:
@@ -2381,6 +2410,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             session["last_narrative_id"] = record_id
             await self._save_sim(event, session)
             text += f"\n\n📝 [剧情ID: `{record_id}`]"
+
+        # 向量记忆:把本轮「用户行动 → 发生的事」写入记忆库(失败静默)
+        await self._record_turn_memory(event_key, session, user_input, text, turn)
 
         return text
 
@@ -3037,6 +3069,126 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             )
         return lines
 
+    # ════════════════════════════════════════════════════════════
+    # 向量记忆:召回「相关回忆」 + 自动记录「发生过的事情」
+    # ════════════════════════════════════════════════════════════
+
+    async def _build_memory_recall(
+        self, event_key: str, session: dict, current_input: str
+    ) -> str | None:
+        """按当前输入召回相关历史记忆,格式化为注入 user 消息的文本块。
+
+        关键设计:召回结果**每轮不同**,因此放进每轮都在变的 user_input,
+        而不是 system prompt —— 保住 system prompt 的前缀缓存(与
+        `_build_narrative_ref_tag` 同一思路)。命中为空 / 召回失败返回 None。
+        """
+        if not self._cfg("memory_enable", True):
+            return None
+        top_k = max(1, min(20, int(self._cfg("memory_top_k", 5))))
+        min_score = float(self._cfg("memory_min_score", 0.10))
+        max_chars = max(100, int(self._cfg("memory_recall_chars", 1600)))
+        try:
+            hits = await self.memory_store.search(
+                event_key, current_input, top_k=top_k, min_score=min_score
+            )
+        except Exception as e:
+            logger.debug(f"life-sim: 向量记忆召回失败(跳过): {e}")
+            return None
+        if not hits:
+            return None
+        parts: list[str] = []
+        used = 0
+        for h in hits:
+            content = (h.get("content") or "").strip()
+            if not content:
+                continue
+            line = f"- {content}"
+            used += len(line) + 1
+            parts.append(line)
+            if used > max_chars:
+                break
+        if not parts:
+            return None
+        block = (
+            "## 📖 相关回忆(往昔发生过的事,延续剧情 / 设定时参照,勿与当前冲突)\n"
+            + "\n".join(parts)
+        )
+        return block
+
+    async def _record_turn_memory(
+        self,
+        event_key: str,
+        session: dict,
+        user_input: str,
+        narrative: str,
+        turn: int,
+    ) -> None:
+        """每轮 LLM 成功后,把本轮「用户行动 → 发生的事」写入向量记忆。
+
+        纯写(一次嵌入 + 落盘),不打断主流程;失败静默跳过。
+        与 lore(角色/世界观设定)完全解耦 —— 本模块只记剧情事件。
+        """
+        if not self._cfg("memory_enable", True):
+            return
+        if not self._cfg("memory_auto_record", True):
+            return
+        narr = (narrative or "").strip()
+        if not narr:
+            return
+        content_chars = max(50, int(self._cfg("memory_content_chars", 600)))
+        body = narr if len(narr) <= content_chars else narr[:content_chars] + "..."
+        action = _strip_xml_tags(user_input).strip()[:120]
+        content = f"用户行动:{action} → {body}" if action else body
+        try:
+            await self.memory_store.add(
+                event_key, content, turn=turn, importance=1, dedup_threshold=0.95
+            )
+            max_store = max(0, int(self._cfg("memory_max_entries", 400)))
+            if max_store:
+                await self.memory_store.set_max_entries(event_key, max_store)
+        except Exception as e:
+            logger.debug(f"life-sim: 写入向量记忆失败(跳过): {e}")
+
+    async def life_sim_memorize(
+        self, event, content: str = "", importance: int = 2
+    ) -> str:
+        """
+        把重要的剧情事件存入向量记忆,供后续轮次语义召回
+
+        适用场景:
+        - 关键转折 / 重大事件(生死、背叛、结盟、觉醒、重大抉择)
+        - 重要人物关系或动机的变化
+        - 用户特别强调要记住、不能忘的约定或目标
+        - 时间跨度很大的伏笔,后续要回应的线索
+
+        调用时机:认为这件事对**未来剧情**重要、值得在很久以后回来的时刻。
+        不要存琐碎的日常细节(每轮叙事已自动记录)。
+
+        Args:
+            content(string): 需要记住的剧情事件描述(简洁、自包含,含关键人名/地点/时间)。
+            importance(int): 重要度 1-3,默认 2。影响生存优先级:生死/关键设定变化给 3,一般重要 2,轻微 1。
+        Returns:
+            确认消息。
+        """
+        if not self.config or not self._cfg("memory_enable", True):
+            return "记忆功能未开启,已忽略。"
+        content = (content or "").strip()
+        if not content:
+            return "内容为空,未保存。"
+        importance = max(1, min(3, int(importance or 2)))
+        event_key = self._sim_session_key(event)
+        turn = 0
+        try:
+            session = await self._load_sim(event)
+            turn = session.get("lore_turn", 0) if session else 0
+            await self.memory_store.add(
+                event_key, content, turn=turn, importance=importance, dedup_threshold=0.95
+            )
+        except Exception as e:
+            logger.debug(f"life-sim: life_sim_memorize 写入失败: {e}")
+            return "记忆写入失败,请稍后重试。"
+        return f"✅ 已记住(重要度 {importance})。"
+
     async def life_sim_save_world_lore(
         self, event, content: str, section: str = "general"
     ) -> str:
@@ -3431,9 +3583,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         yield event.plain_result(
             f"🎬 命运开始转动 [模式 {mode} - {MODE_NAMES[mode]}],正在编织你的人生..."
             + (
-                f"\n⚠️ 已随旧会话清理 {n_branches} 个剧情分支存档。"
+                f"\n⚠️ 已随旧会话清理 {n_branches} 个剧情分支存档、{self._last_clear_mem_count} 条向量记忆。"
                 if n_branches
-                else ""
+                else (
+                    f"\n⚠️ 已随旧会话清理 {self._last_clear_mem_count} 条向量记忆。"
+                    if self._last_clear_mem_count
+                    else ""
+                )
             )
         )
         result = await self._generate(event, session, first_input, mode, imgs)
@@ -3615,9 +3771,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 else ""
             )
             branch_note = f",{n_branches} 个分支存档" if n_branches else ""
+            mem_note = f",{self._last_clear_mem_count} 条向量记忆" if self._last_clear_mem_count else ""
             yield event.plain_result(
                 "🗑️ 会话已删除"
-                f"{char_note}{sess_note}{branch_note}。\n"
+                f"{char_note}{sess_note}{branch_note}{mem_note}。\n"
                 "使用 /创建 <世界观> 可以开始一段新的人生。"
             )
             return

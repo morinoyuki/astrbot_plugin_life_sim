@@ -8,8 +8,9 @@
 - **独立上下文** — 叙事历史走文件存储 + 显式 `contexts` 传入 LLM,不污染主对话
 - **LLM 智能压缩** — 超长历史调 LLM 提炼成摘要(失败自动回退规则抽取),不是简单丢消息
 - **LLM 模式识别** — `/创建` 时调 LLM 分析语境判断 A/B/C(失败回退关键词匹配)
-- **完整工具链** — 20 个 `rpg_*` 工具(HP/EXP/装备/技能点/物品/货币)+ 4 个 `life_sim_*` lore 工具(保存/按需读取/剧情修订)+ `roll_dice` 骰子工具(模式 C)
+- **完整工具链** — 20 个 `rpg_*` 工具(HP/EXP/装备/技能点/物品/货币)+ 5 个 `life_sim_*` lore/记忆工具(保存/按需读取/剧情修订/向量记忆写入)+ `roll_dice` 骰子工具(模式 C)
 - **持久化 lore** — 角色设定(支持多角色,按 `character` 分组)+ 世界观设定由 LLM 在对话中自动调用工具落库,后续每轮注入 system prompt
+- **向量记忆** — 自动记录「发生过的事情」(剧情/事件记忆)到向量库,后续轮次按语义召回与当前剧情相关的历史事件,注入当轮 user 消息;与 lore 完全解耦,生命周期 = 当前会话,/删除 /创建 时自动清空
 - **/undo 完整回滚** — 叙事历史 + lore 快照 + RPG 数值(HP/EXP/装备/会话)按 turn 计数一起回滚
 - **每会话互斥锁** — `/创建` `/do` `/undo` `/redo` `/分支` `/删除` 各持同 session 的 `asyncio.Lock`,并发命令直接返回"上一条还在处理"
 - **灵活模型路由** — 主 provider / 模式专属 / 压缩 / 模式识别各自分配,可把不同任务路由到不同模型
@@ -112,7 +113,7 @@
 
 ## 配置
 
-WebUI → 插件管理 → 转生模拟器 → 配置,共 30 项:
+WebUI → 插件管理 → 转生模拟器 → 配置,共 37 项:
 
 ### 模型路由
 
@@ -158,6 +159,22 @@ WebUI → 插件管理 → 转生模拟器 → 配置,共 30 项:
 | `image_compress_enable`  | `true`  | 图片先压缩再发给 LLM(见「图片处理」)                                       |
 | `img_desc_prompt`        | `""`     | 图片转述提示词(留空用内置:侧重人物外观/服饰/场景细节)                     |
 | `lore_selective_load`    | `true`  | 选择性加载 lore(默认开,减少 system prompt 占用,见「持久化 lore」)         |
+
+### 向量记忆
+
+解决长期会话(数百轮)早期记忆因上下文压缩而丢失的问题。只记录**剧情事件**,与角色/世界观设定(lore)完全解耦 —— 设定仍全部注入 system prompt,此处仅负责事件记忆的写入与召回。
+
+| 字段                   | 默认  | 说明                                                                       |
+| ---------------------- | ----- | -------------------------------------------------------------------------- |
+| `memory_enable`        | `true`| 向量记忆总开关                                                              |
+| `memory_auto_record`   | `true`| 每轮自动把「用户行动→发生的事」写入向量记忆;关闭后仅靠 LLM 调 `life_sim_memorize` 保存 |
+| `memory_top_k`         | 5     | 每轮按相关度召回的历史事件条数(范围 1-20)                                  |
+| `memory_min_score`     | 0.10  | 召回相似度阈值,低于不计入(避免注入无关记忆)                                |
+| `memory_recall_chars`  | 1600  | 召回块最大字符数,超长截断控制 token 占用                                   |
+| `memory_content_chars` | 600   | 每轮自动记录的记忆文本最大长度                                              |
+| `memory_max_entries`   | 400   | 每会话记忆最大条数,超出丢最旧(仅长期会话安全阀)                           |
+
+召回结果注入**当轮 user 消息**(而非 system prompt),保住 system prompt 前缀缓存。嵌入优先用 AstrBot 配置的 Embedding Provider,未配置时回退到稳健的本地 n-gram 哈希嵌入(零依赖、跨重启稳定)。
 | `output_as_image`        | `false` | 开启后 `/创建` `/do` 的叙事输出自动渲染为图片(失败自动回退纯文本)           |
 | `output_image_style_path`| `""`     | pillowmd 模板样式目录;样式带 `page>0` 多帧动画背景时输出 GIF(如独角兽gif)  |
 | `output_image_auto_page` | `true`  | 渲染时自动分页(黄金分割比),避免超长单图                                   |
@@ -173,6 +190,18 @@ WebUI → 插件管理 → 转生模拟器 → 配置,共 30 项:
 | `chat_card_width`      | `1024`          | 卡片宽度(px)                              |
 | `chat_card_font_size`  | `34`            | 正文字号(px)                              |
 | `chat_card_max_pages`  | `5`             | 最大分页数(超出放弃渲染)                  |
+
+**聊天卡片内建多种排版样式**(LLM 输出规范见 `CHAT_CARD_PROMPT`):
+
+| 样式 | 写法 | 渲染效果 |
+| ---- | ---- | -------- |
+| 对白气泡 | `<d name="角色名" me>台词</d>` | 左侧/右侧(主角 `me`)IM 气泡,按角色名挂头像;无口角色可用 `<d name="…">【写下的字】</d>` |
+| 短旁白胶囊 | `<c>动作/神态/环境短句</c>` | 居中灰色胶囊 |
+| **行动选项卡** | 准确有序列表 `1. 冲上去 — 可能受伤` | **圆形序号徽章 + 选项 + 右侧后果提醒**(1 2 3 4…) |
+| **状态胶囊** | 一行内 `<t>HP 78</t><t>🔥 灼烧</t>` 连写 | **横向小标签条**,展示状态/结算/系统提示 |
+| 标题 / 长段 | `# 标题` / 普通段落 | 顶部标题栏 / 正文 |
+
+行动选项仅在需要玩家抉择的关键节点使用;状态胶囊`<t>`适合数值变化、buff/debuff、金币增减等简写结算。
 
 **模型路由推荐配置:**
 
@@ -198,7 +227,7 @@ WebUI → 插件管理 → 转生模拟器 → 配置,共 30 项:
 
 ```
 astrbot_plugin_life_sim/
-├── _conf_schema.json    # WebUI 配置 schema(30 项)
+├── _conf_schema.json    # WebUI 配置 schema(37 项)
 ├── metadata.yaml         # 插件元数据
 ├── requirements.txt      # 第三方依赖:pillowmd(聊天卡片渲染)
 ├── README.md             # 本文档
@@ -209,6 +238,11 @@ astrbot_plugin_life_sim/
 │                         #   - 模式识别 (LLM + 关键词)
 │                         #   - lore 暂存 + 多角色 character_lore
 │                         #   - 4 个 life_sim_* lore 工具(保存/按需读取/剧情修订)
+├── memory_store.py       # 向量记忆存储(剧情事件记忆,生命周期 = 当前会话)
+│                         #   - 每会话一个 JSON 记忆库,随 /删除 /创建 清空
+│                         #   - 优先用 AstrBot Embedding Provider,否则本地 n-gram 哈希嵌入
+│                         #   - add / search / recent / delete_scope / set_max_entries
+│                         #   - 自动记录每轮 + LLM 可调 life_sim_memorize 手动保存
 ├── prompts.py            # 系统提示词 + 模式检测
 │                         #   - COMMON_RULES (三模式共用)
 │                         #   - SYSTEM_PROMPT_A / B / C
