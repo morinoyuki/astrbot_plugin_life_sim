@@ -175,6 +175,50 @@ def _strip_meta_tags(text: str) -> str:
     return text.strip()
 
 
+_MEMORY_NO_STORY = "__NO_STORY__"
+
+
+def _format_recent_memories(recent_mems: list[dict] | None) -> str:
+    """把最近的已有记忆格式化为 `<recent_memory>` 标签块,供记忆总结器区分已有剧情。
+
+    空/无记忆时返回占位说明。每条记忆转义尖括号,避免破坏标签结构。
+    """
+    if not recent_mems:
+        return "<recent_memory>(暂无已有记忆)</recent_memory>"
+    parts = []
+    for m in recent_mems:
+        c = (m.get("content") or "").strip()
+        if not c:
+            continue
+        c = _escape_memory_content(c)
+        parts.append(f"<recent_memory>{c}</recent_memory>")
+    if not parts:
+        return "<recent_memory>(暂无已有记忆)</recent_memory>"
+    return "\n".join(parts)
+
+
+def _is_no_story(raw: str) -> bool:
+    """判断总结器 LLM 返回是否命中『无剧情进展』哨兵。"""
+    return bool(raw) and _MEMORY_NO_STORY.lower() in (raw or "").lower()
+
+
+def _extract_memory_summary(raw: str, limit: int = 500) -> str:
+    """从总结器 LLM 的原始返回中提取有效记忆总结(已剥离哨兵/标签/引号)。
+
+    调用方应先用 `_is_no_story` 过滤哨兵;本函数只负责清洗并截断到 limit。
+    """
+    raw = _strip_xml_tags(raw or "").strip()
+    if not raw:
+        return ""
+    # 去掉哨兵残留(防御:LLM 偶尔会带解释文字)
+    raw = raw.replace(_MEMORY_NO_STORY, "").strip()
+    if raw[0] in "\"'“”‘’":
+        raw = raw.strip(raw[0])
+    raw = re.sub(r"\s+", " ", raw).strip()
+    limit = max(60, int(limit or 500))
+    return raw[:limit]
+
+
 def _escape_memory_content(content: str) -> str:
     """转义记忆内容里可能破坏 XML 标签结构的非法字符。
 
@@ -1875,7 +1919,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
     @staticmethod
     def _is_my_tool(name: str) -> bool:
-        """过滤:只保留本插件的工具(rpg_*/roll_dice/life_sim_save_*/life_sim_get_*/life_sim_revise_narrative)。"""
+        """过滤:只保留本插件的工具(rpg_*/roll_dice/life_sim_save_*/life_sim_get_*/life_sim_revise_narrative/life_sim_recall_memory/life_sim_forget_memory)。"""
         return bool(name) and (
             name.startswith("rpg_")
             or name
@@ -1885,7 +1929,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 "life_sim_save_world_lore",
                 "life_sim_get_character_lore",
                 "life_sim_revise_narrative",
-                "life_sim_memorize",
+                "life_sim_recall_memory",
+                "life_sim_forget_memory",
             }
         )
 
@@ -2640,11 +2685,12 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             await self._save_sim(event, session)
             text += f"\n\n📝 [剧情ID: `{record_id}`]"
 
-        # 向量记忆:把本轮「用户行动 → 发生的事」写入记忆库(失败静默)
+        # 向量记忆:把本轮「剧情进展」总结写入记忆库(失败静默,成功/失败不影响主流程)
         await self._record_turn_memory(
+            event,
             event_key,
             session,
-            user_input,
+            provider_id,
             text,
             turn,
             mode=mode,
@@ -3341,7 +3387,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 continue
             # 转义非法字符:记忆可能含不配对尖括号等,包进 <memory_recall> 会破坏标签闭合
             content = _escape_memory_content(content)
-            line = f"- {content}"
+            # 带上记忆自己的 id(m_xxx),供 LLM 独立管理(如用 life_sim_forget_memory 删除)
+            mid = (h.get("id") or "").strip()
+            mid_pfx = f"[{mid}] " if mid else ""
+            line = f"- {mid_pfx}{content}"
             used += len(line) + 1
             parts.append(line)
             if used > max_chars:
@@ -3361,44 +3410,58 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
     async def _record_turn_memory(
         self,
+        event,
         event_key: str,
         session: dict,
-        user_input: str,
+        provider_id: str,
         narrative: str,
         turn: int,
         mode: str = "A",
         tool_hooks: "_LifeSimToolHooks | None" = None,
     ) -> None:
-        """记录本轮「用户行动 → 发生的剧情进展」到向量记忆。
+        """记录本轮剧情进展到向量记忆(所有模式统一自动记录,无手动记忆工具)。
 
-        方案 A 分工(避免冗余 + 避免逐字存全文):
-        - **模式 B/C**(有工具):以 LLM 主动调 `life_sim_memorize` 为准。
-          若本轮已调过 → 直接跳过(不重复);否则存一条**精简摘要**作为兑底。
-        - **模式 A**(无工具):LLM 无法主动调,存一条**精简摘要**作为兑底。
+        记录内容是「本轮的剧情进展总结」:不包含用户行动输入 —— 用户说了什么
+        属于咨询/指令,不需要沉淀进长期记忆;真正值得记住的是「这轮剧情发生了什么」。
+        总结默认用 LLM 生成(`memory_summarize_by_llm`),失败时回退到规则摘要。
 
-        存的是**精简剧情进展摘要**(用户行动 + 一句剧情动向),而非整段叙事原文 ——
-        避免记忆库被上千字描述词、对白、氛围渲染撑爆。
+        **只记「有实质剧情推进」的轮**。由总结器 LLM 自行判断本轮是否值得记忆:
+        如果本轮只是保存角色/世界观设定、纯闲聊、纯氛围/过场而无剧情进展,LLM
+        返回无剧情哨兵 → 跳过,不污染剧情事件记忆库。日常叙述中 LLM 边推进剧情
+        边顺手保存新设定也属正常剧情轮,会照常记忆。
         """
         if not self._cfg("memory_enable", True):
             return
         if not self._cfg("memory_auto_record", True):
             return
 
-        # 模式 B/C:若本轮 LLM 已主动调 life_sim_memorize,则不重复自动记录
-        if mode in ("B", "C") and self._called_memorize(tool_hooks):
-            return
-
         narr = _clean_narrative_for_memory(narrative)
         if not narr:
             return
-        # 精简摘要:用户行动 + 一句剧情动向(取清洗后叙事的关键段)
-        action = _strip_xml_tags(user_input).strip()[:120]
-        limit = max(60, int(self._cfg("memory_content_chars", 200)))
-        summary = self._compact_turn_summary(narr, limit)
-        if action:
-            content = f"用户行动:{action} → {summary}"
-        else:
-            content = summary
+        limit = max(60, int(self._cfg("memory_content_chars", 500)))
+        summary = ""
+        if self._cfg("memory_summarize_by_llm", True):
+            try:
+                # 检索最近几条已有记忆作为上下文,帮助总结器区分「本轮新增剧情」
+                # 与「已记住的内容」,避免重复记录 / 更好判断本轮是否有新进展。
+                recent_mems = await self.memory_store.recent(event_key, 6)
+                raw = await self._llm_summarize_memory(
+                    event, provider_id, narr, limit, recent_mems=recent_mems
+                )
+            except Exception as e:
+                logger.debug(f"life-sim: LLM 总结记忆失败,回退规则摘要: {e}")
+                raw = ""
+            # LLM 明确判定本轮无剧情进展 → 直接跳过,不写记忆、也不回退规则摘要
+            if raw and _is_no_story(raw):
+                logger.debug("life-sim: 本轮无实质剧情推进,跳过向量记忆")
+                return
+            if raw:
+                summary = _extract_memory_summary(raw, limit)
+        if not summary:
+            summary = self._compact_turn_summary(narr, limit)
+        if not summary:
+            return
+        content = summary
         try:
             await self.memory_store.add(
                 event_key, content, turn=turn, importance=1, dedup_threshold=0.95
@@ -3409,16 +3472,67 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         except Exception as e:
             logger.debug(f"life-sim: 写入向量记忆失败(跳过): {e}")
 
-    @staticmethod
-    def _called_memorize(tool_hooks) -> bool:
-        """本轮 agent loop 是否调用过 life_sim_memorize。"""
-        if tool_hooks is None:
-            return False
-        for step in getattr(tool_hooks, "steps", []) or []:
-            for tc in step.get("tool_calls") or []:
-                if tc.get("name") == "life_sim_memorize":
-                    return True
-        return False
+    async def _llm_summarize_memory(
+        self, event, provider_id: str, narrative: str, limit: int,
+        recent_mems: list[dict] | None = None,
+    ) -> str:
+        """用 LLM 把本轮叙事总结成一条剧情记忆。
+
+        Provider 沿用主流程的 provider_id(与当轮叙事同源,保证角色/风格一致)。
+        要求输出一段自包含的剧情进展总结(不含用户行动、不含聊天标签、不被氛围
+        渲染淹没、不超 limit 字)。**由 LLM 自行判断本轮是否有值得记忆的剧情 
+        进展**:若无(纯设定保存/闲聊/过场),输出 `_MEMORY_NO_STORY` 哨兵,由调用方跳过。
+        失败抛异常由调用方回退规则摘要。
+
+        `recent_mems`:最近几条**已有记忆**,用 `<recent_memory>` 标签+说明包起,
+        作为上下文让 LLM 区分「已记住的历史」与「本轮新增剧情」,避免重复记录、
+        并辅助判断本轮是否有新进展。
+        """
+        if not provider_id:
+            raise RuntimeError("无 provider_id,跳过 LLM 总结")
+        sys_prompt = (
+            "你是转生模拟的剧情记忆整理器。任务:判断本轮叙事**是否有值得长期记住的"
+            "新剧情进展**,若有则整理成一条精炼的自包含记忆(注意与已有记忆区分,只记本轮新增)。\n"
+            "判断标准(有任一即为「有剧情进展」,应当记忆):\n"
+            "- 发生了实质事件(战斗、抉择、相遇、离别、发现、达成目标等)\n"
+            "- 人物关系 / 动机 / 状态发生了值得记住的变化\n"
+            "- 埋下或回应了伏笔、线索、约定\n"
+            "- 出现了会延续到未来的重要事实(新人物、新地点、新身份、重要物品)\n"
+            "判断为【无新剧情进展】的典型情况(应当跳过,不记忆):\n"
+            "- 本轮内容与已有记忆相同/重复(没有新信息,别重复记)\n"
+            "- 只是保存/补充角色或世界观设定(`life_sim_save_*`),没有任何剧情推进\n"
+            "- 只是纯闲聊、问答、氛围/景色/过场描写,没有事件发生\n"
+            "- 只是确认/总结/复述,没有新进展\n\n"
+            "输出规则:\n"
+            "- 若**无新剧情进展** → 只输出一行:`__NO_STORY__`\n"
+            "- 若有 → 输出总结(只记本轮新增,不要重复已有记忆里的内容):\n"
+            "  1. 只总结【剧情本身发生了什么】;不要记录用户说了什么(指令/选择都不需要)\n"
+            "  2. 不要聊天标签(<d> <c> <t> 等)、不要 markdown 标题、不要编号\n"
+            "  3. 不要氛围/景色/外貌渲染;聚焦实质推进\n"
+            "  4. 纯文本段落,自包含(单独抽出也能读懂)"
+        )
+        prompt = (
+            "以下是<i>最近已记住的记忆</i>(供你区分已有剧情,避免重复记录;这些是过去发生的,不是本轮):\n"
+            + _format_recent_memories(recent_mems)
+            + "\n\n===== 本轮 =====\n"
+            f"以下是本轮剧情叙事(应作为新进展判断):\n---\n{narrative[:4000]}\n---\n"
+            f"请判断:本轮有实质**新**剧情进展就总结(不超过约 {limit} 字,尽量精简);"
+            "无新进展就只输出 __NO_STORY__。"
+        )
+        llm_resp = await self._run_llm_with_stats(
+            event,
+            provider_id,
+            lambda: self.context.llm_generate(
+                chat_provider_id=provider_id,
+                system_prompt=sys_prompt,
+                contexts=[],
+                prompt=prompt,
+            ),
+        )
+        text = (getattr(llm_resp, "completion_text", "") or "").strip()
+        if not text:
+            raise RuntimeError("LLM 返回空总结")
+        return text  # 原始文本,由调用方解析哨兵 / 剥离标签
 
     @staticmethod
     def _compact_turn_summary(narr: str, limit: int = 160) -> str:
@@ -3440,49 +3554,97 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             body = body[:limit] + "…"
         return body
 
-    async def life_sim_memorize(
-        self, event, content: str = "", importance: int = 2
+    async def life_sim_recall_memory(
+        self, event, query: str = "", top_k: int = 5
     ) -> str:
         """
-        把重要的剧情事件存入向量记忆,供后续轮次语义召回
+        主动召回向量记忆:按 query 语义检索过往剧情事件,返回相关的历史记忆。
 
-        适用场景:
-        - 关键转折 / 重大事件(生死、背叛、结盟、觉醒、重大抉择)
-        - 重要人物关系或动机的变化
-        - 用户特别强调要记住、不能忘的约定或目标
-        - 时间跨度很大的伏笔,后续要回应的线索
+        调用时机:当你想回顾某段过去的剧情(人物关系、过往约定、伏笔、某个
+        地方/人物/事件)而**当轮自动注入的回忆不够或想再深挖**时调用。
+        例如用户提到一个老伏笔,而你记不清细节;或需要延续很久以前埋下的线。
 
-        调用时机:认为这件事对**未来剧情**重要、值得在很久以后回来的时刻。
-        不要存琐碎的日常细节(每轮叙事已自动记录)。
+        也可用于核实:确认某件重要事情是否发生过、以及当时的具体情况。
 
         Args:
-            content(string): 需要记住的剧情事件描述(简洁、自包含,含关键人名/地点/时间)。
-            importance(int): 重要度 1-3,默认 2。影响生存优先级:生死/关键设定变化给 3,一般重要 2,轻微 1。
+            query(string): 检索关键词/问题,描述你想回忆的剧情内容(含关键人名/地点/事件)。
+            top_k(int, optional): 最多返回条数,1-20。默认 5。
         Returns:
-            确认消息。
+            若干条相关记忆(按相关度降序,带记忆 id `m_xxx`);无命中返回提示。
+            每条记忆是自包含的剧情事件描述。
         """
-        if not self.config or not self._cfg("memory_enable", True):
-            return "记忆功能未开启,已忽略。"
-        content = _clean_narrative_for_memory(content)
-        if not content:
-            return "内容为空,未保存。"
-        importance = max(1, min(3, int(importance or 2)))
+        if not self._cfg("memory_enable", True):
+            return "记忆功能未开启。"
         event_key = self._sim_session_key(event)
-        turn = 0
+        top_k = max(1, min(20, int(top_k or 5)))
+        min_score = float(self._cfg("memory_min_score", 0.10))
+        q = (query or "").strip()
         try:
-            session = await self._load_sim(event)
-            # 工具在 agent loop 内、lore_turn 递增**之前**执行,磁盘上的 lore_turn
-            # 仍是上一轮旧值。本轮的新 turn = 磁盘值 + 1(与 _generate 末尾
-            # session["lore_turn"]+1 后 _record_turn_memory 使用的 turn 一致),否则
-            # 记忆 turn 偏早一轮,导致 /undo 回滚时删不掉这条手动记忆。
-            turn = (session.get("lore_turn", 0) if session else 0) + 1
-            await self.memory_store.add(
-                event_key, content, turn=turn, importance=importance, dedup_threshold=0.95
+            hits = await self.memory_store.search(
+                event_key, q, top_k=top_k, min_score=min_score
             )
         except Exception as e:
-            logger.debug(f"life-sim: life_sim_memorize 写入失败: {e}")
-            return "记忆写入失败,请稍后重试。"
-        return f"✅ 已记住(重要度 {importance})。"
+            logger.debug(f"life-sim: life_sim_recall_memory 召回失败: {e}")
+            return "召回记忆失败,请稍后重试。"
+        if not hits:
+            return "没有找到与此相关的过往记忆。"
+        parts = []
+        for h in hits:
+            content = _escape_memory_content((h.get("content") or "").strip())
+            if not content:
+                continue
+            mid = (h.get("id") or "").strip()
+            mid_pfx = f"[{mid}] " if mid else ""
+            parts.append(f"- {mid_pfx}{content}")
+        if not parts:
+            return "没有找到与此相关的过往记忆。"
+        return (
+            "相关回忆(按相关度,带记忆 id):\n"
+            + "\n".join(parts)
+            + "\n(以上为历史记忆,供延续剧情/设定参照;若与当前冲突以当前为准。若某条记忆已过时/错误,可用 life_sim_forget_memory 删除。)"
+        )
+
+    async def life_sim_forget_memory(
+        self, event, ids: str = "", ids_list: list | None = None
+    ) -> str:
+        """
+        删除指定 id 的向量记忆(应对剧情被修改/推翻后过时的记忆)。
+
+        调用时机:当某条历史记忆已**过时/被推翻/与当前剧情冲突**(例如用户反馈
+        某段剧情写错了、实际上剧情不是那样),应删除它,避免后续回忆注入过时内容。
+
+        记忆的 id(`m_xxx`)由 <memory_recall> 自动注入,或经 life_sim_recall_memory
+        返回——直接复制即可。
+
+        Args:
+            ids(string): 要删除的记忆 id(单个),如 "m_a1b2c3d4"。
+            ids_list(list[string], optional): 也可传多个 id 的列表,如 ["m_a1b2c3d4", "m_e5f6a7b8"]。
+        Returns:
+            成功/失败消息,含实际删除条数。
+        """
+        if not self._cfg("memory_enable", True):
+            return "记忆功能未开启。"
+        # 收集 id:兼容单个字符串 / “,”分隔 / 列表
+        want: list[str] = []
+        if isinstance(ids_list, list):
+            want.extend(str(x).strip() for x in ids_list if x)
+        if ids:
+            for piece in str(ids).replace("，", ",").split(","):
+                piece = piece.strip()
+                if piece:
+                    want.append(piece)
+        want = list(dict.fromkeys(want))  # 去重保序
+        if not want:
+            return "❌ 请提供要删除的记忆 id(如 m_a1b2c3d4),见 <memory_recall> 或 life_sim_recall_memory。"
+        event_key = self._sim_session_key(event)
+        try:
+            removed = await self.memory_store.delete_entries_by_id(event_key, want)
+        except Exception as e:
+            logger.debug(f"life-sim: life_sim_forget_memory 删除失败: {e}")
+            return "删除记忆失败,请稍后重试。"
+        if removed == 0:
+            return f"未删除任何记忆(已不存在或 id 不匹配):{'、'.join(want)}"
+        return f"✅ 已删除 {removed} 条记忆。"
 
     async def life_sim_save_world_lore(
         self, event, content: str, section: str = "general"
@@ -3524,8 +3686,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         - 习得技能 / 称号 / 职业变更
         - 重要 NPC 的设定
 
-        注意:战斗中发生了什么、说了什么话、旅途细节属于向量记忆(自动记录),
-        不要存进这里。若某事件值得长期记住,用 life_sim_memorize。
+        注意:战斗中发生了什么、说了什么话、旅途细节属于向量记忆(每轮自动记录),
+        不要存进这里。
 
         Args:
             content(string): 角色设定内容(详细描述)
@@ -4199,7 +4361,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         session["messages"] = messages
 
         # 回滚向量记忆:删除 turn >= target_turn 的记忆(第 target_turn 轮及之后
-        # 产生的剧情记忆,含该轮自动记录与 life_sim_memorize)。
+        # 产生的剧情记忆,含该轮自动记录)。
         # 与 lore/RPG/剧情历史同一步骤同步回滚,避免 /undo 后残留被否定的未来记忆。
         mem_removed = 0
         if self._cfg("memory_enable", True):

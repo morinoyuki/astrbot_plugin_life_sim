@@ -447,7 +447,7 @@
     const s = MEM_DATA.scopes.find((x) => x.scope === scope);
     $("#m-meta").textContent = `${scope} · 共 ${s?.count ?? 0} 条 · 嵌入源:${s?.embed_source ?? "-"}`;
     if (!s?.entries?.length) {
-      tbody.innerHTML = `<tr><td colspan="7" class="muted">该 scope 暂无记忆(每轮 /do 自动写入,或用 life_sim_memorize 保存)</td></tr>`;
+      tbody.innerHTML = `<tr><td colspan="7" class="muted">该 scope 暂无记忆(每轮 /do 自动写入;无剧情进展的轮自动跳过)</td></tr>`;
       return;
     }
     tbody.innerHTML = s.entries.map((e) => `

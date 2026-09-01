@@ -8,7 +8,7 @@
 - **独立上下文** — 叙事历史走文件存储 + 显式 `contexts` 传入 LLM,不污染主对话
 - **LLM 智能压缩** — 超长历史调 LLM 提炼成摘要(失败自动回退规则抽取),不是简单丢消息
 - **LLM 模式识别** — `/创建` 时调 LLM 分析语境判断 A/B/C(失败回退关键词匹配)
-- **完整工具链** — 20 个 `rpg_*` 工具(HP/EXP/装备/技能点/物品/货币)+ 5 个 `life_sim_*` lore/记忆工具(保存/按需读取/剧情修订/向量记忆写入)+ `roll_dice` 骰子工具(模式 C)
+- **完整工具链** — 20 个 `rpg_*` 工具(HP/EXP/装备/技能点/物品/货币)+ 6 个 `life_sim_*` 工具(保存/按需读取/剧情修订/主动召回/删除记忆)+ `roll_dice` 骰子工具(模式 C)
 - **持久化 lore** — 角色设定(支持多角色,按 `character` 分组)+ 世界观设定由 LLM 在对话中自动调用工具落库,后续每轮注入 system prompt
 - **向量记忆** — 自动记录「发生过的事情」(剧情/事件记忆)到向量库,后续轮次按语义召回与当前剧情相关的历史事件,注入当轮 user 消息;与 lore 完全解耦,生命周期 = 当前会话,/删除 /创建 时自动清空
 - **/undo 完整回滚** — 叙事历史 + lore 快照 + RPG 数值(HP/EXP/装备/会话)按 turn 计数一起回滚
@@ -167,11 +167,12 @@ WebUI → 插件管理 → 转生模拟器 → 配置,共 37 项:
 | 字段                   | 默认  | 说明                                                                       |
 | ---------------------- | ----- | -------------------------------------------------------------------------- |
 | `memory_enable`        | `true`| 向量记忆总开关                                                              |
-| `memory_auto_record`   | `true`| 每轮把「用户行动→剧情进展」的**精简摘要**写入向量记忆;模式 B/C 下若本轮 LLM 已主动调 `life_sim_memorize` 则不重复。关闭后仅靠 LLM 调 `life_sim_memorize` 保存 |
+| `memory_auto_record`   | `true`| 每轮把「本轮剧情进展」写入向量记忆(**不含用户行动/输入**;总结器判断为无实质剧情推进的轮——纯设定保存/闲聊——自动跳过);所有模式统一自动记录,无手动写记忆工具 |
+| `memory_summarize_by_llm`| `true`| 自动记忆是否用 LLM 把本轮叙事总结成一条记忆(不记用户行动、去氛围渲染);关闭则用规则截断摘要兑底 |
 | `memory_top_k`         | 5     | 每轮按相关度召回的历史事件条数(范围 1-20)                                  |
 | `memory_min_score`     | 0.10  | 召回相似度阈值,低于不计入(避免注入无关记忆)                                |
 | `memory_recall_chars`  | 1600  | 召回块最大字符数,超长截断控制 token 占用                                   |
-| `memory_content_chars` | 200   | 每轮自动记录的剧情摘要长度(默认原文截断改为精简摘要)                    |
+| `memory_content_chars` | 500   | 每条自动记忆的最大长度(LLM/规则两种方式都遵守此上限)                       |
 | `memory_max_entries`   | 400   | 每会话记忆最大条数,超出丢最旧(仅长期会话安全阀)                           |
 
 召回结果注入**当轮 user 消息**(而非 system prompt),保住 system prompt 前缀缓存。嵌入优先用 AstrBot 配置的 Embedding Provider,未配置时回退到稳健的本地 n-gram 哈希嵌入(零依赖、跨重启稳定)。
@@ -238,12 +239,13 @@ astrbot_plugin_life_sim/
 │                         #   - 历史压缩 (LLM + 规则)
 │                         #   - 模式识别 (LLM + 关键词)
 │                         #   - lore 暂存 + 多角色 character_lore
-│                         #   - 4 个 life_sim_* lore 工具(保存/按需读取/剧情修订)
+│                         #   - 6 个 life_sim_* 工具(保存/按需读取/剧情修订/主动召回/删除记忆)
 ├── memory_store.py       # 向量记忆存储(剧情事件记忆,生命周期 = 当前会话)
 │                         #   - 每会话一个 JSON 记忆库,随 /删除 /创建 清空
 │                         #   - 优先用 AstrBot Embedding Provider,否则本地 n-gram 哈希嵌入
 │                         #   - add / search / recent / delete_scope / set_max_entries
-│                         #   - 自动记录每轮 + LLM 可调 life_sim_memorize 手动保存
+│                         #   - 自动记录每轮(无实质剧情推进的轮自动跳过)
+                         #   - life_sim_recall_memory / life_sim_forget_memory 供 LLM 主动召回/删除记忆
 ├── prompts.py            # 系统提示词 + 模式检测
 │                         #   - COMMON_RULES (三模式共用)
 │                         #   - SYSTEM_PROMPT_A / B / C

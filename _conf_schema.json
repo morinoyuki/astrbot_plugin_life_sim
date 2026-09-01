@@ -195,7 +195,7 @@
   "memory_auto_record": {
     "description": "每轮自动记录剧情事件到向量记忆",
     "type": "bool",
-    "hint": "关闭后仍可手动经 LLM 调 life_sim_memorize 工具保存关键事件。默认开",
+    "hint": "关闭后不自动记录。剧情事件全部靠每轮自动总结写入向量记忆(无手动写记忆工具);可从后台页或 life_sim_recall_memory 工具召回。默认开",
     "default": true
   },
   "memory_top_k": {
@@ -216,11 +216,17 @@
     "hint": "召回的回忆块累计超过此长度即截断,控制 token 占用。默认 1600",
     "default": 1600
   },
+  "memory_summarize_by_llm": {
+    "description": "自动记忆是否用 LLM 总结本轮剧情(而非规则截断)",
+    "type": "bool",
+    "hint": "开启后每轮自动记忆会调用一次 LLM 把本轮叙事总结成精炼记忆(不记用户行动、不存氛围渲染);每次会多消耗一轮 token。关闭则用规则截断摘要作为兑底。默认 true",
+    "default": true
+  },
   "memory_content_chars": {
-    "description": "每轮自动记录的剧情摘要长度",
+    "description": "每条自动记忆的最大长度",
     "type": "int",
-    "hint": "自动记录(模式 A 兜底 / 模式 B·C 时 LLM 未主动记忆)存的精简剧情进展摘要最大字数。摘要而非全文,避免记忆库被描述词撑爆。默认 200",
-    "default": 200
+    "hint": "自动记录(模式 A 兜底 / 模式 B·C 时 LLM 未主动记忆)存的剧情进展总结最大字数。LLM/规则两种方式都遵守此上限。默认 500",
+    "default": 500
   },
   "memory_max_entries": {
     "description": "每会话向量记忆最大条数",

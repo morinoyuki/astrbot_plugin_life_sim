@@ -22,9 +22,13 @@ sys.modules["lsim_pkg"] = _pkg
 _spec.loader.exec_module(_pkg)
 
 from lsim_pkg.main import (
+    _MEMORY_NO_STORY,
     LifeSimPlugin,
     _clean_narrative_for_memory,
     _escape_memory_content,
+    _extract_memory_summary,
+    _format_recent_memories,
+    _is_no_story,
     _strip_meta_tags,
     _strip_xml_tags,
 )
@@ -49,23 +53,128 @@ def test_compact_turn_summary():
     assert len(s2) <= 65
 
 
-def test_called_memorize():
-    """判断本轮 agent loop 是否已调 life_sim_memorize(避免自动记录重复)。"""
+def test_memory_no_story_helpers():
+    """总结器 LLM 的哨兵/清洗辅助函数。"""
+    assert _is_no_story("__NO_STORY__") is True
+    assert _is_no_story("  __NO_STORY__  \n") is True
+    assert _is_no_story("北境之行启程") is False
+    assert _is_no_story("") is False
 
-    class HooksYes:
+    # 有剧情 → 返回清洗后的总结
+    s = _extract_memory_summary("  阿龙与凌霜结伴前往北境。  ", 500)
+    assert s == "阿龙与凌霜结伴前往北境。"
+    # 截断(下限 60)
+    s2 = _extract_memory_summary("一" * 100, 60)
+    assert len(s2) <= 60, len(s2)
+    # 哨兵残留被清空
+    assert _extract_memory_summary(f"说明文字{_MEMORY_NO_STORY}") == "说明文字"
+    # 空
+    assert _extract_memory_summary("   ") == ""
+
+    # 最近记忆标签格式化
+    empty = _format_recent_memories(None)
+    assert "recent_memory" in empty and "暂无" in empty
+    one = _format_recent_memories([{"content": "主角在山谷救下雪音"}])
+    assert "<recent_memory>主角在山谷救下雪音</recent_memory>" in one
+    esc = _format_recent_memories([{"content": "伤害 a<b"}])
+    assert "a〈b" in esc and "<recent_memory>伤害 a〈b</recent_memory>" in esc
+
+
+def test_record_turn_memory_summarizes():
+    """自动记忆:用 LLM 总结本轮剧情(不含用户行动);失败回退规则摘要;
+    纯设定保存轮(调 life_sim_save_*)跳过不记忆。"""
+
+    class _R:
+        completion_text = "北境之行启程:阿龙与凌霜结伴前往北境。"
+
+    class _FakeStore:
         def __init__(self):
-            self.steps = [
-                {"tool_calls": [{"name": "rpg_get_status"}]},
-                {"tool_calls": [{"name": "life_sim_memorize"}]},
-            ]
+            self.added = []
 
-    class HooksNo:
+        async def add(self, *a, **k):
+            self.added.append((a[1], k))
+
+        async def set_max_entries(self, *a, **k):
+            pass
+
+        async def recent(self, scope, limit=6):
+            return []
+
+    class _FakeCtx:
         def __init__(self):
-            self.steps = [{"tool_calls": [{"name": "rpg_get_status"}]}]
+            self.calls = []
 
-    assert LifeSimPlugin._called_memorize(HooksYes()) is True
-    assert LifeSimPlugin._called_memorize(HooksNo()) is False
-    assert LifeSimPlugin._called_memorize(None) is False
+        async def llm_generate(self, **k):
+            self.calls.append(k.get("chat_provider_id"))
+            return _R()
+
+    class _FakePlugin(LifeSimPlugin):
+        def __init__(self):
+            self.memory_store = _FakeStore()
+            self.context = _FakeCtx()
+
+        def _cfg(self, k, d=None):
+            return {
+                "memory_enable": True,
+                "memory_auto_record": True,
+                "memory_summarize_by_llm": True,
+                "memory_content_chars": 500,
+                "memory_max_entries": 400,
+            }.get(k, d)
+
+        async def _run_llm_with_stats(self, event, pid, fn):
+            return await fn()
+
+    narr = "阿龙晃了晃药剂瓶。\n阿龙:放心，交给我。\n他们一起离开了城门,往北境而去。\n月光洒下。"
+
+    def _run(p, mode="A", tool_hooks=None):
+        asyncio.run(
+            p._record_turn_memory(None, "g", {}, "providerX", narr, 7, mode=mode, tool_hooks=tool_hooks)
+        )
+
+    # 场景 1:LLM 总结成功,不含用户行动,用传入 provider
+    p = _FakePlugin()
+    _run(p)
+    c = p.memory_store.added[0][0]
+    assert "用户行动" not in c, c
+    assert "北境" in c
+    assert p.context.calls == ["providerX"], p.context.calls
+
+    # 场景 2:LLM 失败 → 回退规则摘要,仍不含用户行动
+    class _Fail(_FakePlugin):
+        async def _llm_summarize_memory(self, *a, **k):
+            raise RuntimeError("boom")
+
+    p2 = _Fail()
+    _run(p2)
+    c2 = p2.memory_store.added[0][0]
+    assert "用户行动" not in c2, c2
+    assert c2
+
+    # 场景 3:总结器判定本轮无剧情进展(纯设定保存/闲聊)→ 跳过,不记忆
+    class _RNoStory:
+        completion_text = _MEMORY_NO_STORY
+
+    class _CtxNoStory(_FakeCtx):
+        async def llm_generate(self, **k):
+            self.calls.append(k.get("chat_provider_id"))
+            return _RNoStory()
+
+    p3 = _FakePlugin()
+    p3.context = _CtxNoStory()
+    _run(p3)
+    assert not p3.memory_store.added, "无剧情进展轮不应写入记忆"
+
+    # 场景 4:即便调了 save_*(纯设定)但没有剧情,也跳过(与场景 3 一致),
+    # 且无剧情时必须跳过、不能回退到规则摘要
+    class _HooksSave:
+        def __init__(self):
+            self.steps = [{"tool_calls": [{"name": "life_sim_save_world_lore"}]}]
+
+    p4 = _FakePlugin()
+    p4.context = _CtxNoStory()
+    _run(p4, mode="B", tool_hooks=_HooksSave())
+    assert not p4.memory_store.added
     """注入记忆时,内容里的尖括号等非法字符应被转义,避免破坏 <memory_recall> 标签闭合。"""
     assert _escape_memory_content("a<b 且 c>d") == "a〈b 且 c〉d"
     assert _escape_memory_content("残留 </d>") == "残留 〈/d〉"
@@ -269,6 +378,46 @@ async def main():
     after = await store.recent(scope, 100)
     assert len(after) == 1 and "少女" not in after[0]["content"]
 
+    # 11. 记忆 id 注入召回 + life_sim_forget_memory 按 id 删除(独立管理,不与 n_xxxx 耦合)
+    fscope = "group_forget"
+    id1 = await store.add(fscope, "主角在山谷救了白发少女雪音,她自称来自北境", turn=1)
+    id2 = await store.add(fscope, "主角被国王册封为骑士领主", turn=2)
+    assert id1 and id2
+    # 召回注入应带记忆 id(供 LLM 引用)
+    from lsim_pkg.main import LifeSimPlugin as _P
+
+    class _ForgetPlugin(_P):
+        def __init__(self, st):
+            self.memory_store = st
+
+        def _cfg(self, k, d=None):
+            return {
+                "memory_enable": True,
+                "memory_top_k": 5,
+                "memory_min_score": 0.10,
+                "memory_recall_chars": 1600,
+            }.get(k, d)
+
+        def _sim_session_key(self, event):
+            return fscope
+
+    fp = _ForgetPlugin(store)
+    block = await fp._build_memory_recall(fscope, {}, "雪音是谁")
+    assert block and id1 in block, block
+    # 单条删除
+    out = await fp.life_sim_forget_memory(None, ids=id1)
+    assert "已删除 1" in out, out
+    remain = await store.recent(fscope, 20)
+    assert all(e["id"] != id1 for e in remain)
+    # 再删(已不存在)
+    out2 = await fp.life_sim_forget_memory(None, ids=id1)
+    assert "未删除" in out2, out2
+    # 批量删除(ids_list)
+    out3 = await fp.life_sim_forget_memory(None, ids_list=[id2])
+    assert "已删除 1" in out3, out3
+    assert await store.count(fscope) == 0
+    await store.delete_scope(fscope)
+
     # 清空
     removed = await store.delete_scope(scope)
     assert removed == 1 and await store.count(scope) == 0
@@ -323,6 +472,8 @@ if __name__ == "__main__":
     print("✓ 注入记忆时非法字符被转义")
     test_compact_turn_summary()
     print("✓ 自动记忆存精简摘要(非整段原文)")
-    test_called_memorize()
-    print("✓ 检测本轮是否已调 life_sim_memorize")
+    test_memory_no_story_helpers()
+    print("✓ 总结器哨兵识别与清洗")
+    test_record_turn_memory_summarizes()
+    print("✓ 自动记忆用 LLM 总结(不记用户行动/失败回退/无剧情轮跳过)")
     asyncio.run(main())
