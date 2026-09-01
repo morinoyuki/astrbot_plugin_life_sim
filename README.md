@@ -8,10 +8,11 @@
 - **独立上下文** — 叙事历史走文件存储 + 显式 `contexts` 传入 LLM,不污染主对话
 - **LLM 智能压缩** — 超长历史调 LLM 提炼成摘要(失败自动回退规则抽取),不是简单丢消息
 - **LLM 模式识别** — `/创建` 时调 LLM 分析语境判断 A/B/C(失败回退关键词匹配)
-- **完整 RPG/DND 工具链** — 27 个 `rpg_*` 工具(HP/EXP/装备/技能/技能点/物品)+ `roll_dice` 骰子工具(模式 C)
+- **完整工具链** — 20 个 `rpg_*` 工具(HP/EXP/装备/技能点/物品/货币)+ 6 个 `life_sim_*` 工具(保存/按需读取/剧情修订/主动召回/删除记忆)+ `roll_dice` 骰子工具(模式 C)
 - **持久化 lore** — 角色设定(支持多角色,按 `character` 分组)+ 世界观设定由 LLM 在对话中自动调用工具落库,后续每轮注入 system prompt
+- **向量记忆** — 自动记录「发生过的事情」(剧情/事件记忆)到向量库,后续轮次按语义召回与当前剧情相关的历史事件,注入当轮 user 消息;与 lore 完全解耦,生命周期 = 当前会话,/删除 /创建 时自动清空
 - **/undo 完整回滚** — 叙事历史 + lore 快照 + RPG 数值(HP/EXP/装备/会话)按 turn 计数一起回滚
-- **每会话互斥锁** — `/创建` `/do` `/undo` `/删除` 各持同 session 的 `asyncio.Lock`,并发命令直接返回"上一条还在处理"
+- **每会话互斥锁** — `/创建` `/do` `/undo` `/redo` `/分支` `/删除` 各持同 session 的 `asyncio.Lock`,并发命令直接返回"上一条还在处理"
 - **灵活模型路由** — 主 provider / 模式专属 / 压缩 / 模式识别各自分配,可把不同任务路由到不同模型
 - **引用兼容** — 回复消息时自动提取引用内容作为补充背景传入
 - **人生结束标记** — 死亡结局输出 `<LIFE_SIM_END>`,插件自动识别并提示重开
@@ -26,6 +27,26 @@
 | `/undo [N]`                 | 撤销最近 N 轮对话(默认 1)。叙事历史 + 持久化 lore + RPG 数值全部按 turn 回滚  |
 | `/redo`                     | 重试上一轮:自动回滚最近一轮,并用相同输入(含图片)重新生成                  |
 | `/删除`                     | 删除当前会话,同时清理该群/私聊的 RPG 存档与会话文件                          |
+| `/lore [角色名\|世界观]`    | 查看角色/世界观持久化设定;`/lore 删除 <角色名>` 删除该角色当前设定(不动快照,/undo 可恢复)   |
+| `/头像 <角色名>` + 图片      | 为聊天卡片中的指定角色设置头像(不设置则回退到默认头像/角色名首字占位)           |
+| `/删除头像 <角色名>`         | 删除指定角色的头像                                                            |
+| `/分支 [子命令] [名称]`      | 剧情分支管理:`当前` / `保存 <名>` / `切换 <名>` / `列表` / `删除 <名>`,多结局存档 |
+| `/历史 [N]`                  | 列出当前会话最近的 N 条剧情记录(默认 10)                                      |
+| `/上传历史 [jsonl] [last N\|all]` | 导出剧情历史为文件发送(JSON / JSONL,可跨 scope)                              |
+| `/删除历史 <id\|all>`        | 删除指定剧情记录,或清空当前 scope 全部                                        |
+
+> 💡 **默认头像**:把图片命名为 `default.png` 放到数据目录的 `avatars/` 下作为全局默认头像
+> (例如 `<数据目录>/avatars/default.png`),未设置专属头像的角色都会使用它;未放置默认头像时
+> 显示以角色名首字符绘制的圆角占位头像。也可选择为单个角色设置:`/头像 阿龙 <图片>`。
+>
+> 💡 **头像自选**:开启聊天卡片后,模型可自行决定让任意角色使用列表中的某张已有头像 ——
+> 对白用 `角色名@头像名: 台词` 格式(例如 `阴影少女@汐见小亚: 你是谁?`),气泡显示「阴影少女」
+> 但头像用「汐见小亚」;不写 `@` 时默认按角色名对头像做模糊匹配。
+
+> 💡 **聊天卡片(实验性)**:在插件配置中开启 `chat_card_enable` 后,剧情中的角色对白
+> 会以即时通讯聊天气泡的样式渲染成图片(类似《蔚蓝档案》桃信),支持 `light` / `dark`
+> 主题、自定宽度 / 字号、自动分页。开启后 `角色名:对白` 会被识别为一条消息,其余文本
+> 渲染为居中旁白。用 `/头像` 为角色指定头像后,聊天卡片会自动使用。
 
 **支持群聊和私聊**(私聊可能无 prefix,插件通过 `text.find(cmd)` 自适应)。
 
@@ -92,7 +113,7 @@
 
 ## 配置
 
-WebUI → 插件管理 → 转生模拟器 → 配置,共 12 项:
+WebUI → 插件管理 → 转生模拟器 → 配置,共 37 项:
 
 ### 模型路由
 
@@ -104,6 +125,7 @@ WebUI → 插件管理 → 转生模拟器 → 配置,共 12 项:
 | `provider_mode_c`         | `""` | 模式 C 专属 — 推荐能力强模型                    |
 | `compress_provider_id`    | `""` | 压缩任务专用 — 路由到便宜模型省成本             |
 | `mode_detect_provider_id` | `""` | 模式识别专用 — 路由到便宜分类模型               |
+| `img_desc_provider_id`    | `""` | 图片转述专用 — 主模型不支持多模态时用它把图变文字;留空用 AstrBot 系统默认转述模型 |
 
 优先级(每个字段):`field 专属 > provider_id > 会话默认(provider_id 空时)`
 
@@ -114,7 +136,18 @@ WebUI → 插件管理 → 转生模拟器 → 配置,共 12 项:
 | `tool_max_steps`     | 30    | 5-100  | 模式 B/C 单次 LLM 调用最大工具步数  |
 | `tool_call_timeout`  | 60    | 10-300 | 单次工具调用超时(秒)                |
 | `max_history_chars`  | 60000 | —      | 叙事历史最大字符数,超过时压缩成摘要 |
-| `keep_tail_messages` | 20    | —      | 压缩后保留的最近消息条数            |
+| `keep_tail_messages` | 10    | —      | 压缩后保留的最近轮数(一次 /do 输入算一轮,回复与工具调用随属同轮) |
+| `lore_active_rounds` | 6     | —      | 活跃角色检测窗口(轮)              |
+| `image_max_size`     | 1280  | 64-8192| 图片压缩后最长边(px),仅超限时缩放   |
+| `image_quality`      | 90    | 1-100  | JPEG 压缩质量(透明图不受影响)        |
+
+### 图片处理
+
+`/创建`、`/do`(含 `/redo`)传入图片时统一走以下管线:
+
+1. **先压缩**(`image_compress_enable`,默认开):等比缩放到最长边 `image_max_size` 并重编码(JPEG 质量 `image_quality`;透明图保持 PNG;GIF 动图跳过),大幅降低多模态 token 与上传耗时。压缩失败自动回退原图;
+2. **多模态检测**:主模型的 `modalities` 未配置视为支持;显式配置且不含 `image` 时判定为不支持;
+3. **不支持时自动转述**:改调「图片转述专用模型」(插件 `img_desc_provider_id` > AstrBot 系统设置「默认图片转述模型」)把图片描述为 `<Image Description>` 文字注入本轮剧情上下文,消息历史也不再落 base64(省存储);两者都未配置时仅注入占位提示。
 
 ### 开关
 
@@ -122,9 +155,54 @@ WebUI → 插件管理 → 转生模拟器 → 配置,共 12 项:
 | ------------------------ | ------- | -------------------------------------------------------------------------- |
 | `use_llm_compress`       | `true`  | 关闭则用纯规则抽取标题与世界观(快但粗)                                     |
 | `use_llm_mode_detect`    | `true`  | 关闭则只用关键词匹配(快但简陋)                                             |
+| `record_llm_stats`       | `true`  | 上报 LLM 用量到系统数据统计                                                 |
+| `image_compress_enable`  | `true`  | 图片先压缩再发给 LLM(见「图片处理」)                                       |
+| `img_desc_prompt`        | `""`     | 图片转述提示词(留空用内置:侧重人物外观/服饰/场景细节)                     |
+| `lore_selective_load`    | `true`  | 选择性加载 lore(默认开,减少 system prompt 占用,见「持久化 lore」)         |
+
+### 向量记忆
+
+解决长期会话(数百轮)早期记忆因上下文压缩而丢失的问题。只记录**剧情事件**,与角色/世界观设定(lore)完全解耦 —— 设定仍全部注入 system prompt,此处仅负责事件记忆的写入与召回。
+
+| 字段                   | 默认  | 说明                                                                       |
+| ---------------------- | ----- | -------------------------------------------------------------------------- |
+| `memory_enable`        | `true`| 向量记忆总开关                                                              |
+| `memory_auto_record`   | `true`| 每轮把「本轮剧情进展」写入向量记忆(**不含用户行动/输入**;总结器判断为无实质剧情推进的轮——纯设定保存/闲聊——自动跳过);所有模式统一自动记录,无手动写记忆工具 |
+| `memory_summarize_by_llm`| `true`| 自动记忆是否用 LLM 把本轮叙事总结成一条记忆(不记用户行动、去氛围渲染);关闭则用规则截断摘要兑底 |
+| `memory_top_k`         | 5     | 每轮按相关度召回的历史事件条数(范围 1-20)                                  |
+| `memory_min_score`     | 0.10  | 召回相似度阈值,低于不计入(避免注入无关记忆)                                |
+| `memory_recall_chars`  | 1600  | 召回块最大字符数,超长截断控制 token 占用                                   |
+| `memory_content_chars` | 500   | 每条自动记忆的最大长度(LLM/规则两种方式都遵守此上限)                       |
+| `memory_max_entries`   | 400   | 每会话记忆最大条数,超出丢最旧(仅长期会话安全阀)                           |
+
+召回结果注入**当轮 user 消息**(而非 system prompt),保住 system prompt 前缀缓存。嵌入优先用 AstrBot 配置的 Embedding Provider,未配置时回退到稳健的本地 n-gram 哈希嵌入(零依赖、跨重启稳定)。
 | `output_as_image`        | `false` | 开启后 `/创建` `/do` 的叙事输出自动渲染为图片(失败自动回退纯文本)           |
 | `output_image_style_path`| `""`     | pillowmd 模板样式目录;样式带 `page>0` 多帧动画背景时输出 GIF(如独角兽gif)  |
 | `output_image_auto_page` | `true`  | 渲染时自动分页(黄金分割比),避免超长单图                                   |
+| `chat_card_enable`       | `false` | 剧情对白显示为聊天卡片(IM 样式,实验性,见下方说明)                         |
+
+### 聊天卡片
+
+| 字段                   | 默认            | 说明                                        |
+| ---------------------- | --------------- | ------------------------------------------- |
+| `chat_card_theme`      | `light`         | 卡片主题(light / dark)                     |
+| `chat_card_title`      | `""`            | 卡片标题(留空不显示标题栏)                 |
+| `chat_card_self_names` | `我,自己,你,玩家` | 兕底判定「主角」的称呼(逗号分隔,右侧蓝色气泡) |
+| `chat_card_width`      | `1024`          | 卡片宽度(px)                              |
+| `chat_card_font_size`  | `34`            | 正文字号(px)                              |
+| `chat_card_max_pages`  | `5`             | 最大分页数(超出放弃渲染)                  |
+
+**聊天卡片内建多种排版样式**(LLM 输出规范见 `CHAT_CARD_PROMPT`):
+
+| 样式 | 写法 | 渲染效果 |
+| ---- | ---- | -------- |
+| 对白气泡 | `<d name="角色名" me>台词</d>` | 左侧/右侧(主角 `me`)IM 气泡,按角色名挂头像;无口角色可用 `<d name="…">【写下的字】</d>` |
+| 短旁白胶囊 | `<c>动作/神态/环境短句</c>` | 居中灰色胶囊 |
+| **行动选项卡** | 准确有序列表 `1. 冲上去 — 可能受伤` | **圆形序号徽章 + 选项 + 右侧后果提醒**(1 2 3 4…) |
+| **状态胶囊** | 一行内 `<t>HP 78</t><t>🔥 灼烧</t>` 连写 | **横向小标签条**,展示状态/结算/系统提示 |
+| 标题 / 长段 | `# 标题` / 普通段落 | 顶部标题栏 / 正文 |
+
+行动选项仅在需要玩家抉择的关键节点使用;状态胶囊`<t>`适合数值变化、buff/debuff、金币增减等简写结算。
 
 **模型路由推荐配置:**
 
@@ -133,20 +211,41 @@ WebUI → 插件管理 → 转生模拟器 → 配置,共 12 项:
 - 历史压缩 → 最便宜的模型(只是抽取要点)
 - 模式识别 → 便宜的分类模型(简单 A/B/C 选择)
 
+## 插件页面(WebUI 数据管理)
+
+插件自带一个 WebUI 页面:`插件管理 → 转生模拟器 → 页面 → manage`(需 AstrBot 版本支持插件页面)。功能:
+
+- **总览**:各存储的文件数/体积统计;
+- **模拟会话**:列表(模式/创建者/轮数/Lore 条数/大小),支持查看详情、编辑世界观设定与创建者、导出 JSON、删除(可选连带剧情记录);
+- **Lore 编辑**:世界观 lore 与分角色 character_lore 逐条编辑(seq/分类/内容),可增删条目与角色,保存时自动清洗非法字段、补齐 seq;
+- **消息回滚**:按消息粒度回滚(删除该条及之后全部),并同步修剪 turn 快照;
+- **剧情历史**:主线/分支线的剧情记录查看、修订全文、删除;
+- **向量记忆**:按 scope 查看全部记忆条目(重要度/轮次/时间),支持单条删除、勾选批量删除、按关键字删除、清空 scope、导出 JSON;
+- **分支存档 / RPG 存档**:查看与删除。
+
+所有变更操作复用聊天命令同一把会话锁,不会与群内 /do 并发冲突;接口仅登录后的 dashboard 可调用。旧版 AstrBot 无插件页面能力时自动跳过注册,不影响聊天指令。
+
 ## 文件结构
 
 ```
 astrbot_plugin_life_sim/
-├── _conf_schema.json    # WebUI 配置 schema(12 项)
+├── _conf_schema.json    # WebUI 配置 schema(37 项)
 ├── metadata.yaml         # 插件元数据
-├── requirements.txt      # 无第三方依赖
+├── requirements.txt      # 第三方依赖:pillowmd(聊天卡片渲染)
 ├── README.md             # 本文档
 ├── main.py               # 主入口 - LifeSimPlugin 类
-│                         #   - 4 个指令 + LLM 调度
+│                         #   - 14 个指令(/创建 /do /进度 /undo /redo /分支 /lore /头像 等)
 │                         #   - 文件会话 (SimStore)
 │                         #   - 历史压缩 (LLM + 规则)
 │                         #   - 模式识别 (LLM + 关键词)
 │                         #   - lore 暂存 + 多角色 character_lore
+│                         #   - 6 个 life_sim_* 工具(保存/按需读取/剧情修订/主动召回/删除记忆)
+├── memory_store.py       # 向量记忆存储(剧情事件记忆,生命周期 = 当前会话)
+│                         #   - 每会话一个 JSON 记忆库,随 /删除 /创建 清空
+│                         #   - 优先用 AstrBot Embedding Provider,否则本地 n-gram 哈希嵌入
+│                         #   - add / search / recent / delete_scope / set_max_entries
+│                         #   - 自动记录每轮(无实质剧情推进的轮自动跳过)
+                         #   - life_sim_recall_memory / life_sim_forget_memory 供 LLM 主动召回/删除记忆
 ├── prompts.py            # 系统提示词 + 模式检测
 │                         #   - COMMON_RULES (三模式共用)
 │                         #   - SYSTEM_PROMPT_A / B / C
@@ -157,9 +256,17 @@ astrbot_plugin_life_sim/
 │                         #   - _roll_dice_expr (NdM, NdMk{h,l}X, +/-)
 │                         #   - DiceMixin.roll_dice (LLM 工具)
 ├── rpg_tools.py          # RPG 工具全套(模式 B/C)
-│                         #   - 27 个 rpg_* LLM 工具
+│                         #   - 20 个 rpg_* LLM 工具
 │                         #   - DEFAULT_WORLD_RULES
 │                         #   - RPGMixin 类(标注 self.data_dir / self.rpg_store)
+├── avatar_store.py       # AvatarStore:角色头像存取(avatars/<scope>/<角色名>.png)
+├── md_to_image.py        # Markdown → 图片渲染统一入口(基于 pillowmd,PNG/GIF)
+├── pillowmd_patch.py     # 上游 pillowmd 库的兼容补丁(导入时自动应用)
+├── im_render/            # 聊天卡片渲染引擎(实验性)
+│                         #   - engine.py 块布局/分页/绘制,markdown.py 解析,rows.py 行绘制,style.py 样式
+├── pages/manage/         # WebUI 插件页面:数据管理(bridge SDK + 原生 JS)
+│                         #   - index.html 入口,app.js 逻辑,style.css 双主题样式
+│                         #   - 对应 main.py 里 _register_web_apis 注册的 /api/* REST 接口
 ├── storage_base.py       # JSON 文件存储公共原语
 │                         #   - read_json / write_json_atomic(原子写)
 │                         #   - safe_remove / ensure_dir
@@ -215,7 +322,6 @@ LLM 调用时通过 `contexts=[...]` 显式传入,完全不走主对话的 `conv
 - `world_lore`:list 结构 `[{section, content, updated_at}]`,同 section 覆盖。工具签名:
   ```
   life_sim_save_world_lore(content, section)
-  life_sim_get_world_lore(section="")     # 按需读取世界观(留空返回全部)
   ```
 - **选择性加载**(`lore_selective_load` 默认开,`lore_active_rounds` 默认 6):
   角色多 / 轮数多时,system prompt 不再被整棵角色树撑爆 ——
@@ -228,6 +334,8 @@ LLM 调用时通过 `contexts=[...]` 显式传入,完全不走主对话的 `conv
   自动昵称推导(小X/阿X/X酱、末 2 字称呼、去编号后缀)作为兜底,宁多勿漏。
 - 工具调用写入 `self._pending_lore` 实例暂存,**不立即落库**;`_generate_locked` 末尾与消息一起一次性 `_save_sim`,消除"工具内 save vs 外层 save"的竞态。
 - `/undo` 用 turn 计数回滚 lore(每 turn 开始时拍快照),不受消息压缩/增删影响。
+- **失败轮不推进 turn 计数**:`/do` 只有在 LLM 成功返回后才递增 `lore_turn` 并提交 lore/剧情/RPG 快照——失败或空输出的轮次不产生 turn、不落消息,`/undo N` 按消息数回滚时与轮数严格一一对应,不会少删剧情历史。
+- 每条 user 消息落库时盖上本轮 `turn` 戳,`/undo N` 优先按戳定位回滚目标轮(消息与轮次一一对应,压缩/失败轮也不影响);老会话(消息无戳)用快照指纹(剧情记录数/lore/RPG 变化)推断每轮是否真实成功,仍无法推断才回退到按 `lore_turn` 倒推。
 
 ### RPG 状态快照与回滚
 
@@ -240,7 +348,7 @@ LLM 调用时通过 `contexts=[...]` 显式传入,完全不走主对话的 `conv
 
 ### 并发互斥
 
-每个 session 一把 `asyncio.Lock`,挂在 `self._sim_locks[key]`。`/创建` `/do` `/undo` `/删除` 各自在命令入口取锁;`lock.locked()` 时返回"⏳ 上一条还在处理"提示,不等待。`asyncio.Lock` 不可重入,所以 `_generate` 不再取锁,锁完全在命令层互斥。
+每个 session 一把 `asyncio.Lock`,挂在 `self._sim_locks[key]`。`/创建` `/do` `/undo` `/redo` `/分支` `/删除` 各自在命令入口取锁;`lock.locked()` 时返回"⏳ 上一条还在处理"提示,不等待。`asyncio.Lock` 不可重入,所以 `_generate` 不再取锁,锁完全在命令层互斥。
 
 ### 历史压缩
 
@@ -251,6 +359,7 @@ LLM 调用时通过 `contexts=[...]` 显式传入,完全不走主对话的 `conv
 3. LLM 失败自动回退规则抽取(快速但粗)
 4. 摘要自身超 8000 字符硬截断兜底
 5. 下次压缩时旧摘要会纳入 head,重新生成新摘要 — 摘要不会无限增长
+6. 尾部保留范围按「轮」计:一次 /do 用户输入算一轮,其后的回复与工具调用随属同轮;切分边界永远落在真实用户消息上(旧压缩产物 `_summary` 不算一轮)
 
 ### 模式识别
 
@@ -266,6 +375,6 @@ LLM 调用时通过 `contexts=[...]` 显式传入,完全不走主对话的 `conv
 ## 注意事项
 
 - **每个群(或私聊)同时只有一段人生** — 新 `/创建` 会覆盖旧的,同时清理该群/私聊的 RPG 存档
-- **依赖**:无第三方依赖,使用 AstrBot 自带能力
+- **依赖**:仅 `pillowmd`(聊天卡片/叙事图片渲染,连带 Pillow);其余使用 AstrBot 自带能力
 - **最低 AstrBot 版本**: `>=4.5.7`(用到 `llm_generate` 的 `system_prompt` / `contexts` 参数;老版本会自动回退)
 - **上下文窗口**:大部分模型支持 32k-128k,设置 `max_history_chars` 在 30k-100k 之间比较合理

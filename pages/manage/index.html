@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>转生模拟器 · 数据管理</title>
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">🎲 转生模拟器 <span class="sub">数据管理</span></div>
+  <button id="btn-refresh" class="btn ghost" title="重新加载当前页数据">↻ 刷新</button>
+</header>
+
+<nav class="tabs" id="tabs">
+  <button class="tab active" data-tab="overview">📊 总览</button>
+  <button class="tab" data-tab="sessions">💾 模拟会话</button>
+  <button class="tab" data-tab="narrative">📜 剧情历史</button>
+  <button class="tab" data-tab="memory">🧠 向量记忆</button>
+  <button class="tab" data-tab="branches">🌿 分支存档</button>
+  <button class="tab" data-tab="rpg">⚔️ RPG 存档</button>
+</nav>
+
+<main id="main">
+
+  <!-- ── 总览 ── -->
+  <section class="panel active" id="tab-overview">
+    <div class="cards" id="ov-cards"></div>
+    <p class="hint muted" id="ov-datadir"></p>
+  </section>
+
+  <!-- ── 模拟会话 ── -->
+  <section class="panel" id="tab-sessions">
+    <div class="table-wrap"><table class="tbl" id="sessions-tbl">
+      <thead><tr><th>会话 scope</th><th>模式</th><th>创建者</th><th>轮数</th><th>消息</th><th>Lore</th><th>世界观</th><th>大小</th><th>更新时间</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+
+  <!-- ── 剧情历史 ── -->
+  <section class="panel" id="tab-narrative">
+    <div class="toolbar">
+      <label>scope <select id="n-scope"></select></label>
+      <label>剧情线 <select id="n-branch"></select></label>
+      <button class="btn ghost" id="n-load">载入</button>
+    </div>
+    <div class="table-wrap"><table class="tbl" id="narr-tbl">
+      <thead><tr><th>ID</th><th>时间</th><th>摘要</th><th>用户行动</th><th>字数</th><th>修订</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+
+  <!-- ── 向量记忆 ── -->
+  <section class="panel" id="tab-memory">
+    <div class="toolbar">
+      <label>scope <select id="m-scope"></select></label>
+      <button class="btn ghost" id="m-load">载入</button>
+      <button class="btn ghost" id="m-export">导出 JSON</button>
+      <span class="spacer"></span>
+      <input id="m-keyword" placeholder="按关键字删…">
+      <button class="btn ghost" id="m-del-kw">删匹配</button>
+      <button class="btn danger" id="m-del-all">清空该 scope</button>
+    </div>
+    <p class="hint muted" id="m-meta"></p>
+    <div class="table-wrap"><table class="tbl" id="mem-tbl">
+      <thead><tr><th style="width:2.5em"><input type="checkbox" id="m-checkall"></th><th>ID</th><th>重要度</th><th>轮</th><th>时间</th><th>内容</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <div class="row-end"><button class="btn danger" id="m-del-sel">删除选中</button></div>
+  </section>
+
+  <!-- ── 分支存档 ── -->
+  <section class="panel" id="tab-branches">
+    <div class="toolbar">
+      <label>scope <select id="b-scope"></select></label>
+      <button class="btn ghost" id="b-load">载入</button>
+    </div>
+    <div class="table-wrap"><table class="tbl" id="branch-tbl">
+      <thead><tr><th>分支名</th><th>信息</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+
+  <!-- ── RPG 存档 ── -->
+  <section class="panel" id="tab-rpg">
+    <h3>角色存档</h3>
+    <div class="table-wrap"><table class="tbl" id="rpg-char-tbl">
+      <thead><tr><th>uid</th><th>名字</th><th>等级</th><th>HP</th><th>群</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <h3>会话存档</h3>
+    <div class="table-wrap"><table class="tbl" id="rpg-sess-tbl">
+      <thead><tr><th>session_id</th><th>规则</th><th>群</th><th>成员</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+  </section>
+</main>
+
+<!-- 会话详情抽屉 -->
+<div class="drawer-mask" id="drawer-mask"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-head">
+    <strong id="drawer-title">会话详情</strong>
+    <span class="muted" id="drawer-sub"></span>
+    <button class="btn ghost" id="drawer-close">✕ 关闭</button>
+  </div>
+  <div class="drawer-body">
+    <div class="drawer-tabs">
+      <button class="dt active" data-dt="info">设定 / 世界观</button>
+      <button class="dt" data-dt="lore">Lore 管理</button>
+      <button class="dt" data-dt="msgs">消息历史</button>
+    </div>
+
+    <div class="dpane active" id="dp-info">
+      <label class="fld">创建者 <input id="e-owner"></label>
+      <label class="fld">世界观设定<textarea id="e-world" rows="10" spellcheck="false"></textarea></label>
+      <div class="row-end"><button class="btn primary" id="save-basic">保存基本信息</button></div>
+    </div>
+
+    <div class="dpane" id="dp-lore">
+      <h4>世界观 Lore <button class="btn tiny" id="wl-add">+ 新增条目</button></h4>
+      <div id="wl-list" class="lore-list"></div>
+      <h4>角色 Lore</h4>
+      <div id="cl-add-row" class="toolbar">
+        <input id="cl-new-name" placeholder="新角色名">
+        <button class="btn tiny" id="cl-add">+ 新增角色</button>
+      </div>
+      <div id="cl-list" class="lore-list"></div>
+      <div class="row-end"><button class="btn primary" id="save-lore">保存全部 Lore</button></div>
+    </div>
+
+    <div class="dpane" id="dp-msgs">
+      <p class="hint muted">「回滚」会删除该条及之后的所有消息,并修剪 turn 快照。谨慎操作。</p>
+      <ol id="msg-list" class="msg-list"></ol>
+    </div>
+  </div>
+</aside>
+
+<!-- 通用弹窗(编辑剧情 / 查看 JSON / 自定义确认) -->
+<div class="modal-mask" id="modal-mask">
+  <div class="modal" role="dialog">
+    <div class="modal-head"><strong id="modal-title"></strong></div>
+    <div class="modal-body" id="modal-body"></div>
+    <div class="modal-foot" id="modal-foot"></div>
+  </div>
+</div>
+
+<div id="toast" class="toast"></div>
+
+<script src="/api/plugin/page/bridge-sdk.js"></script>
+<script src="./app.js"></script>
+</body>
+</html>

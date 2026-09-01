@@ -137,9 +137,7 @@ class BranchStore:
 
     async def delete(self, scope: str, name: str) -> bool:
         """删除单条分支快照。"""
-        return await asyncio.to_thread(
-            safe_remove, self._path(scope, name)
-        )
+        return await asyncio.to_thread(safe_remove, self._path(scope, name))
 
     async def delete_scope(self, scope: str) -> int:
         """删除整个 scope 的所有分支快照,返回删除条数。"""

@@ -8,10 +8,14 @@
 
 import asyncio
 import copy
+import functools
 import json
 import os
 import re
+import shutil
 import time
+from collections.abc import Awaitable, Callable
+from contextvars import ContextVar
 
 import docstring_parser
 from astrbot.api import logger
@@ -32,24 +36,46 @@ from astrbot.core.agent.tool import ToolSet
 from astrbot.core.astr_agent_context import AstrAgentContext
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.message.components import Image
-from astrbot.core.provider.entities import LLMResponse
+from astrbot.core.provider.entities import LLMResponse, TokenUsage
 from astrbot.core.provider.func_tool_manager import PY_TO_JSON_TYPE
 from astrbot.core.star.star_tools import StarTools
 from astrbot.core.utils.quoted_message.extractor import QuotedMessageExtractor
 
+from .avatar_store import AvatarStore
 from .dice import DiceMixin
+from .im_render import markdown as _md
+from .im_render.engine import render_narrative
 from .md_to_image import MdToImageMixin
+from .memory_store import MemoryStore
 from .prompts import (
+    CHAT_CARD_PROMPT,
     HELP_TEXT,
     MODE_DETECT_SYSTEM_PROMPT,
     MODE_NAMES,
     SUMMARY_SYSTEM_PROMPT,
     SYSTEM_PROMPTS,
+    TYPOGRAPHY_CHAT_CARD,
+    TYPOGRAPHY_TEXT,
     _keyword_detect_mode,
     _parse_mode_prefix,
 )
 from .rpg_tools import RPGMixin
+from .storage_base import list_json_stems, write_json_atomic
 from .storage_branch import BranchStore
+
+try:  # AstrBot ≥ 4.x 提供图片压缩工具;旧版缺失时优雅降级为不压缩
+    from astrbot.core.utils.media_utils import compress_image
+except ImportError:  # pragma: no cover
+    compress_image = None
+
+try:  # 插件 Web API / 插件页面(较新版本提供);旧版缺失时跳过页面接口注册
+    from astrbot.api.web import error_response as _web_error
+    from astrbot.api.web import file_response as _web_file
+    from astrbot.api.web import json_response as _web_json
+    from astrbot.api.web import request as _web_request
+except ImportError:  # pragma: no cover
+    _web_error = _web_file = _web_json = _web_request = None
+
 from .storage_narrative import NarrativeStore
 from .storage_rpg import RpgStore
 from .storage_sim import SimStore
@@ -107,33 +133,165 @@ def _chain_to_content_parts(chain) -> list:
 
 
 def _strip_xml_tags(text: str) -> str:
-    """去除 <xxx>...</xxx> 标签块(包括内部内容),只保留用户真实输入。
+    """去除系统注入标签块及环境标签,只保留用户真实输入。
 
-    用于 /undo 预览时去掉 <system_reminder>、<Quoted Message>、<environment_details>
-    等噪声。
+    用于 /undo 预览、剧情历史 user_action、历史摘要等去掉 <system_reminder>、
+    <Quoted Message>、<environment_details> 等噪声。
+
+    先**具名精确剔除** system_reminder / narrative_ref / memory_recall:
+    这三个是插件注入的标签,内部可能含聊天卡片标签(<d>/<c>/<t>)甚至不成对的
+    尖括号 —— 若用通用正则匹配成对标签,内部标签会错配成闭合标记,
+    导致外层标签剥不干净、残留内容。具名方式把整块整体删掉,内部再乱也不影响。
+    然后再用通用正则兜底处理其余普通环境标签。
     """
-    cleaned = re.sub(
+    if not text:
+        return ""
+    # 第一步:具名精确剔除插件注入标签(整体删除,内部标签不干扰)
+    for tag in ("system_reminder", "narrative_ref", "memory_recall"):
+        text = re.sub(rf"<{tag}>[\s\S]*?</{tag}>", "", text, flags=re.DOTALL)
+    # 第二步:通用剥离其余环境标签块
+    text = re.sub(
         r"<[A-Za-z_][\w\- ]*?>([\s\S]*?)</[A-Za-z_][\w\- ]*?>",
         "",
         text,
         flags=re.DOTALL,
     )
-    cleaned = re.sub(r"</?[A-Za-z_][\w\- ]*?/?>", "", cleaned)
-    cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
+    text = re.sub(r"</?[A-Za-z_][\w\- ]*?/?>", "", text)
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 def _strip_meta_tags(text: str) -> str:
-    """只剥掉系统注入标签(<system_reminder> / <narrative_ref>),保留用户真实输入。
+    """只剥掉系统注入标签(<system_reminder> / <narrative_ref> / <memory_recall>),保留用户真实输入。
 
     用于 /redo 恢复上一轮的原始输入:system_reminder 是运行时注入的(重新生成会
-    再注入),narrative_ref 里的剧情 ID 已随回滚失效;而 <Quoted Message> 是用户
-    引用的上下文,重新生成时应当保留。
+    再注入),narrative_ref 里的剧情 ID 已随回滚失效,memory_recall 是运行时召回的
+    向量记忆(重新生成会重新召回);而 <Quoted Message> 是用户引用的上下文,
+    重新生成时应当保留。
     """
-    for tag in ("system_reminder", "narrative_ref"):
+    for tag in ("system_reminder", "narrative_ref", "memory_recall"):
         text = re.sub(rf"<{tag}>[\s\S]*?</{tag}>", "", text, flags=re.DOTALL)
     return text.strip()
+
+
+_MEMORY_NO_STORY = "__NO_STORY__"
+
+
+def _format_recent_memories(recent_mems: list[dict] | None) -> str:
+    """把最近的已有记忆格式化为 `<recent_memory>` 标签块,供记忆总结器区分已有剧情。
+
+    空/无记忆时返回占位说明。每条记忆转义尖括号,避免破坏标签结构。
+    """
+    if not recent_mems:
+        return "<recent_memory>(暂无已有记忆)</recent_memory>"
+    parts = []
+    for m in recent_mems:
+        c = (m.get("content") or "").strip()
+        if not c:
+            continue
+        c = _escape_memory_content(c)
+        parts.append(f"<recent_memory>{c}</recent_memory>")
+    if not parts:
+        return "<recent_memory>(暂无已有记忆)</recent_memory>"
+    return "\n".join(parts)
+
+
+def _is_no_story(raw: str) -> bool:
+    """判断总结器 LLM 返回是否命中『无剧情进展』哨兵。"""
+    return bool(raw) and _MEMORY_NO_STORY.lower() in (raw or "").lower()
+
+
+def _extract_memory_summary(raw: str, limit: int = 500) -> str:
+    """从总结器 LLM 的原始返回中提取有效记忆总结(已剥离哨兵/标签/引号)。
+
+    调用方应先用 `_is_no_story` 过滤哨兵;本函数只负责清洗并截断到 limit。
+    """
+    raw = _strip_xml_tags(raw or "").strip()
+    if not raw:
+        return ""
+    # 去掉哨兵残留(防御:LLM 偶尔会带解释文字)
+    raw = raw.replace(_MEMORY_NO_STORY, "").strip()
+    if raw[0] in "\"'“”‘’":
+        raw = raw.strip(raw[0])
+    raw = re.sub(r"\s+", " ", raw).strip()
+    limit = max(60, int(limit or 500))
+    return raw[:limit]
+
+
+def _escape_memory_content(content: str) -> str:
+    """转义记忆内容里可能破坏 XML 标签结构的非法字符。
+
+    记忆内容虽然落库前经 _clean_narrative_for_memory 清洗,但仍可能含
+    不配对的尖括号(如纯文本里的 `a<b`、单个 `<`)或历史旧数据残留。若这些
+    原样被包进 <memory_recall>,会干扰标签闭合匹配(甚至让 _strip_xml_tags 剥不干净)。
+
+    这里把 `<` 和 `>` 转义为全角字符:既不破坏标签结构,又能保留原意
+    (LLM 仍能读懂,且不会再被当成标签)。
+    """
+    content = (content or "")
+    content = content.replace("<", "〈")
+    content = content.replace(">", "〉")
+    return content
+
+
+def _clean_narrative_for_memory(narrative: str) -> str:
+    """把叙事文本清洗成适合存入向量记忆的干净纯文本。
+
+    叙事输出可能含聊天卡片标签(<d>/<c>/<t>)、markdown 标题/列表等。
+    若原样存入记忆库,这些标签会被带入;之后注入 <memory_recall> 时,
+    _strip_xml_tags 的通用正则会把记忆里的 <d>…</d> 等当作系统标签块剥掉,
+    破坏记忆内容(甚至把记忆内容以外的东西误剥)。
+
+    这里用 markdown 解析把叙事拆成块,再逐块提取纯文本:
+    - 对白 <d name="某人">…</d> → 保留为「某人:台词」
+    - 胶囊 <c>…</c> / 标签 <t>…</t> → 保留其文字
+    - 标题 / 列表 / 段落 → 保留纯文本
+    最终合并为一段干净的事件描述(移除重复空行)。
+    """
+    narrative = (narrative or "").strip()
+    if not narrative:
+        return ""
+    try:
+        blocks = _md.parse_blocks(narrative)
+        parts: list[str] = []
+        for b in blocks:
+            if b.type == "dialogue":
+                sp = getattr(b, "speaker", "") or ""
+                txt = _md.plain_text(b.spans).strip()
+                if txt:
+                    parts.append(f"{sp}:{txt}" if sp else txt)
+            elif b.type == "list":
+                for it in getattr(b, "items", []):
+                    t = _md.plain_text(it).strip()
+                    if t:
+                        parts.append(t)
+            elif getattr(b, "spans", None):
+                t = _md.plain_text(b.spans).strip()
+                if t:
+                    parts.append(t)
+            elif b.type == "code":
+                c = (getattr(b, "code", "") or "").strip()
+                if c:
+                    parts.append(c)
+        return _md_join_clean(parts)
+    except Exception:
+        # 解析失败回退:手动剥掉标签
+        cleaned = re.sub(r"<[^>]+>", "", narrative)
+        cleaned = re.sub(r"[ \t]\n", "\n", cleaned)
+        cleaned = re.sub(r"\n{2,}", "\n", cleaned)
+        return cleaned.strip()
+
+
+def _md_join_clean(parts: list[str]) -> str:
+    """把清洗后的片段合并为一段连续文本(去重空行)。"""
+    seen: list[str] = []
+    for p in parts:
+        p = (p or "").strip()
+        if not p:
+            continue
+        seen.append(p)
+    return "\n".join(seen)
 
 
 _CHAR_ALIAS_PATTERN = re.compile(r"[（(【]\s*([^）)】]+?)\s*[）)】]")
@@ -278,9 +436,11 @@ def _match_lore_characters(char_lore: dict, query: str) -> list[str]:
         if not name:
             continue
         # 候选词匹配(全名/括号别名/昵称变体),大小写不敏感
-        if any(a.lower() == q_low for a in _char_aliases(name)):
-            matches.append(name)
-        elif len(q) >= 2 and (name.lower() in q_low or q_low in name.lower()):
+        if (
+            any(a.lower() == q_low for a in _char_aliases(name))
+            or len(q) >= 2
+            and (name.lower() in q_low or q_low in name.lower())
+        ):
             matches.append(name)
     return matches
 
@@ -373,6 +533,60 @@ async def _extract_image(event: AstrMessageEvent) -> list[Image]:
     return images
 
 
+# 图片转述默认提示词(主模型不支持多模态时,由转述模型把图变成文字注入剧情)
+_DEFAULT_IMG_DESC_PROMPT = (
+    "请客观、详细地描述图片内容,供后续剧情生成使用:画面主体与场景环境;"
+    "出场人物的外貌(发色/发型/瞳色/服饰/表情/动作);画面中出现的文字;"
+    "整体画风与氛围。不要评价图片质量,只输出描述本身。"
+)
+
+
+def _provider_allows_image(prov) -> bool:
+    """判定 provider 是否接受图片输入(AstrBot 同款约定):
+
+    - modalities 未配置(None / [])→ 视为支持全部模态(向后兼容);
+    - 显式配置为列表 → 必须包含 "image" 才算支持多模态。
+    """
+    try:
+        modalities = prov.provider_config.get("modalities", None)
+    except AttributeError:
+        return True
+    return (not modalities) or (isinstance(modalities, list) and "image" in modalities)
+
+
+def _build_img_desc_tag(text: str) -> str:
+    return f"<Image Description>\n{text}\n</Image Description>"
+
+
+async def _extract_image_with_quoted(event: AstrMessageEvent) -> list[Image]:
+    """取图片,当前消息无图时回退到**引用消息**的图片。
+
+    手机端常无法在同一消息里同时发文字 + 图片(引用图片省去重新上传)。
+    复用 QuotedMessageExtractor(event).images()(与 /create /do 相同的引用通道):
+    它会把引用消息里的图片解析成可 LLM 读取的 URL / base64 / 本地路径。
+    这里统一包成 Image 组件(convert_to_file_path 能处理以上全部形态)。
+    """
+    imgs = await _extract_image(event)
+    if imgs:
+        return imgs
+
+    try:
+        refs = await QuotedMessageExtractor(event=event).images()
+    except Exception as e:
+        logger.warning(f"life-sim: 解析引用图片失败: {e}")
+        return []
+    # resolver 可能对同一张图返回重复/本地路径,去重后构造 Image
+    out: list[Image] = []
+    seen: set[str] = set()
+    for ref in refs or []:
+        ref = (ref or "").strip()
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        out.append(Image(file=ref))
+    return out
+
+
 def _restore_images_from_content(content) -> list[Image]:
     """从已存储的 user 消息 content 里恢复图片(Image 组件列表)。
 
@@ -414,6 +628,12 @@ def _build_system_reminder(event: AstrMessageEvent) -> str:
     )
 
 
+def _read_all_bytes(path: str) -> bytes:
+    """同步读取文件全部字节(供 asyncio.to_thread 在线程池中调用)。"""
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def _build_narrative_ref_tag(last_nid: str) -> str:
     """构造最近剧情 ID 的 tag(放在当轮 user 消息里,不进 system prompt)。
 
@@ -431,6 +651,194 @@ def _build_narrative_ref_tag(last_nid: str) -> str:
         f'life_sim_revise_narrative(record_id="{last_nid}", narrative="<新剧情全文>") 覆盖即可,'
         f"不必让用户复制 ID(也可省略 record_id 自动修订最近一条)。</narrative_ref>"
     )
+
+
+def _compact_lore_versions(session: dict) -> None:
+    """把 `lore_snapshots` 收敛为 `_lore_versions` 内容索引表(去重)。
+
+    - 老会话中快照内联了整份 `world_lore` / `character_lore`,连续轮次内容相同
+      时会产生大量重复数据(实测 25 轮里只有 5 组内容)。
+    - 这里把每份不相同的内容存到 `session["_lore_versions"]` 表里一次,
+      快照只保留 `{turn, version}` 轻量索引;同一内容被多个 turn 复用。
+    - 兼容反向:快照若已带 `version` 引用则按其指向解析,旧格式内联字段也会照常迁移。
+
+    快照窗口滑动时,此函数同时处理两类快照,结果仍保证 `_resolve_snapshot_lore` 一致。
+    """
+    old_versions = session.get("_lore_versions") or []
+    snapshots = session.get("lore_snapshots") or []
+    versions: list[dict] = []
+    index: dict[tuple[str, str], int] = {}
+    out: list[dict] = []
+    for snap in snapshots:
+        if not isinstance(snap, dict) or "turn" not in snap:
+            out.append(snap)
+            continue
+        turn = snap["turn"]
+        vi = snap.get("version")
+        if isinstance(vi, int) and 0 <= vi < len(old_versions):
+            prev = old_versions[vi]
+            wl = prev.get("world_lore", [])
+            cl = prev.get("character_lore", {})
+        else:
+            wl = snap.get("world_lore", [])
+            cl = snap.get("character_lore", {})
+        key = (
+            json.dumps(wl, sort_keys=True, ensure_ascii=False),
+            json.dumps(cl, sort_keys=True, ensure_ascii=False),
+        )
+        new_vi = index.get(key)
+        if new_vi is None:
+            new_vi = len(versions)
+            index[key] = new_vi
+            versions.append({"world_lore": wl, "character_lore": cl})
+        out.append({"turn": turn, "version": new_vi})
+    session["lore_snapshots"] = out
+    if out:
+        session["_lore_versions"] = versions
+    else:
+        session.pop("_lore_versions", None)
+
+
+def _resolve_snapshot_lore(session: dict, snapshot: dict) -> tuple[list, dict]:
+    """解析单个 lore 快照的 (world_lore, character_lore)。
+
+    新格式快照只带 `version` 索引,从 `_lore_versions` 取内容;
+    旧格式快照仍内联了整份内容,直接返回。
+    """
+    if not isinstance(snapshot, dict):
+        return [], {}
+    vi = snapshot.get("version")
+    if isinstance(vi, int):
+        versions = session.get("_lore_versions") or []
+        if 0 <= vi < len(versions):
+            v = versions[vi]
+            return v.get("world_lore", []), v.get("character_lore", {})
+    return (
+        snapshot.get("world_lore", []),
+        snapshot.get("character_lore", {}),
+    )
+
+
+def _compact_rpg_versions(session: dict) -> None:
+    """把 `rpg_snapshots` 收敛为 `_rpg_versions` 内容索引表(去重)。
+
+    RPG 快照里 `chars` / `sessions` 是整份角色档案副本,大多数 turn 里内容完全
+    相同(实测 25 轮只有 1 组内容)。这里按 (chars, sessions) 内容寻址,相同内容
+    只存一次;快照本身退化为 `{turn, scope, version}` 轻量引用。
+
+    `scope` 每轮保留(记录当时触发者),不进版本表 —— 不同 sender 触发同一状态
+    时共享同一版本,不重复存储。
+    """
+    old_versions = session.get("_rpg_versions") or []
+    snapshots = session.get("rpg_snapshots") or []
+    versions: list[dict] = []
+    index: dict[str, int] = {}
+    out: list[dict] = []
+    for snap in snapshots:
+        if not isinstance(snap, dict) or "turn" not in snap:
+            out.append(snap)
+            continue
+        vi = snap.get("version")
+        if isinstance(vi, int) and 0 <= vi < len(old_versions):
+            body = old_versions[vi]
+        else:
+            body = {k: snap[k] for k in ("chars", "sessions") if k in snap}
+        key = json.dumps(body, sort_keys=True, ensure_ascii=False)
+        new_vi = index.get(key)
+        if new_vi is None:
+            new_vi = len(versions)
+            index[key] = new_vi
+            versions.append(body)
+        ref: dict = {"turn": snap["turn"], "version": new_vi}
+        scope = snap.get("scope")
+        if scope is not None:
+            ref["scope"] = scope
+        out.append(ref)
+    session["rpg_snapshots"] = out
+    if out:
+        session["_rpg_versions"] = versions
+    else:
+        session.pop("_rpg_versions", None)
+
+
+def _resolve_rpg_snapshot(session: dict, snapshot: dict) -> dict:
+    """解析单个 RPG 快照为 `_rpg_restore` 需要的完整 dict。
+
+    - 新格式: `{turn, scope, version}` → 从 `_rpg_versions` 取 (chars, sessions)。
+    - 旧格式: 内联了 chars/sessions,原样返回。
+    """
+    if not isinstance(snapshot, dict):
+        return {}
+    vi = snapshot.get("version")
+    if isinstance(vi, int):
+        versions = session.get("_rpg_versions") or []
+        if 0 <= vi < len(versions):
+            body = dict(versions[vi])
+            scope = snapshot.get("scope")
+            if scope is not None:
+                body["scope"] = scope
+            return body
+    return dict(snapshot)
+
+
+def _narrative_branch(session: dict | None) -> str:
+    """从会话取当前剧情线(分支)名;空 = 主线(history.json)。
+
+    老会话里 current_branch 可能是 `"主线"`(旧版自动保留分支语义,
+    表示"处于主线的延续线上"),归一为空串,与主线 history.json 对齐。
+    """
+    if not session:
+        return ""
+    b = (session.get("current_branch") or "").strip()
+    if b == "主线":
+        return ""
+    return b
+
+
+# ══════════════════════════════════════════════════════════════
+# LLM 用量统计上报
+#
+# 本插件通过 context.llm_generate() / context.tool_loop_agent() 直接调用 LLM,
+# 不经过 AstrBot 内部 agent 子阶段(pipeline),因此 token 消耗不会被写入
+# 全局 provider_stats 表 —— WebUI「数据统计」页的调用量/Token 曲线读的就是这张表。
+#
+# 方案:给 provider 实例挂一个幂等的 text_chat 包装器,配合 ContextVar 作用域标记,
+# 只累计本插件发起的调用;每轮结束后通过 db_helper.insert_provider_stat()
+# 以 agent_type="internal" 写入同一张表,从而完整融入系统级数据统计。
+# ══════════════════════════════════════════════════════════════
+
+_LLM_STATS_CTX: ContextVar[dict | None] = ContextVar("life_sim_llm_stats", default=None)
+
+
+def _ensure_provider_stats_hook(prov) -> bool:
+    """给 provider 实例安装 text_chat 统计包装器(幂等)。返回是否成功。"""
+    if getattr(prov, "_life_sim_stats_hooked", False):
+        return True
+    orig = getattr(prov, "text_chat", None)
+    if not callable(orig):
+        return False
+
+    async def hooked(*args, **kwargs):
+        resp = await orig(*args, **kwargs)
+        ctx = _LLM_STATS_CTX.get()
+        if ctx is not None:
+            ctx["calls"] += 1
+            if getattr(resp, "role", "") == "err":
+                ctx["errors"] += 1
+            usage = getattr(resp, "usage", None)
+            if usage is not None:
+                try:
+                    ctx["usage"] = ctx["usage"] + usage
+                except (AttributeError, TypeError):
+                    pass
+        return resp
+
+    try:
+        prov.text_chat = hooked  # type: ignore[method-assign]
+    except (AttributeError, TypeError):
+        return False
+    prov._life_sim_stats_hooked = True
+    return True
 
 
 class _LifeSimToolHooks(BaseAgentRunHooks[AstrAgentContext]):
@@ -524,11 +932,18 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.data_dir = StarTools.get_data_dir()
+        # 角色头像存储
+        self.avatar_store = AvatarStore(self.data_dir)
         # 文件存储实例(sim 会话 + RPG 数据 + 剧情历史 + 分支快照,各自独立模块)
         self.sim_store = SimStore(self.data_dir)
         self.rpg_store = RpgStore(self.data_dir)
         self.narrative_store = NarrativeStore(self.data_dir)
         self.branch_store = BranchStore(self.data_dir)
+        # 向量记忆存储:记录「发生过的事情」(剧情/事件记忆),生命周期 = 当前会话
+        self.memory_store = MemoryStore(self.data_dir)
+        self._setup_memory_embedding()
+        # WebUI 插件页面(数据管理)的 REST 接口
+        self._register_web_apis()
         # AstrBot 在配置存在时传入,缺失时为 None
         self.config = config
         # 每个会话(group/user)一把 asyncio.Lock,防止同一会话并发触发 _generate 造成竞态
@@ -542,8 +957,22 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         # 本轮 revise 暂存:{event_key: [修订前记录状态, ...]} — 本轮 LLM 是否调用过
         # life_sim_revise_narrative(列表非空即有);兼作 /undo 回滚修订的 pre-revision 数据
         self._pending_revise: dict[str, list] = {}
+        # 最近一次 _clear_sim 清理掉的向量记忆条数(用于 /删除 /创建 提示)
+        self._last_clear_mem_count = 0
         # Markdown → 图片渲染引擎(config 驱动,惰性加载样式)
         self._md_init()
+
+    def _setup_memory_embedding(self) -> None:
+        """把 AstrBot 配置的 Embedding Provider 接入向量记忆(若可用),否则用本地嵌入。"""
+        try:
+            pm = getattr(self.context, "provider_manager", None)
+            if pm is None:
+                return
+            insts = getattr(pm, "embedding_provider_insts", None) or []
+            if insts and hasattr(insts[0], "get_embeddings"):
+                self.memory_store.set_embedding_provider(insts[0])
+        except Exception as e:
+            logger.debug(f"life-sim: 向量记忆接入 Embedding Provider 失败(回退本地嵌入): {e}")
 
     # ─── 配置读取助手 ────────────────────────────────────────
 
@@ -558,12 +987,22 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         return val if val is not None else default
 
     async def _yield_narrative_result(self, event, text: str):
-        """把叙事输出以文本或图片形式 yield(根据 output_as_image 开关)。
+        """把叙事输出以文本或图片形式 yield(根据 chat_card_enable / output_as_image)。
 
-        转图失败自动回退纯文本,不影响主流程。图片走 framework 的临时文件
-        跟踪(event.track_temporary_local_file),事件处理完后统一删除;
-        渲染/保存失败时 `md_render_to_path` 已自清理,不会残留空文件。
+        优先级:聊天卡片(IM 对白) > Markdown 转图(pillowmd) > 纯文本。
+        图片走 framework 的临时文件跟踪,事件处理完后自动删除。
         """
+        if self._cfg("chat_card_enable", False):
+            try:
+                sent = False
+                async for item in self._chat_card_generate(text, event):
+                    sent = True
+                    yield item
+                if sent:
+                    return
+            except Exception as e:
+                logger.warning(f"life-sim: 聊天卡片渲染失败,回退: {e}")
+
         if self.md_should_render(text):
             try:
                 path = await self.md_render_to_path(
@@ -578,8 +1017,157 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         yield event.plain_result(text)
 
     # ════════════════════════════════════════════════════════════════
-    # 转生模拟:独立文件会话(叙事历史)
+    # 聊天卡片(IM 对白样式) — 基于 im_render 新引擎
     # ════════════════════════════════════════════════════════════════
+
+    def _chat_card_avatar_prompt(self, event=None) -> str:
+        """生成角色头像列表提示,注入 system prompt,让 LLM 输出规范角色名。
+
+        作用:头像按「角色名 + scope」存储(/头像 汐见小亚 <图>)。若 LLM 输出的
+        角色名与头像名有出入(如头像叫「龟」,对白叫「小龟」;或输出简称「小亚」
+        而非「汐见小亚」),渲染时就可能匹配不上。所以除了列出头像名单,
+        还要明确要求 LLM **自行把对白角色名与名单逐一比对**,有出入时在对白
+        标签上加 `av="头像名"` 显式指定,而不是指望渲染端的模糊匹配兜底。
+
+        按当前会话 scope(群/私聊)列出本区头像,不跨群泄露。
+        """
+        try:
+            store = getattr(self, "avatar_store", None)
+            scope = self._sim_session_key(event) if event is not None else ""
+            names = store.list_names(scope) if store else []
+        except Exception as e:
+            logger.warning(f"life-sim: 读取头像列表失败: {e}")
+            names = []
+        if not names:
+            return ""
+        lines = "\n".join(f"- {n}" for n in names)
+        return (
+            "\n\n## 📷 角色头像名单(每句对白前必须先核对)"
+            "\n以下角色已设置头像:**每个 `<d>` 对白的 name 都要先与这份名单比对**,再按下述规则书写:"
+            "\n1. **完全一致**:name 与名单中某项完全相同 → 直接写,自动匹配头像;"
+            "\n2. **有出入(简称/昵称/别称)**:想用的名字与头像名不完全一致,"
+            "但你能从名单中判断出对应哪一张 → 必须加 `av` 属性显式指定。"
+            "判断依据:头像名是对白名的子串(如对白「小龟」↔ 名单「龟」)、"
+            "对白名是头像名的省略(如「小亚」↔「汐见小亚」)、或语义上明显同一人。"
+            '\n   例:名单里有「龟」而对白叫它「小龟」 → `<d name="小龟" av="龟">主人你回来啦~</d>`'
+            " —— 气泡显示「小龟」,头像用「龟」;"
+            "\n3. **自选借用**:让任意角色使用名单中某张头像(即使两者毫无关系),"
+            '同样用 `av`,如 `<d name="阴影少女" av="汐见小亚">你是谁?</d>`;'
+            "\n4. **确实无关**:与名单所有项都对不上 → 正常写 name,不要硬套 `av`,也不要使用名单以外的头像名。"
+            "\n注意:`av` 后面的头像名必须是名单中的原文,不可自创;宁可多写 `av` 也不要让名字出入的头像匹配失败。"
+            "\n可用头像名单：" + lines + "\n"
+        )
+
+    def _chat_card_avatars(self, event=None) -> dict:
+        """构建 角色名 → 头像 映射(含默认头兜底),按当前 scope 过滤。"""
+        avatars = {}
+        try:
+            store = getattr(self, "avatar_store", None)
+            if store is not None:
+                scope = self._sim_session_key(event) if event is not None else ""
+                for name in store.list_names(scope):
+                    avatars[name] = store.get_avatar(name, scope)
+                d = store.get_default_avatar()
+                if d:
+                    avatars[""] = d
+        except Exception as e:
+            logger.warning(f"life-sim: 加载角色头像失败: {e}")
+        return avatars
+
+    def _temporary_avatar_copy(self, path: str, event) -> str | None:
+        """把已存储的头像复制成临时文件,交给框架在事件结束后清理。
+
+        不能直接把 avatar_store 里的真实头像文件登记为临时文件——框架会在
+        事件结束后清理掉这些文件,那样「查看头像」反而会把用户的头像删掉。
+        """
+        import tempfile
+
+        p: str | None = None
+        try:
+            fd, p = tempfile.mkstemp(suffix=os.path.splitext(path)[1] or ".png")
+            os.close(fd)
+            shutil.copyfile(path, p)
+            event.track_temporary_local_file(p)
+            return p
+        except Exception as e:
+            logger.warning(f"life-sim: 头像临时副本创建失败: {e}")
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            return None
+
+    async def _chat_card_generate(self, text: str, event):
+        """把叙事 markdown 渲染为聊天截图并逐一 yield。"""
+        from .im_render.engine import TooManyPages
+
+        loops = asyncio.get_running_loop()
+
+        def _build() -> list:
+            return self._chat_card_render(text, event)
+
+        try:
+            images = await loops.run_in_executor(None, _build)
+        except TooManyPages:
+            logger.warning("life-sim: 聊天卡片分页超限,降级")
+            return
+        except Exception as e:
+            logger.warning(f"life-sim: 聊天卡片渲染失败: {e}")
+            return
+
+        for img in images or []:
+            if img is None:
+                continue
+            path = await self._save_chat_bubble(img)
+            if path:
+                event.track_temporary_local_file(path)
+                yield event.image_result(path)
+
+    def _chat_card_render(self, text: str, event=None) -> list:
+        """同步执行渲染,返回图片列表。可被线程池调用。"""
+        theme = str(self._cfg("chat_card_theme", "light") or "light").strip().lower()
+        if theme not in ("light", "dark"):
+            theme = "light"
+        self_names = [
+            s.strip()
+            for s in str(self._cfg("chat_card_self_names", "我,自己,你,玩家")).split(
+                ","
+            )
+            if s.strip()
+        ]
+        avatars = self._chat_card_avatars(event)
+
+        def _is_self(speaker: str) -> bool:
+            return speaker in self_names
+
+        return render_narrative(
+            text,
+            theme=theme,
+            width=int(self._cfg("chat_card_width", 1024)),
+            font_size=int(self._cfg("chat_card_font_size", 34)),
+            title=str(self._cfg("chat_card_title", "") or ""),
+            max_pages=int(self._cfg("chat_card_max_pages", 5)),
+            is_self=_is_self,
+            avatars=avatars,
+        )
+
+    async def _save_chat_bubble(self, img) -> str:
+        """保存聊天卡片图到临时文件并返回路径。"""
+        import tempfile
+
+        fd, p = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        try:
+            await asyncio.get_running_loop().run_in_executor(None, img.save, p, "PNG")
+            return p
+        except Exception as e:
+            logger.warning(f"life-sim: 聊天卡片保存失败: {e}")
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            return None
 
     def _sim_session_key(self, event: AstrMessageEvent) -> str:
         gid = event.message_obj.group_id
@@ -602,18 +1190,697 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         await self.sim_store.save(self._sim_session_key(event), session)
 
     async def _clear_sim(self, event: AstrMessageEvent) -> int:
-        """删除当前会话文件,并同步清理该会话名下全部分支快照。
+        """删除当前会话文件,并同步清理该会话名下全部分支快照与头像。
 
-        分支快照独立存储(见 BranchStore),不会随会话文件自动消失,
-        必须在删除/重建会话时显式清理,避免留下孤儿分支。
+        分支快照独立存储(见 BranchStore),不会随会话文件自动消失;
+        头像按 scope 分区(见 AvatarStore)。都会在删除/重建会话时显式清理。
         返回被清理的分支快照数量。
         """
         key = self._sim_session_key(event)
         await self.sim_store.delete(key)
+        # 头像按 scope 分区,随会话一起清除(默认头像在根目录,不动)
+        self.avatar_store.clear_scope(key)
+        n_mem = await self.memory_store.delete_scope(key)
+        self._last_clear_mem_count = n_mem
         return await self.branch_store.delete_scope(key)
 
     def _busy_message(self) -> str:
         return "⏳ 上一条消息还在处理中,请稍候再试..."
+
+    # ════════════════════════════════════════════════════════════
+    # WebUI 插件页面:数据管理 REST 接口
+    #
+    # 页面本体在 pages/manage/index.html,由 dashboard 自动发现并
+    # 以 iframe + bridge SDK 方式加载;这里只注册 JSON 接口。
+    # 路由必须带插件名前缀(dashboard 按 /plugins/extensions/<插件名>/<路由>
+    # 匹配 registered_web_apis)。所有变更操作复用聊天命令同一把会话锁,
+    # 避免与 /do 并发改坏存档。
+    # ════════════════════════════════════════════════════════════
+
+    def _register_web_apis(self) -> None:
+        if _web_json is None or not hasattr(self.context, "register_web_api"):
+            logger.debug("life-sim: 当前 AstrBot 无插件 Web API,跳过页面接口注册")
+            return
+        base = "/astrbot_plugin_life_sim"
+        routes = (
+            (f"{base}/api/overview", self._web_overview, ["GET"], "总览统计"),
+            (f"{base}/api/scopes", self._web_scopes, ["GET"], "全部会话 scope 列表"),
+            (f"{base}/api/sessions", self._web_sessions, ["GET"], "模拟会话列表"),
+            (f"{base}/api/session/<key>", self._web_session_detail, ["GET"], "会话详情"),
+            (f"{base}/api/session/update", self._web_session_update, ["POST"], "编辑会话(世界观/lore/主人名)"),
+            (f"{base}/api/session/delete", self._web_session_delete, ["POST"], "删除会话"),
+            (f"{base}/api/messages/truncate", self._web_messages_truncate, ["POST"], "回滚消息到指定条数"),
+            (f"{base}/api/export/<key>", self._web_export, ["GET"], "导出会话 JSON"),
+            (f"{base}/api/narrative", self._web_narrative_list, ["GET"], "剧情记录列表"),
+            (f"{base}/api/narrative/detail", self._web_narrative_detail, ["GET"], "剧情记录详情"),
+            (f"{base}/api/narrative/update", self._web_narrative_update, ["POST"], "修订剧情内容"),
+            (f"{base}/api/narrative/delete", self._web_narrative_delete, ["POST"], "删除剧情记录"),
+            (f"{base}/api/branches", self._web_branches, ["GET"], "分支快照列表"),
+            (f"{base}/api/branch/delete", self._web_branch_delete, ["POST"], "删除分支快照"),
+            (f"{base}/api/rpg", self._web_rpg, ["GET"], "RPG 存档列表"),
+            (f"{base}/api/rpg/char/delete", self._web_rpg_char_delete, ["POST"], "删除 RPG 角色存档"),
+            (f"{base}/api/rpg/session/delete", self._web_rpg_session_delete, ["POST"], "删除 RPG 会话存档"),
+            (f"{base}/api/memory", self._web_memory_list, ["GET"], "向量记忆列表"),
+            (f"{base}/api/memory/delete", self._web_memory_delete, ["POST"], "删除向量记忆"),
+            (f"{base}/api/memory/export", self._web_memory_export, ["GET"], "导出向量记忆"),
+        )
+        for route, handler, methods, desc in routes:
+            try:
+                self.context.register_web_api(route, handler, methods, f"life-sim: {desc}")
+            except Exception as e:
+                logger.warning(f"life-sim: 注册 Web API {route} 失败: {e}")
+
+    @staticmethod
+    def _web_handler(func):
+        """包装插件 Web API handler:统一异常 → error envelope。"""
+
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            if _web_json is None:
+                return {"ok": False, "message": "AstrBot 版本过低,无插件 Web API"}
+            try:
+                return await func(*args, **kwargs)
+            except ValueError as e:
+                return _web_error(str(e), status_code=400)
+            except Exception as e:
+                logger.error(f"life-sim: Web API {func.__name__} 失败: {e}")
+                return _web_error("内部错误,请查看日志", status_code=500)
+
+        return wrapper
+
+    @staticmethod
+    def _count_memory_entries(mem_dir: str) -> int:
+        """统计向量记忆目录下所有文件的条目数(在线程池中调用)。"""
+        total = 0
+        if not os.path.isdir(mem_dir):
+            return 0
+        import json as _json
+
+        for fname in os.listdir(mem_dir):
+            if not fname.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(mem_dir, fname), "r", encoding="utf-8") as f:
+                    data = _json.load(f)
+                total += len(data.get("entries") or [])
+            except Exception:
+                pass
+        return total
+
+    # ── web 公共小工具 ───────────────────────────────────────────
+
+    @staticmethod
+    async def _web_body() -> dict:
+        try:
+            body = await _web_request.json(default=None)
+        except Exception:  # 无绑定上下文(测试直调)时取不到 body
+            return {}
+        return body if isinstance(body, dict) else {}
+
+    @staticmethod
+    def _web_query(name: str, default: str = "") -> str:
+        try:
+            val = _web_request.query.get(name)
+        except Exception:  # 同上
+            return default
+        return str(val).strip() if val is not None else default
+
+    @staticmethod
+    def _dir_stats(path: str) -> tuple[int, int]:
+        files = size = 0
+        if os.path.isdir(path):
+            for root, _, fs in os.walk(path):
+                for f in fs:
+                    files += 1
+                    try:
+                        size += os.path.getsize(os.path.join(root, f))
+                    except OSError:
+                        pass
+        return files, size
+
+    @classmethod
+    def _sanitize_lore_entries(cls, entries) -> list[dict]:
+        """清洗 lore 条目列表:list[dict] 且只保留合法字段,seq 缺失时两遍扫描自动补号。"""
+        kept: list[tuple[int, dict]] = []
+        for e in entries or []:
+            if not isinstance(e, dict):
+                continue
+            content = str(e.get("content") or "").strip()
+            if not content:
+                continue
+            try:
+                seq = int(e.get("seq") or 0)
+            except (TypeError, ValueError):
+                seq = 0
+            kept.append(
+                (
+                    seq,
+                    {
+                        "section": str(e.get("section") or "general").strip() or "general",
+                        "content": content,
+                        "updated_at": str(e.get("updated_at") or "").strip(),
+                    },
+                )
+            )
+        # 两遍扫描:先收集显式 seq 的最大值,再给缺失项从 max+1 起连续补号
+        explicit_max = max((s for s, _ in kept if s > 0), default=0)
+        next_seq = explicit_max + 1
+        out: list[dict] = []
+        for seq, entry in kept:
+            if seq <= 0:
+                seq = next_seq
+                next_seq += 1
+            out.append({"seq": seq, **entry})
+        out.sort(key=lambda d: d["seq"])
+        return out
+
+    @classmethod
+    def _sanitize_message_for_web(cls, msg: dict, include_images: bool) -> dict:
+        """消息深拷贝并把 base64 图片替换为占位符(base64 太大不宜进页面)。"""
+        m = copy.deepcopy(msg) if isinstance(msg, dict) else msg
+        if not include_images and isinstance(m, dict) and isinstance(m.get("content"), list):
+            for part in m["content"]:
+                if (
+                    isinstance(part, dict)
+                    and part.get("type") == "image_url"
+                    and isinstance(part.get("image_url"), dict)
+                    and str(part["image_url"].get("url") or "").startswith("data:image")
+                ):
+                    part["image_url"]["url"] = "[图片数据已省略]"
+        return m
+
+    # ── web handlers ─────────────────────────────────────────────
+
+    @_web_handler
+    async def _web_overview(self):
+        import concurrent.futures
+
+        d = self.data_dir
+        sim_dir = os.path.join(d, "sim_sessions")
+        narr_dir = os.path.join(d, "narrative_history")
+        br_dir = os.path.join(d, "sim_branches")
+        avatars_dir = os.path.join(d, "avatars")
+        mem_dir = os.path.join(d, "vector_memory")
+
+        loop = asyncio.get_running_loop()
+        with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
+            sim_f = loop.run_in_executor(pool, self._dir_stats, sim_dir)
+            narr_f = loop.run_in_executor(pool, self._dir_stats, narr_dir)
+            br_f = loop.run_in_executor(pool, self._dir_stats, br_dir)
+            av_f = loop.run_in_executor(pool, self._dir_stats, avatars_dir)
+            mem_f = loop.run_in_executor(pool, self._dir_stats, mem_dir)
+            memcnt_f = loop.run_in_executor(pool, self._count_memory_entries, mem_dir)
+            sim_files, sim_size = await sim_f
+            narr_files, narr_size = await narr_f
+            br_files, br_size = await br_f
+            av_files, _ = await av_f
+            mem_files, mem_size = await mem_f
+            mem_entries = await memcnt_f
+
+        scopes = set(list_json_stems(sim_dir))
+        if os.path.isdir(narr_dir):
+            scopes |= {x for x in os.listdir(narr_dir) if os.path.isdir(os.path.join(narr_dir, x))}
+        rpg_chars = len(self.rpg_store.list_chars())
+        rpg_sessions = len(self.rpg_store.list_sessions())
+
+        return {
+            "ok": True,
+            "data_dir": d,
+            "sessions": {
+                "count": len(list_json_stems(sim_dir)),
+                "files": sim_files,
+                "size": sim_size,
+            },
+            "narrative": {
+                "scopes": len([x for x in os.listdir(narr_dir) if os.path.isdir(os.path.join(narr_dir, x))]) if os.path.isdir(narr_dir) else 0,
+                "files": narr_files,
+                "size": narr_size,
+            },
+            "branches": {"files": br_files, "size": br_size},
+            "rpg": {"chars": rpg_chars, "sessions": rpg_sessions},
+            "avatars": {"files": av_files},
+            "memory": {"files": mem_files, "size": mem_size, "entries": mem_entries},
+            "scope_count": len(scopes),
+        }
+
+    @_web_handler
+    async def _web_scopes(self):
+        """全部 scope(sim key == narrative scope == branch scope):给下拉框用。"""
+        d = self.data_dir
+        keys = set(list_json_stems(os.path.join(d, "sim_sessions")))
+        narr_dir = os.path.join(d, "narrative_history")
+        if os.path.isdir(narr_dir):
+            keys |= {x for x in os.listdir(narr_dir) if os.path.isdir(os.path.join(narr_dir, x))}
+        br_dir = os.path.join(d, "sim_branches")
+        if os.path.isdir(br_dir):
+            keys |= {x for x in os.listdir(br_dir) if os.path.isdir(os.path.join(br_dir, x))}
+        out = []
+        for key in sorted(keys):
+            branches = list((await self.branch_store.list(key)).keys())
+            out.append({"key": key, "has_session": key in set(list_json_stems(os.path.join(d, "sim_sessions"))), "branches": branches})
+        return {"ok": True, "scopes": out}
+
+    @_web_handler
+    async def _web_sessions(self):
+        sim_dir = os.path.join(self.data_dir, "sim_sessions")
+        out = []
+        for key in list_json_stems(sim_dir):
+            session = await self.sim_store.load(key)
+            path = os.path.join(sim_dir, f"{key}.json")
+            try:
+                size = os.path.getsize(path)
+                mtime = int(os.path.getmtime(path))
+            except OSError:
+                size = mtime = 0
+            msgs = session.get("messages") or []
+            mode = session.get("mode", "A")
+            wl = session.get("world_lore") or []
+            cl = LifeSimPlugin._normalize_character_lore(session.get("character_lore"))
+            out.append(
+                {
+                    "key": key,
+                    "mode": mode,
+                    "mode_name": MODE_NAMES.get(mode, mode),
+                    "owner": session.get("owner_name", ""),
+                    "world_setting": (session.get("world_setting") or "")[:120],
+                    "turn": int(session.get("lore_turn", 0) or 0),
+                    "msg_count": len(msgs),
+                    "current_branch": session.get("current_branch") or "",
+                    "lore_entries": len(wl) + sum(len(v) for v in cl.values()),
+                    "size": size,
+                    "mtime": mtime,
+                }
+            )
+        out.sort(key=lambda x: -x["mtime"])
+        return {"ok": True, "sessions": out}
+
+    @_web_handler
+    async def _web_session_detail(self, key: str = ""):
+        session = await self.sim_store.load(key)
+        if session is None:
+            return _web_error(f"会话不存在: {key}", status_code=404)
+        include_images = self._web_query("with_images") in ("1", "true")
+        messages = [
+            self._sanitize_message_for_web(m, include_images)
+            for m in (session.get("messages") or [])
+        ]
+        cl = LifeSimPlugin._normalize_character_lore(session.get("character_lore"))
+        snaps = {
+            k: len(session.get(k) or [])
+            for k in ("lore_snapshots", "narrative_snapshots", "rpg_snapshots")
+        }
+        return {
+            "ok": True,
+            "session": {
+                "key": key,
+                "mode": session.get("mode", "A"),
+                "mode_name": MODE_NAMES.get(session.get("mode", "A"), ""),
+                "owner": session.get("owner_name", ""),
+                "created_at": session.get("created_at", 0),
+                "lore_turn": int(session.get("lore_turn", 0) or 0),
+                "current_branch": session.get("current_branch") or "",
+                "last_narrative_id": session.get("last_narrative_id") or "",
+                "world_setting": session.get("world_setting") or "",
+                "world_lore": self._sanitize_lore_entries(session.get("world_lore")),
+                "character_lore": {
+                    name: self._sanitize_lore_entries(entries)
+                    for name, entries in cl.items()
+                },
+                "snapshot_counts": snaps,
+                "messages": messages,
+                "message_count": len(messages),
+            },
+        }
+
+    @staticmethod
+    def _apply_session_edits(session: dict, body: dict) -> list[str]:
+        changed: list[str] = []
+        if "world_setting" in body:
+            ws = str(body.get("world_setting") or "").strip()
+            session["world_setting"] = ws
+            changed.append("世界观设定")
+        if "owner" in body:
+            owner = str(body.get("owner") or "").strip()
+            session["owner_name"] = owner
+            changed.append("创建者")
+        if "world_lore" in body:
+            raw = body.get("world_lore")
+            if raw is not None and not isinstance(raw, list):
+                raise ValueError("world_lore 必须是数组")
+            session["world_lore"] = LifeSimPlugin._sanitize_lore_entries(raw)
+            changed.append(f"世界观 lore({len(session['world_lore'])} 条)")
+        if "character_lore" in body:
+            raw = body.get("character_lore")
+            if raw is not None and not isinstance(raw, dict):
+                raise ValueError("character_lore 必须是对象 {角色名: [条目]}")
+            cleaned: dict[str, list[dict]] = {}
+            for name, entries in (raw or {}).items():
+                cleaned[str(name).strip()] = LifeSimPlugin._sanitize_lore_entries(entries)
+            session["character_lore"] = {k: v for k, v in cleaned.items() if v} or {"主角": []}
+            changed.append(
+                f"角色 lore({len(session['character_lore'])} 人)"
+            )
+        return changed
+
+    @_web_handler
+    async def _web_session_update(self):
+        body = await self._web_body()
+        key = str(body.get("key") or "").strip()
+        if not key:
+            raise ValueError("缺少 key")
+        lock = self._get_sim_lock(key)
+        async with lock:
+            session = await self.sim_store.load(key)
+            if session is None:
+                return _web_error(f"会话不存在: {key}", status_code=404)
+            changed = self._apply_session_edits(session, body)
+            if not changed:
+                return _web_error("没有需要保存的字段", status_code=400)
+            await self.sim_store.save(key, session)
+        return {"ok": True, "changed": changed}
+
+    @_web_handler
+    async def _web_session_delete(self):
+        body = await self._web_body()
+        key = str(body.get("key") or "").strip()
+        if not key:
+            raise ValueError("缺少 key")
+        purge_narrative = bool(body.get("purge_narrative"))
+        lock = self._get_sim_lock(key)
+        async with lock:
+            existed = await self.sim_store.load(key) is not None
+            await self.sim_store.delete(key)
+            self.avatar_store.clear_scope(key)
+            n_branches = await self.branch_store.delete_scope(key)
+            n_records = await self.narrative_store.delete_scope(key) if purge_narrative else 0
+        if not existed and not n_branches and not n_records:
+            return _web_error(f"scope 不存在或已为空: {key}", status_code=404)
+        return {
+            "ok": True,
+            "deleted": {"session": existed, "branches": n_branches, "records": n_records},
+        }
+
+    @_web_handler
+    async def _web_messages_truncate(self):
+        """回滚消息到前 keep_messages 条,并同步修剪 turn 快照(供 WebUI 撤销轮次)。"""
+        body = await self._web_body()
+        key = str(body.get("key") or "").strip()
+        keep = int(body.get("keep_messages", -1))
+        if not key:
+            raise ValueError("缺少 key")
+        lock = self._get_sim_lock(key)
+        async with lock:
+            session = await self.sim_store.load(key)
+            if session is None:
+                return _web_error(f"会话不存在: {key}", status_code=404)
+            msgs = session.get("messages") or []
+            if not 0 <= keep < len(msgs):
+                raise ValueError(f"keep_messages 越界(当前共 {len(msgs)} 条)")
+            removed = len(msgs) - keep
+            session["messages"] = msgs[:keep]
+            turns = [
+                int(m.get("turn") or 0)
+                for m in session["messages"]
+                if isinstance(m, dict) and m.get("turn")
+            ]
+            new_turn = max(turns) if turns else 0
+            session["lore_turn"] = new_turn
+            for sk in ("lore_snapshots", "narrative_snapshots", "rpg_snapshots"):
+                snaps = session.get(sk)
+                if isinstance(snaps, list):
+                    kept = [s for s in snaps if isinstance(s, dict) and int(s.get("turn", 0) or 0) <= new_turn]
+                    session[sk] = kept
+            await self.sim_store.save(key, session)
+        return {"ok": True, "removed": removed, "kept": keep, "lore_turn": new_turn}
+
+    @_web_handler
+    async def _web_export(self, key: str = ""):
+        from .storage_base import sanitize_key
+
+        safe = sanitize_key(key)
+        path = os.path.join(self.data_dir, "sim_sessions", f"{safe}.json")
+        if not os.path.exists(path):
+            return _web_error("会话文件不存在", status_code=404)
+        return _web_file(path, filename=f"life_sim_{safe}.json", content_type="application/json")
+
+    @_web_handler
+    async def _web_narrative_list(self):
+        scope = self._web_query("scope")
+        branch = self._web_query("branch")
+        records = await self.narrative_store.list(scope, branch)
+        items = [
+            {
+                "id": r.get("id", ""),
+                "created_at": r.get("created_at", ""),
+                "summary": (r.get("summary") or "")[:200],
+                "user_action": (r.get("user_action") or "")[:120],
+                "mode": r.get("mode", ""),
+                "turn": r.get("turn", ""),
+                "revised_count": int(r.get("revised_count", 0) or 0),
+                "revised_at": r.get("revised_at", ""),
+                "narrative_len": len(r.get("narrative") or ""),
+            }
+            for r in records
+        ]
+        return {"ok": True, "records": items}
+
+    @_web_handler
+    async def _web_narrative_detail(self):
+        scope = self._web_query("scope")
+        branch = self._web_query("branch")
+        record_id = self._web_query("id")
+        record = await self.narrative_store.get(scope, record_id, branch)
+        if record is None:
+            return _web_error("剧情记录不存在", status_code=404)
+        return {
+            "ok": True,
+            "record": {
+                "id": record.get("id", ""),
+                "branch": branch,
+                "scope": scope,
+                "created_at": record.get("created_at", ""),
+                "summary": record.get("summary", ""),
+                "user_action": record.get("user_action", ""),
+                "narrative": record.get("narrative", ""),
+                "revised_at": record.get("revised_at", ""),
+                "revised_count": int(record.get("revised_count", 0) or 0),
+            },
+        }
+
+    @_web_handler
+    async def _web_narrative_update(self):
+        body = await self._web_body()
+        scope = str(body.get("scope") or "").strip()
+        record_id = str(body.get("id") or "").strip()
+        narrative = str(body.get("narrative") or "")
+        branch = str(body.get("branch") or "")
+        if not scope or not record_id:
+            raise ValueError("缺少 scope 或 id")
+        if not narrative.strip():
+            raise ValueError("剧情内容不能为空")
+        ok = await self.narrative_store.revise(scope, record_id, narrative, branch)
+        if not ok:
+            return _web_error("剧情记录不存在", status_code=404)
+        return {"ok": True}
+
+    @_web_handler
+    async def _web_narrative_delete(self):
+        body = await self._web_body()
+        scope = str(body.get("scope") or "").strip()
+        record_id = str(body.get("id") or "").strip()
+        branch = str(body.get("branch") or "")
+        if not scope or not record_id:
+            raise ValueError("缺少 scope 或 id")
+        ok = await self.narrative_store.delete(scope, record_id, branch)
+        if not ok:
+            return _web_error("剧情记录不存在", status_code=404)
+        return {"ok": True}
+
+    @_web_handler
+    async def _web_branches(self):
+        scope = self._web_query("scope")
+        data = await self.branch_store.list(scope)
+        out = []
+        for name, b in data.items():
+            scalars = {}
+            for k, v in b.items():
+                if isinstance(v, (str, int, float, bool)) and k != "name":
+                    scalars[k] = str(v)[:120]
+            out.append({"name": name, "fields": scalars})
+        return {"ok": True, "branches": out}
+
+    @_web_handler
+    async def _web_branch_delete(self):
+        body = await self._web_body()
+        scope = str(body.get("scope") or "").strip()
+        name = str(body.get("name") or "").strip()
+        if not scope or not name:
+            raise ValueError("缺少 scope 或 name")
+        ok = await self.branch_store.delete(scope, name)
+        if not ok:
+            return _web_error("分支不存在", status_code=404)
+        return {"ok": True}
+
+    @_web_handler
+    async def _web_rpg(self):
+        chars = []
+        for uid in self.rpg_store.list_chars():
+            c = self.rpg_store.load_char(uid) or {}
+            chars.append(
+                {
+                    "uid": uid,
+                    "name": c.get("name") or c.get("nickname") or c.get("char_name") or "",
+                    "level": c.get("level", ""),
+                    "hp": c.get("hp", c.get("hp_now", "")),
+                    "group_id": c.get("group_id", ""),
+                    "raw": json.dumps(c, ensure_ascii=False)[:6000],
+                }
+            )
+        sessions = []
+        for sid in self.rpg_store.list_sessions():
+            s = self.rpg_store.load_session(sid) or {}
+            sessions.append(
+                {
+                    "sid": sid,
+                    "game_system": s.get("game_system", ""),
+                    "group_id": s.get("group_id", ""),
+                    "members": s.get("members") or [],
+                    "raw": json.dumps(s, ensure_ascii=False)[:6000],
+                }
+            )
+        return {"ok": True, "chars": chars, "sessions": sessions}
+
+    @_web_handler
+    async def _web_rpg_char_delete(self):
+        body = await self._web_body()
+        uid = str(body.get("uid") or "").strip()
+        if not uid:
+            raise ValueError("缺少 uid")
+        if not self.rpg_store.delete_char(uid):
+            return _web_error("角色存档不存在", status_code=404)
+        return {"ok": True}
+
+    @_web_handler
+    async def _web_rpg_session_delete(self):
+        body = await self._web_body()
+        sid = str(body.get("sid") or "").strip()
+        if not sid:
+            raise ValueError("缺少 sid")
+        if not self.rpg_store.delete_session(sid):
+            return _web_error("会话存档不存在", status_code=404)
+        return {"ok": True}
+
+    @_web_handler
+    async def _web_memory_list(self):
+        """向量记忆列表:按 scope 分组展示全部记忆条目(供后台管理)。"""
+        scopes = []
+        mem_dir = os.path.join(self.data_dir, "vector_memory")
+        if os.path.isdir(mem_dir):
+            for fname in sorted(os.listdir(mem_dir)):
+                if not fname.endswith(".json"):
+                    continue
+                key = fname[:-5]
+                entries = await self.memory_store.recent(key, 100000)  # 全量
+                scopes.append({
+                    "scope": key,
+                    "count": len(entries),
+                    "embed_source": self.memory_store.embed_source,
+                    "entries": [
+                        {
+                            "id": e.get("id"),
+                            "content": e.get("content"),
+                            "turn": e.get("turn"),
+                            "importance": e.get("importance", 1),
+                            "created_at": e.get("created_at"),
+                        }
+                        for e in entries
+                    ],
+                })
+        return {"ok": True, "scopes": scopes}
+
+    @_web_handler
+    async def _web_memory_delete(self):
+        """删除向量记忆:scope 全删 / 按 id 单删 / 按关键字批量删。"""
+        body = await self._web_body()
+        scope = str(body.get("scope") or "").strip()
+        if not scope:
+            raise ValueError("缺少 scope")
+
+        mode = str(body.get("mode") or "all")
+        ids = body.get("ids") or []
+        keyword = str(body.get("keyword") or "").strip()
+        if not isinstance(ids, list):
+            ids = []
+        idset = {str(x) for x in ids if x}
+
+        if mode == "ids" and idset:
+            removed = await self.memory_store.delete_entries_by_id(scope, list(idset))
+            return {"ok": True, "removed": removed}
+
+        entries = await self.memory_store.recent(scope, 100000)
+        if mode == "keyword" and keyword:
+            kw = keyword.lower()
+            remaining = [
+                e
+                for e in entries
+                if kw not in str(e.get("content") or "").lower()
+            ]
+            removed = len(entries) - len(remaining)
+            if removed:
+                await self.memory_store.replace_entries(scope, remaining)
+            return {"ok": True, "removed": removed}
+
+        # all:清空该 scope
+        removed = await self.memory_store.delete_scope(scope)
+        return {"ok": True, "removed": removed}
+
+    @_web_handler
+    async def _web_memory_export(self):
+        """导出向量记忆为 JSON 文件。"""
+        scope = self._web_query("scope", "")
+        if not scope:
+            raise ValueError("缺少 scope")
+        entries = await self.memory_store.recent(scope, 100000)
+        cnt = len(entries)
+        if not entries:
+            raise ValueError("该 scope 没有记忆")
+
+        import tempfile
+
+        fd, path = tempfile.mkstemp(suffix=".json", prefix="lsim_mem_")
+        os.close(fd)
+        try:
+            payload = {
+                "_meta": {
+                    "format": "vector_memory",
+                    "format_version": 1,
+                    "scope": scope,
+                    "record_count": cnt,
+                    "exported_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                    "embed_source": self.memory_store.embed_source,
+                },
+                "entries": [
+                    {
+                        "id": e.get("id"),
+                        "content": e.get("content"),
+                        "turn": e.get("turn"),
+                        "importance": e.get("importance", 1),
+                        "created_at": e.get("created_at"),
+                    }
+                    for e in entries
+                ],
+            }
+            await asyncio.to_thread(lambda: write_json_atomic(path, payload))
+        except Exception as e:
+            logger.warning(f"life-sim: 导出向量记忆失败: {e}")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return _web_error("导出失败,请查看日志", status_code=500)
+
+        safe = scope.replace("/", "_").replace("\\", "_")
+        return _web_file(path, filename=f"life_sim_memory_{safe}.json", content_type="application/json")
 
     def _extract_after_cmd(
         self, event: AstrMessageEvent, cmds: str | tuple[str, ...] | list[str]
@@ -652,7 +1919,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
     @staticmethod
     def _is_my_tool(name: str) -> bool:
-        """过滤:只保留本插件的工具(rpg_*/roll_dice/life_sim_save_*/life_sim_get_*/life_sim_revise_narrative)。"""
+        """过滤:只保留本插件的工具(rpg_*/roll_dice/life_sim_save_*/life_sim_get_*/life_sim_revise_narrative/life_sim_recall_memory/life_sim_forget_memory)。"""
         return bool(name) and (
             name.startswith("rpg_")
             or name
@@ -662,6 +1929,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 "life_sim_save_world_lore",
                 "life_sim_get_character_lore",
                 "life_sim_revise_narrative",
+                "life_sim_recall_memory",
+                "life_sim_forget_memory",
             }
         )
 
@@ -719,20 +1988,45 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         self._cached_tool_set = tool_set
         return tool_set
 
+    @staticmethod
+    def _split_tail_by_turns(messages: list, keep_turns: int) -> tuple[list, list]:
+        """按「用户输入 = 一轮」从尾部切出最近 keep_turns 轮,返回 (head, tail)。
+
+        - 一轮 = 该用户消息 + 其后所有 assistant 回复 / tool 结果 / 中间步骤,
+          即切分边界永远落在真实用户消息上;
+        - `_summary` 标记的合成消息(旧压缩产物)不算用户输入,归入 head
+          参与下次重新摘要;
+        - 历史里没有任何真实用户输入时返回 ([], 全部),避免误删。
+        """
+        tail_start = None
+        seen = 0
+        for idx in range(len(messages) - 1, -1, -1):
+            m = messages[idx]
+            if not isinstance(m, dict) or m.get("_summary"):
+                continue
+            if str(m.get("role")) == "user":
+                seen += 1
+                if seen >= max(1, keep_turns):
+                    tail_start = idx
+                    break
+        if tail_start is None:
+            return [], list(messages)
+        return list(messages[:tail_start]), list(messages[tail_start:])
+
     async def _compress_history(self, messages: list, event=None) -> list:
         """压缩叙事历史:
-        - 总长 ≤ max_history_chars 或 messages ≤ keep_tail_messages → 原样返回
-        - 否则把前面的消息压缩为一段【叙事历史摘要】(优先 LLM,失败回退规则抽取),保留尾部 keep_tail 条原文
+        - 总长 ≤ max_history_chars 或「用户输入轮数」≤ keep_tail_messages → 原样返回
+        - 否则把前面的消息压缩为一段【叙事历史摘要】(优先 LLM,失败回退规则抽取),
+          尾部保留最近 keep_tail_messages **轮**原文 —— 以用户输入计一轮,
+          该轮的回复与工具调用随所属用户消息一起保留/压缩(不再按消息条数切分)。
         下次压缩时,旧摘要会被纳入"前面",重新生成新摘要 — 摘要不会无限增长。
         """
         max_chars = int(self._cfg("max_history_chars", 60000))
-        keep_tail = int(self._cfg("keep_tail_messages", 20))
+        keep_tail = int(self._cfg("keep_tail_messages", 10))
         total = sum(len(_content_to_text(m.get("content"))) for m in messages)
-        if total <= max_chars or len(messages) <= keep_tail:
+        head, tail = self._split_tail_by_turns(messages, keep_tail)
+        if not head or total <= max_chars:
             return messages
-
-        head = messages[:-keep_tail]
-        tail = list(messages[-keep_tail:])
 
         use_llm = bool(self._cfg("use_llm_compress", True))
         summary_text = None
@@ -774,11 +2068,15 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             f"请判断最适合的模式(只输出字母 A / B / C):"
         )
 
-        llm_resp = await self.context.llm_generate(
-            chat_provider_id=pid,
-            system_prompt=MODE_DETECT_SYSTEM_PROMPT,
-            contexts=[],
-            prompt=user_msg,
+        llm_resp = await self._run_llm_with_stats(
+            event,
+            pid,
+            lambda: self.context.llm_generate(
+                chat_provider_id=pid,
+                system_prompt=MODE_DETECT_SYSTEM_PROMPT,
+                contexts=[],
+                prompt=user_msg,
+            ),
         )
         text = (getattr(llm_resp, "completion_text", "") or "").strip().upper()
         for ch in text:
@@ -808,11 +2106,15 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         contexts = bind_checkpoint_messages(head_msgs)
         prompt = "请将上方历史对话压缩成简洁摘要,保留关键叙事线、人物关系、人生走向与结局标记。"
 
-        llm_resp = await self.context.llm_generate(
-            chat_provider_id=pid,
-            system_prompt=SUMMARY_SYSTEM_PROMPT,
-            contexts=contexts,
-            prompt=prompt,
+        llm_resp = await self._run_llm_with_stats(
+            event,
+            pid,
+            lambda: self.context.llm_generate(
+                chat_provider_id=pid,
+                system_prompt=SUMMARY_SYSTEM_PROMPT,
+                contexts=contexts,
+                prompt=prompt,
+            ),
         )
         text = (getattr(llm_resp, "completion_text", "") or "").strip()
         if not text:
@@ -909,6 +2211,265 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
     # LLM 调用 — 按模式选择 llm_generate / tool_loop_agent
     # ════════════════════════════════════════════════════════════════
 
+    async def _run_llm_with_stats(
+        self,
+        event: AstrMessageEvent | None,
+        provider_id: str,
+        fn: Callable[[], Awaitable[LLMResponse]],
+    ) -> LLMResponse:
+        """执行一次(或一轮 agent loop)LLM 调用,并把 token 用量写入 AstrBot 全局统计表。
+
+        原理:在 ContextVar 作用域内调用 provider.text_chat 的统计包装器,
+        累计本插件本轮所有请求的 usage;结束后通过 db_helper.insert_provider_stat()
+        以 agent_type="internal" 写入 provider_stats 表 —— 与 WebUI「数据统计」页
+        同一数据源,因此调用量/Token 曲线会把本插件的消耗计入。
+        统计失败不影响主流程。旧版 AstrBot 无此接口时静默跳过。
+        """
+        # 确保 provider 实例已安装 text_chat 统计包装器(幂等)
+        if self._cfg("record_llm_stats", True):
+            try:
+                prov = await self.context.provider_manager.get_provider_by_id(
+                    provider_id
+                )
+                if prov is not None:
+                    _ensure_provider_stats_hook(prov)
+            except Exception as e:
+                logger.debug(f"life-sim: 安装 LLM 用量统计钩子失败: {e}")
+
+        ctx = {
+            "calls": 0,
+            "errors": 0,
+            "usage": TokenUsage(),
+            "start_time": time.time(),
+            "end_time": 0.0,
+        }
+        token = _LLM_STATS_CTX.set(ctx)
+        errored = False
+        try:
+            llm_resp = await fn()
+            errored = getattr(llm_resp, "role", "") == "err"
+            return llm_resp
+        except Exception:
+            errored = True
+            raise
+        finally:
+            _LLM_STATS_CTX.reset(token)
+            ctx["end_time"] = time.time()
+            if self._cfg("record_llm_stats", True):
+                status = "error" if errored else "completed"
+                try:
+                    await self._flush_llm_provider_stat(event, provider_id, ctx, status)
+                except Exception as e:
+                    logger.debug(f"life-sim: 写入 LLM 用量统计失败(不影响功能): {e}")
+
+    async def _flush_llm_provider_stat(
+        self,
+        event: AstrMessageEvent | None,
+        provider_id: str,
+        ctx: dict,
+        status: str,
+    ) -> None:
+        """把一轮累计的用量写入 AstrBot 全局 provider_stats 表(WebUI 数据统计页数据源)。"""
+        from astrbot.core import db_helper  # 局部导入避免启动顺序问题
+
+        insert = getattr(db_helper, "insert_provider_stat", None)
+        if insert is None:
+            return  # 旧版 AstrBot,无此接口
+
+        u = ctx.get("usage") or TokenUsage()
+        provider_model = None
+        try:
+            prov = await self.context.provider_manager.get_provider_by_id(provider_id)
+            get_model = getattr(prov, "get_model", None)
+            provider_model = get_model() if callable(get_model) else None
+        except Exception:
+            provider_model = None
+
+        await insert(
+            umo=event.unified_msg_origin if event is not None else "",
+            provider_id=provider_id or "",
+            provider_model=provider_model,
+            conversation_id=None,
+            status=status if ctx.get("calls") else "error",
+            stats={
+                "token_usage": {
+                    "input_other": int(getattr(u, "input_other", 0) or 0),
+                    "input_cached": int(getattr(u, "input_cached", 0) or 0),
+                    "output": int(getattr(u, "output", 0) or 0),
+                },
+                "start_time": float(ctx.get("start_time") or 0.0),
+                "end_time": float(ctx.get("end_time") or 0.0),
+                # 非流式调用拿不到真实 TTFT,置 0(统计页会忽略为 0 的样本)
+                "time_to_first_token": 0.0,
+            },
+            agent_type="internal",
+        )
+
+    # ════════════════════════════════════════════════
+    # 图片预处理:压缩 → 多模态检测 → 不支持时用转述模型
+    # ════════════════════════════════════════════════
+
+    async def _compress_imgs(
+        self, event: AstrMessageEvent, imgs: list[Image]
+    ) -> list[Image]:
+        """把每张图统一落到本地文件并按配置压缩(等比缩放 + 重编码)。
+
+        - 压缩失败/无需压缩的图保留原样,绝不因压缩失败阻断叙事;
+        - 压缩产物是临时文件,登记到 event 以便框架统一回收;
+        - 动图(GIF)由 compress_image 内部跳过,保持原样。
+        """
+        if compress_image is None:
+            logger.debug("life-sim: 当前 AstrBot 无 compress_image,跳过图片压缩")
+            return imgs
+        if not self._cfg("image_compress_enable", True):
+            return imgs
+        try:
+            max_size = max(64, min(8192, int(self._cfg("image_max_size", 1280))))
+            quality = max(1, min(100, int(self._cfg("image_quality", 90))))
+        except (TypeError, ValueError):
+            max_size, quality = 1280, 90
+
+        out: list[Image] = []
+        for img in imgs:
+            try:
+                src_path = await img.convert_to_file_path()
+                compressed = await compress_image(
+                    src_path, max_size=max_size, quality=quality
+                )
+                if compressed and compressed != src_path and os.path.exists(compressed):
+                    out.append(Image.fromFileSystem(compressed))
+                    try:
+                        event.track_temporary_local_file(compressed)
+                    except AttributeError:
+                        pass  # 旧版 AstrBot 无此接口,临时文件交给系统清理
+                    logger.debug(f"life-sim: 图片已压缩 {src_path} -> {compressed}")
+                else:
+                    out.append(img)  # 无需压缩或压缩被跳过(GIF/过小图)
+            except Exception as e:
+                logger.warning(f"life-sim: 图片压缩失败,使用原图: {e}")
+                out.append(img)
+        return out
+
+    async def _get_img_desc_provider(self):
+        """选图片转述 provider。优先级:插件配置 > AstrBot 系统默认转述模型。
+
+        返回 (provider 实例 | None, provider_id),未配置时返回 (None, "")。
+        """
+        pid = str(self._cfg("img_desc_provider_id", "") or "").strip()
+        source = "插件配置"
+        if not pid:
+            try:
+                ps = self.context.get_config().get("provider_settings", {}) or {}
+                pid = str(ps.get("default_image_caption_provider_id", "") or "").strip()
+            except Exception as e:
+                logger.debug(f"life-sim: 读取系统默认图片转述模型失败: {e}")
+                pid = ""
+            source = "系统默认"
+        if not pid:
+            return None, ""
+        try:
+            prov = await self.context.provider_manager.get_provider_by_id(pid)
+        except Exception as e:
+            prov = None
+            logger.warning(f"life-sim: 获取图片转述模型 {pid} 失败: {e}")
+        if prov is None:
+            logger.warning(f"life-sim: 图片转述模型不存在({source}: {pid}),请检查配置")
+            return None, ""
+        return prov, pid
+
+    async def _caption_images(self, event, prov, desc_pid, imgs) -> str:
+        """调用转述模型把本轮全部图片转成一段文字描述。
+
+        单次调用带全部图(常见就一张);失败抛异常由上层兜底。
+        """
+        urls: list[str] = []
+        for img in imgs:
+            try:
+                p = await img.convert_to_file_path()
+                if p:
+                    urls.append(p)
+            except Exception as e:
+                logger.warning(f"life-sim: 转述前解析图片路径失败,跳过该图: {e}")
+        if not urls:
+            return ""
+        prompt = (
+            str(self._cfg("img_desc_prompt", "") or "").strip()
+            or _DEFAULT_IMG_DESC_PROMPT
+        )
+        llm_resp = await self._run_llm_with_stats(
+            event,
+            desc_pid,
+            lambda: prov.text_chat(prompt=prompt, image_urls=urls),
+        )
+        return (getattr(llm_resp, "completion_text", "") or "").strip()
+
+    async def _prepare_images(
+        self,
+        event: AstrMessageEvent,
+        provider_id: str,
+        imgs: list[Image] | None,
+    ) -> tuple[list[Image], str]:
+        """图片进入 LLM 前的统一入口(被 /创建 /do /redo 的 _generate 共用):
+
+        1. 先压缩(image_compress_enable / image_max_size / image_quality);
+        2. 检测主模型是否支持图片输入(modalities 未配置视为支持);
+        3. 不支持时改走「图片转述」:插件 img_desc_provider_id 或 AstrBot 系统默认
+           转述模型把图变成 <Image Description> 文字块,追加到本轮 user 输入;
+           两处都未配置则只注入占位提示,避免非多模态模型收到 image part 报错。
+
+        返回 (处理后的 imgs, 需追加到 user_input 的文字)。不支持多模态时 imgs 置空,
+        下游不再传 image_urls、消息历史也不落 base64(省 KV 且对纯文本模型安全)。
+        """
+        if not imgs:
+            return [], ""
+
+        # ── 1) 压缩(两种通道都受益:直传给视觉模型 / 交给转述模型)──
+        imgs = await self._compress_imgs(event, list(imgs))
+
+        # ── 2) 主模型多模态能力检测 ──
+        main_prov = None
+        try:
+            main_prov = await self.context.provider_manager.get_provider_by_id(
+                provider_id
+            )
+        except Exception as e:
+            logger.debug(f"life-sim: 获取主 provider 实例失败(跳过多模态检测): {e}")
+        if main_prov is None or _provider_allows_image(main_prov):
+            return imgs, ""
+
+        n_imgs = len(imgs)
+        plural = f"{n_imgs} 张图片" if n_imgs > 1 else "1 张图片"
+
+        # ── 3a) 走转述模型 ──
+        desc_prov, desc_pid = await self._get_img_desc_provider()
+        if desc_prov is not None:
+            try:
+                caption = await self._caption_images(event, desc_prov, desc_pid, imgs)
+            except Exception as e:
+                caption = ""
+                logger.error(f"life-sim: 图片转述失败({desc_pid}): {e}")
+            if caption:
+                logger.info(
+                    f"life-sim: 主模型不支持图片输入,已用转述模型 {desc_pid} "
+                    f"处理 {plural}"
+                )
+                return [], "\n\n" + _build_img_desc_tag(caption)
+            logger.warning(
+                f"life-sim: 图片转述无输出(模型 {desc_pid}),本轮以占位提示替代"
+            )
+
+        # ── 3b) 兜底:无可用转述模型 → 占位提示,丢弃原图 ──
+        note = (
+            f"[用户发送了{plural},但当前叙事模型不支持图片输入"
+            + (
+                ",且未配置图片转述模型(img_desc_provider_id 或 AstrBot 默认转述模型)"
+                if desc_prov is None
+                else ",转述失败"
+            )
+            + "]"
+        )
+        return [], f"\n\n<image_note>{note}</image_note>"
+
     async def _generate(
         self,
         event: AstrMessageEvent,
@@ -920,6 +2481,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         provider_id, err = await self._get_provider_id(event, mode)
         if err:
             return err
+
+        # 图片预处理:压缩 → 多模态检测 → 不支持时转述为文字(追加到本轮输入)
+        imgs, img_desc_text = await self._prepare_images(event, provider_id, imgs)
+        if img_desc_text:
+            user_input += img_desc_text
 
         # 为本轮开一个 staging 槽位:工具 handler 写到 self._pending_lore[event_key],
         # 本函数末尾统一合并到 session 并落库(成功路径)。失败路径在 finally 释放。
@@ -941,6 +2507,16 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         if lore:
             system_prompt += "\n\n" + lore
 
+        # 聊天卡片模式:先把公共排版段替换成聊天卡片专用排版(避免普通"合并短句"
+        # 规则污染聊天输出),再注入对白输出规范
+        if self._cfg("chat_card_enable", False):
+            if TYPOGRAPHY_TEXT and TYPOGRAPHY_TEXT in system_prompt:
+                system_prompt = system_prompt.replace(
+                    TYPOGRAPHY_TEXT, TYPOGRAPHY_CHAT_CARD
+                )
+            system_prompt += CHAT_CARD_PROMPT
+            system_prompt += self._chat_card_avatar_prompt(event)
+
         # 输出前自检 — 放在 system prompt 最末尾,利用 recency bias 强化设定遵从度
         system_prompt += (
             "\n\n## ✅ 输出前自检清单(写正文前必须过一遍)\n"
@@ -955,23 +2531,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             session.get("messages", []), event=event
         )
 
-        # 用 turn 计数器快照 lore(单调递增,与消息位置/压缩解耦,稳定)
-        turn = session.get("lore_turn", 0) + 1
-        session["lore_turn"] = turn
-        self._snapshot_lore(session, turn)
-        # 同步快照剧情历史状态(供 /undo 回滚被本 turn 新增/修订的记录)
-        # 必须在 LLM 调用前抓取 — `_auto_record_narrative` 在调用结束后才写。
-        await self._snapshot_narrative_history(session, turn, event_key)
-        # 同步快照 RPG 数值状态,供 /undo 回滚 HP/EXP/装备/会话等
-        # mode B/C 一律保存(包括空快照)— 否则回滚到"首个创建 RPG 数据的 turn"时找不到快照,
-        # 导致本应被删除的新建角色/会话漏网。
-        if mode in ("B", "C"):
-            rpg_snap = self._rpg_snapshot(event, mode)
-            rpg_snaps = session.setdefault("rpg_snapshots", [])
-            rpg_snaps.append({"turn": turn, **rpg_snap})
-            # 限制最多保留 25 个快照(每个可能含多角色,避免 KV 膨胀)
-            if len(rpg_snaps) > 25:
-                del rpg_snaps[: len(rpg_snaps) - 25]
+        # ── turn 计数与快照:失败 / 空输出的 /do 不推进 ──
+        # 旧实现:进入 LLM 调用前就递增 lore_turn 并拍快照;若本轮调用失败/返回空文本
+        # (不落任何 user 消息),lore_turn 与用户消息数会错位 —— /undo N 按消息数回滚,
+        # 却按 lore_turn 倒推目标轮,导致目标轮偏晚、剧情历史只删了一条。
+        # 现在:RPG 快照内容(存档文件会被本轮工具就地修改)必须在调用前抓取;
+        # lore / 剧情历史快照与 turn 递增移到 LLM 成功后统一提交(见下)。
+        rpg_capture = self._rpg_snapshot(event, mode) if mode in ("B", "C") else None
 
         contexts = bind_checkpoint_messages(messages)
 
@@ -991,32 +2557,48 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             if last_nid:
                 user_input += _build_narrative_ref_tag(last_nid)
 
+        # 向量记忆召回:把与当前输入相关的「历史事件」注入到本轮 user 消息
+        # (不写入 system prompt,保住前缀缓存;每轮本就不同,零额外成本)
+        recall = await self._build_memory_recall(event_key, session, user_input)
+        if recall:
+            if not user_input.endswith("\n"):
+                user_input += "\n"
+            user_input += recall
+
         image_urls = [(img.url or img.path) for img in (imgs or [])]
         tool_hooks: _LifeSimToolHooks | None = None
         try:
             if mode == "A":
-                llm_resp = await self.context.llm_generate(
-                    chat_provider_id=provider_id,
-                    system_prompt=system_prompt,
-                    image_urls=image_urls,
-                    contexts=contexts,
-                    prompt=user_input,
+                llm_resp = await self._run_llm_with_stats(
+                    event,
+                    provider_id,
+                    lambda: self.context.llm_generate(
+                        chat_provider_id=provider_id,
+                        system_prompt=system_prompt,
+                        image_urls=image_urls,
+                        contexts=contexts,
+                        prompt=user_input,
+                    ),
                 )
             else:
                 # 传 tools 让 LLM 知道 rpg_*/roll_dice 可用(否则 tool_loop_agent 不会调任何工具)
                 tools = self._build_my_tool_set()
                 tool_hooks = _LifeSimToolHooks()
-                llm_resp = await self.context.tool_loop_agent(
-                    event=event,
-                    chat_provider_id=provider_id,
-                    system_prompt=system_prompt,
-                    image_urls=image_urls,
-                    contexts=contexts,
-                    prompt=user_input,
-                    tools=tools,
-                    max_steps=tool_max_steps,
-                    tool_call_timeout=tool_call_timeout,
-                    agent_hooks=tool_hooks,
+                llm_resp = await self._run_llm_with_stats(
+                    event,
+                    provider_id,
+                    lambda: self.context.tool_loop_agent(
+                        event=event,
+                        chat_provider_id=provider_id,
+                        system_prompt=system_prompt,
+                        image_urls=image_urls,
+                        contexts=contexts,
+                        prompt=user_input,
+                        tools=tools,
+                        max_steps=tool_max_steps,
+                        tool_call_timeout=tool_call_timeout,
+                        agent_hooks=tool_hooks,
+                    ),
                 )
         except (ValueError, KeyError, TimeoutError, OSError, ConnectionError) as e:
             logger.error(f"life-sim: LLM 调用失败: {e}")
@@ -1035,6 +2617,33 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         new_msgs = await self._llm_resp_to_messages(
             user_input, llm_resp, imgs, tool_hooks
         )
+
+        # ── LLM 调用成功,提交本轮 turn:递增计数 + 快照 pre-turn 状态 ──
+        turn = session.get("lore_turn", 0) + 1
+        session["lore_turn"] = turn
+        self._snapshot_lore(session, turn)
+        # 同步快照剧情历史状态(供 /undo 回滚被本 turn 新增/修订的记录)。
+        # 此时本轮记录尚未写入(`_auto_record_narrative` 在末尾才调),
+        # 所以快照拿到的 `ids` 正是"本轮开始前"的记录集合;工具里的 revise
+        # 只改写既有记录(id 不变),不改变 ids 集合。
+        await self._snapshot_narrative_history(session, turn, event_key)
+        # 同步快照 RPG 数值状态:内容已在 LLM 调用前抓取(rpg_capture),
+        # 即 pre-turn 状态,这里只补 turn 号提交。
+        if rpg_capture is not None:
+            rpg_snaps = session.setdefault("rpg_snapshots", [])
+            rpg_snaps.append({"turn": turn, **rpg_capture})
+            # 限制最多保留 25 个快照(每个可能含多角色,避免 KV 膨胀)
+            if len(rpg_snaps) > 25:
+                del rpg_snaps[: len(rpg_snaps) - 25]
+            # 去重:chars/sessions 内容寻址收敛到 `_rpg_versions` 索引表
+            _compact_rpg_versions(session)
+
+        # 给本轮 user 消息盖上 turn 戳,`/undo N` 按戳精确定位回滚目标轮
+        # (消息与轮次一一对应,不受失败轮/压缩/摘要影响)。
+        for _m in new_msgs:
+            if isinstance(_m, dict) and _m.get("role") == "user":
+                _m["turn"] = turn
+                break
 
         messages.extend(new_msgs)
         session["messages"] = messages
@@ -1075,6 +2684,18 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             session["last_narrative_id"] = record_id
             await self._save_sim(event, session)
             text += f"\n\n📝 [剧情ID: `{record_id}`]"
+
+        # 向量记忆:把本轮「剧情进展」总结写入记忆库(失败静默,成功/失败不影响主流程)
+        await self._record_turn_memory(
+            event,
+            event_key,
+            session,
+            provider_id,
+            text,
+            turn,
+            mode=mode,
+            tool_hooks=tool_hooks,
+        )
 
         return text
 
@@ -1351,9 +2972,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         """在 turn 处快照当前 lore 状态,供 /undo 回滚。
 
         每个 turn 开始时(LLM 调用前)调用一次。/undo 时用 turn 计数回滚,
-        比 msg_index 更稳定 — 压缩 / 增删消息不影响 turn 计数。
+        比 msg_index 更稳定 —— 压缩 / 分支切换不影响 turn 计数。
 
-        深拷贝避免后续修改 session.lore 影响快照。
+        深拷贝避免后续修改 session.lore 影响快照。快照经 `_compact_lore_versions`
+        内容寻址去重:连续多轮 lore 未变时,只保留一份较新版本引用而不是整份拷贝。
         """
         snapshots = session.setdefault("lore_snapshots", [])
         char_lore_dict = self._normalize_character_lore(session.get("character_lore"))
@@ -1371,6 +2993,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         # undo 最大回滚 20 轮,25 个快照足够覆盖。
         if len(snapshots) > 25:
             del snapshots[: len(snapshots) - 25]
+        # 去重 + 迁移旧格式(把内联整份 lore 收敛到 `_lore_versions` 索引表)
+        _compact_lore_versions(session)
 
     async def _snapshot_narrative_history(
         self, session: dict, turn: int, scope: str
@@ -1388,7 +3012,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
         限制:最多保留 25 个快照,与 lore / rpg 一致。
         """
-        records = await self.narrative_store.list(scope)
+        # 只存记录 ID 列表(轻量);快照标记所属 branch,回滚时按当前线隔离
+        records = await self.narrative_store.list(scope, _narrative_branch(session))
         snapshots = session.setdefault("narrative_snapshots", [])
         snapshots.append(
             {
@@ -1402,9 +3027,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             del snapshots[: len(snapshots) - 25]
 
     async def _restore_narrative_history(
-        self, scope: str, snap: dict, all_snaps: list | None = None
+        self,
+        scope: str,
+        snap: dict,
+        all_snaps: list | None = None,
+        branch: str = "",
     ) -> dict:
-        """从快照恢复剧情历史。返回 {"deleted": int, "restored": int}。
+        """从快照恢复指定线(主线/分支)的剧情历史。返回 {"deleted": int, "restored": int}。
 
         删除:当前存在但快照点不存在(快照点后新增)的记录。
         回滚修订:
@@ -1432,12 +3061,12 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 for state in s.get("records") or []:
                     target_map[state["id"]] = state
 
-        current = await self.narrative_store.list(scope)
+        current = await self.narrative_store.list(scope, branch)
 
         deleted = 0
         for r in current:
             if r["id"] not in target_ids and await self.narrative_store.delete(
-                scope, r["id"]
+                scope, r["id"], branch=branch
             ):
                 deleted += 1
 
@@ -1451,6 +3080,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                     "revised_count": state["revised_count"],
                     "revised_at": state["revised_at"],
                 },
+                branch=branch,
             )
             if ok:
                 restored += 1
@@ -1501,7 +3131,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 "source_session_key": session.get("_session_key", scope),
                 "mode": session.get("mode", "A"),
             }
-            return await self.narrative_store.append(scope, payload)
+            return await self.narrative_store.append(
+                scope, payload, branch=_narrative_branch(session)
+            )
         except (OSError, ValueError, TypeError) as e:
             logger.warning(f"life-sim: 剧情历史记录失败: {e}")
             return None
@@ -1562,8 +3194,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
           (名字 + 条目数 + 按需读取工具),刻画前由 LLM 调
           `life_sim_get_character_lore` 获取完整设定 → 角色多、轮数多时
           system prompt 不再被整棵角色树撑爆。
-        - 世界观:每个 section 只注入最新一条(世界状态以最新为准),
-          历史条目提示可用 `life_sim_get_world_lore` 查询。
+        - 世界观:不做按需裁剪,一律完整注入(历史条目本身有参考价值,
+          且不依赖 LLM 主动调工具读取)。
         关闭开关则与旧行为一致:全部完整注入。
 
         在块顶部加粗体权威性声明,`appearance` 等硬约束 section 前面插入
@@ -1644,7 +3276,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
     @staticmethod
     def _render_lore_timeline(
-        entries: list, indent: str = "", hard_sections: set[str] | None = None
+        entries: list,
+        indent: str = "",
+        hard_sections: set[str] | None = None,
+        max_content_chars: int | None = None,
+        max_total_chars: int = 0,
     ) -> list[str]:
         """把 (角色 / 世界观) 的 entries 列表渲染成时间轴字符串列表。
 
@@ -1653,6 +3289,12 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
         `hard_sections` 指定的 section(如 appearance / forms)在首条前会插入
         一行「禁止脑补」警告,强化模型对这些字段的遵从度。
+
+        `max_content_chars` / `max_total_chars` 用于**用户展示**路径(如 /lore):
+        QQ 平台对超长转发消息(>4096 字符)会直接拒绝发送,而角色/世界观条目可能
+        单条上千字。设限后每条 content 截断到 `max_content_chars`(默认不截),
+        累计超出 `max_total_chars` 时停止追加并提示省略条数。
+        LLM 注入 / 工具返回等路径不传这两个参数,保持全文。
 
         为什么按首次出现顺序而不是字典序:
         - 新 entry 永远是**追加**到对应 section 组末尾,老条目的字节位置不动;
@@ -1672,19 +3314,337 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
         lines: list[str] = []
         prev_section: str | None = None
+        total_chars = 0
+        truncated = False
         for sec in sorted(groups, key=lambda s: section_order.get(s, 0)):
             group = sorted(groups[sec], key=lambda e: int(e.get("seq", 0)))
             for e in group:
                 seq = e.get("seq", "?")
                 ts = e.get("updated_at", "")
                 content = e.get("content", "")
+                if (
+                    max_content_chars
+                    and isinstance(content, str)
+                    and len(content) > max_content_chars
+                ):
+                    content = content[:max_content_chars] + "…"
+                line = f"{indent}[#{seq} | {ts}] **{sec}** — {content}"
                 if sec != prev_section and sec in hard_sections:
-                    lines.append(
-                        f"{indent}> 🔒 **「{sec}」为硬性约束 — 发色/瞳色/服装/配饰等严禁凭印象脑补,叙事必须照写。**"
-                    )
-                lines.append(f"{indent}[#{seq} | {ts}] **{sec}** — {content}")
+                    warn = f"{indent}> 🔒 **「{sec}」为硬性约束 — 发色/瞳色/服装/配饰等严禁凭印象脑补,叙事必须照写。**"
+                    if max_total_chars and total_chars + len(warn) > max_total_chars:
+                        truncated = True
+                        break
+                    lines.append(warn)
+                    total_chars += len(warn)
+                if max_total_chars and total_chars + len(line) > max_total_chars:
+                    truncated = True
+                    break
+                lines.append(line)
+                total_chars += len(line)
+            if truncated:
+                break
             prev_section = sec
+        # 截断提示:内容过长时告知总条数与已显示条数
+        if truncated:
+            all_ = sum(len(g) for g in groups.values())
+            lines.append(
+                f"{indent}…(内容过长,已截断,共 {all_} 条,显示 {len(lines)} 条)"
+            )
         return lines
+
+    # ════════════════════════════════════════════════════════════
+    # 向量记忆:召回「相关回忆」 + 自动记录「发生过的事情」
+    # ════════════════════════════════════════════════════════════
+
+    async def _build_memory_recall(
+        self, event_key: str, session: dict, current_input: str
+    ) -> str | None:
+        """按当前输入召回相关历史记忆,格式化为注入 user 消息的文本块。
+
+        关键设计:召回结果**每轮不同**,因此放进每轮都在变的 user_input,
+        而不是 system prompt —— 保住 system prompt 的前缀缓存(与
+        `_build_narrative_ref_tag` 同一思路)。命中为空 / 召回失败返回 None。
+        """
+        if not self._cfg("memory_enable", True):
+            return None
+        top_k = max(1, min(20, int(self._cfg("memory_top_k", 5))))
+        min_score = float(self._cfg("memory_min_score", 0.10))
+        max_chars = max(100, int(self._cfg("memory_recall_chars", 1600)))
+        try:
+            hits = await self.memory_store.search(
+                event_key, current_input, top_k=top_k, min_score=min_score
+            )
+        except Exception as e:
+            logger.debug(f"life-sim: 向量记忆召回失败(跳过): {e}")
+            return None
+        if not hits:
+            return None
+        parts: list[str] = []
+        used = 0
+        for h in hits:
+            content = (h.get("content") or "").strip()
+            if not content:
+                continue
+            # 转义非法字符:记忆可能含不配对尖括号等,包进 <memory_recall> 会破坏标签闭合
+            content = _escape_memory_content(content)
+            # 带上记忆自己的 id(m_xxx),供 LLM 独立管理(如用 life_sim_forget_memory 删除)
+            mid = (h.get("id") or "").strip()
+            mid_pfx = f"[{mid}] " if mid else ""
+            line = f"- {mid_pfx}{content}"
+            used += len(line) + 1
+            parts.append(line)
+            if used > max_chars:
+                break
+        if not parts:
+            return None
+        inner = "\n".join(parts)
+        # 用 XML 标签 <memory_recall> 包裹(与 <system_reminder>/<narrative_ref> 一致),
+        # 这样 _strip_xml_tags / _strip_meta_tags 能识别剥离,不会污染
+        # 剧情历史的 user_action、向量记忆的“用户行动”、/redo 重放等下游。
+        block = (
+            "<memory_recall>以下为与当前剧情相关的往昔回忆,供延续剧情 / 设定时参照,勿与当前冲突:\n"
+            + inner
+            + "</memory_recall>"
+        )
+        return block
+
+    async def _record_turn_memory(
+        self,
+        event,
+        event_key: str,
+        session: dict,
+        provider_id: str,
+        narrative: str,
+        turn: int,
+        mode: str = "A",
+        tool_hooks: "_LifeSimToolHooks | None" = None,
+    ) -> None:
+        """记录本轮剧情进展到向量记忆(所有模式统一自动记录,无手动记忆工具)。
+
+        记录内容是「本轮的剧情进展总结」:不包含用户行动输入 —— 用户说了什么
+        属于咨询/指令,不需要沉淀进长期记忆;真正值得记住的是「这轮剧情发生了什么」。
+        总结默认用 LLM 生成(`memory_summarize_by_llm`),失败时回退到规则摘要。
+
+        **只记「有实质剧情推进」的轮**。由总结器 LLM 自行判断本轮是否值得记忆:
+        如果本轮只是保存角色/世界观设定、纯闲聊、纯氛围/过场而无剧情进展,LLM
+        返回无剧情哨兵 → 跳过,不污染剧情事件记忆库。日常叙述中 LLM 边推进剧情
+        边顺手保存新设定也属正常剧情轮,会照常记忆。
+        """
+        if not self._cfg("memory_enable", True):
+            return
+        if not self._cfg("memory_auto_record", True):
+            return
+
+        narr = _clean_narrative_for_memory(narrative)
+        if not narr:
+            return
+        limit = max(60, int(self._cfg("memory_content_chars", 500)))
+        summary = ""
+        if self._cfg("memory_summarize_by_llm", True):
+            try:
+                # 检索最近几条已有记忆作为上下文,帮助总结器区分「本轮新增剧情」
+                # 与「已记住的内容」,避免重复记录 / 更好判断本轮是否有新进展。
+                recent_mems = await self.memory_store.recent(event_key, 6)
+                raw = await self._llm_summarize_memory(
+                    event, provider_id, narr, limit, recent_mems=recent_mems
+                )
+            except Exception as e:
+                logger.debug(f"life-sim: LLM 总结记忆失败,回退规则摘要: {e}")
+                raw = ""
+            # LLM 明确判定本轮无剧情进展 → 直接跳过,不写记忆、也不回退规则摘要
+            if raw and _is_no_story(raw):
+                logger.debug("life-sim: 本轮无实质剧情推进,跳过向量记忆")
+                return
+            if raw:
+                summary = _extract_memory_summary(raw, limit)
+        if not summary:
+            summary = self._compact_turn_summary(narr, limit)
+        if not summary:
+            return
+        content = summary
+        try:
+            await self.memory_store.add(
+                event_key, content, turn=turn, importance=1, dedup_threshold=0.95
+            )
+            max_store = max(0, int(self._cfg("memory_max_entries", 400)))
+            if max_store:
+                await self.memory_store.set_max_entries(event_key, max_store)
+        except Exception as e:
+            logger.debug(f"life-sim: 写入向量记忆失败(跳过): {e}")
+
+    async def _llm_summarize_memory(
+        self, event, provider_id: str, narrative: str, limit: int,
+        recent_mems: list[dict] | None = None,
+    ) -> str:
+        """用 LLM 把本轮叙事总结成一条剧情记忆。
+
+        Provider 沿用主流程的 provider_id(与当轮叙事同源,保证角色/风格一致)。
+        要求输出一段自包含的剧情进展总结(不含用户行动、不含聊天标签、不被氛围
+        渲染淹没、不超 limit 字)。**由 LLM 自行判断本轮是否有值得记忆的剧情 
+        进展**:若无(纯设定保存/闲聊/过场),输出 `_MEMORY_NO_STORY` 哨兵,由调用方跳过。
+        失败抛异常由调用方回退规则摘要。
+
+        `recent_mems`:最近几条**已有记忆**,用 `<recent_memory>` 标签+说明包起,
+        作为上下文让 LLM 区分「已记住的历史」与「本轮新增剧情」,避免重复记录、
+        并辅助判断本轮是否有新进展。
+        """
+        if not provider_id:
+            raise RuntimeError("无 provider_id,跳过 LLM 总结")
+        sys_prompt = (
+            "你是转生模拟的剧情记忆整理器。任务:判断本轮叙事**是否有值得长期记住的"
+            "新剧情进展**,若有则整理成一条精炼的自包含记忆(注意与已有记忆区分,只记本轮新增)。\n"
+            "判断标准(有任一即为「有剧情进展」,应当记忆):\n"
+            "- 发生了实质事件(战斗、抉择、相遇、离别、发现、达成目标等)\n"
+            "- 人物关系 / 动机 / 状态发生了值得记住的变化\n"
+            "- 埋下或回应了伏笔、线索、约定\n"
+            "- 出现了会延续到未来的重要事实(新人物、新地点、新身份、重要物品)\n"
+            "判断为【无新剧情进展】的典型情况(应当跳过,不记忆):\n"
+            "- 本轮内容与已有记忆相同/重复(没有新信息,别重复记)\n"
+            "- 只是保存/补充角色或世界观设定(`life_sim_save_*`),没有任何剧情推进\n"
+            "- 只是纯闲聊、问答、氛围/景色/过场描写,没有事件发生\n"
+            "- 只是确认/总结/复述,没有新进展\n\n"
+            "输出规则:\n"
+            "- 若**无新剧情进展** → 只输出一行:`__NO_STORY__`\n"
+            "- 若有 → 输出总结(只记本轮新增,不要重复已有记忆里的内容):\n"
+            "  1. 只总结【剧情本身发生了什么】;不要记录用户说了什么(指令/选择都不需要)\n"
+            "  2. 不要聊天标签(<d> <c> <t> 等)、不要 markdown 标题、不要编号\n"
+            "  3. 不要氛围/景色/外貌渲染;聚焦实质推进\n"
+            "  4. 纯文本段落,自包含(单独抽出也能读懂)"
+        )
+        prompt = (
+            "以下是<i>最近已记住的记忆</i>(供你区分已有剧情,避免重复记录;这些是过去发生的,不是本轮):\n"
+            + _format_recent_memories(recent_mems)
+            + "\n\n===== 本轮 =====\n"
+            f"以下是本轮剧情叙事(应作为新进展判断):\n---\n{narrative[:4000]}\n---\n"
+            f"请判断:本轮有实质**新**剧情进展就总结(不超过约 {limit} 字,尽量精简);"
+            "无新进展就只输出 __NO_STORY__。"
+        )
+        llm_resp = await self._run_llm_with_stats(
+            event,
+            provider_id,
+            lambda: self.context.llm_generate(
+                chat_provider_id=provider_id,
+                system_prompt=sys_prompt,
+                contexts=[],
+                prompt=prompt,
+            ),
+        )
+        text = (getattr(llm_resp, "completion_text", "") or "").strip()
+        if not text:
+            raise RuntimeError("LLM 返回空总结")
+        return text  # 原始文本,由调用方解析哨兵 / 剥离标签
+
+    @staticmethod
+    def _compact_turn_summary(narr: str, limit: int = 160) -> str:
+        """把清洗后的叙事压成一句精炼的剧情进展摘要。
+
+        取第一段(通常是开场/主事件)+ 若有对白拼关键的几句,截断到 limit。
+        目标:短且承载剧情实质,不要整段描述词。
+        """
+        if not narr:
+            return ""
+        # 取包含“行动/结果”信息量高的段落:优先非纯氛围的第一段
+        lines = [ln.strip() for ln in narr.split("\n") if ln.strip()]
+        if not lines:
+            return ""
+        body = "；".join(lines[1:5]) if len(lines) > 1 else lines[0]
+        # 合并压缩多余空白
+        body = re.sub(r"\s+", " ", body)
+        if len(body) > limit:
+            body = body[:limit] + "…"
+        return body
+
+    async def life_sim_recall_memory(
+        self, event, query: str = "", top_k: int = 5
+    ) -> str:
+        """
+        主动召回向量记忆:按 query 语义检索过往剧情事件,返回相关的历史记忆。
+
+        调用时机:当你想回顾某段过去的剧情(人物关系、过往约定、伏笔、某个
+        地方/人物/事件)而**当轮自动注入的回忆不够或想再深挖**时调用。
+        例如用户提到一个老伏笔,而你记不清细节;或需要延续很久以前埋下的线。
+
+        也可用于核实:确认某件重要事情是否发生过、以及当时的具体情况。
+
+        Args:
+            query(string): 检索关键词/问题,描述你想回忆的剧情内容(含关键人名/地点/事件)。
+            top_k(int, optional): 最多返回条数,1-20。默认 5。
+        Returns:
+            若干条相关记忆(按相关度降序,带记忆 id `m_xxx`);无命中返回提示。
+            每条记忆是自包含的剧情事件描述。
+        """
+        if not self._cfg("memory_enable", True):
+            return "记忆功能未开启。"
+        event_key = self._sim_session_key(event)
+        top_k = max(1, min(20, int(top_k or 5)))
+        min_score = float(self._cfg("memory_min_score", 0.10))
+        q = (query or "").strip()
+        try:
+            hits = await self.memory_store.search(
+                event_key, q, top_k=top_k, min_score=min_score
+            )
+        except Exception as e:
+            logger.debug(f"life-sim: life_sim_recall_memory 召回失败: {e}")
+            return "召回记忆失败,请稍后重试。"
+        if not hits:
+            return "没有找到与此相关的过往记忆。"
+        parts = []
+        for h in hits:
+            content = _escape_memory_content((h.get("content") or "").strip())
+            if not content:
+                continue
+            mid = (h.get("id") or "").strip()
+            mid_pfx = f"[{mid}] " if mid else ""
+            parts.append(f"- {mid_pfx}{content}")
+        if not parts:
+            return "没有找到与此相关的过往记忆。"
+        return (
+            "相关回忆(按相关度,带记忆 id):\n"
+            + "\n".join(parts)
+            + "\n(以上为历史记忆,供延续剧情/设定参照;若与当前冲突以当前为准。若某条记忆已过时/错误,可用 life_sim_forget_memory 删除。)"
+        )
+
+    async def life_sim_forget_memory(
+        self, event, ids: str = "", ids_list: list | None = None
+    ) -> str:
+        """
+        删除指定 id 的向量记忆(应对剧情被修改/推翻后过时的记忆)。
+
+        调用时机:当某条历史记忆已**过时/被推翻/与当前剧情冲突**(例如用户反馈
+        某段剧情写错了、实际上剧情不是那样),应删除它,避免后续回忆注入过时内容。
+
+        记忆的 id(`m_xxx`)由 <memory_recall> 自动注入,或经 life_sim_recall_memory
+        返回——直接复制即可。
+
+        Args:
+            ids(string): 要删除的记忆 id(单个),如 "m_a1b2c3d4"。
+            ids_list(list[string], optional): 也可传多个 id 的列表,如 ["m_a1b2c3d4", "m_e5f6a7b8"]。
+        Returns:
+            成功/失败消息,含实际删除条数。
+        """
+        if not self._cfg("memory_enable", True):
+            return "记忆功能未开启。"
+        # 收集 id:兼容单个字符串 / “,”分隔 / 列表
+        want: list[str] = []
+        if isinstance(ids_list, list):
+            want.extend(str(x).strip() for x in ids_list if x)
+        if ids:
+            for piece in str(ids).replace("，", ",").split(","):
+                piece = piece.strip()
+                if piece:
+                    want.append(piece)
+        want = list(dict.fromkeys(want))  # 去重保序
+        if not want:
+            return "❌ 请提供要删除的记忆 id(如 m_a1b2c3d4),见 <memory_recall> 或 life_sim_recall_memory。"
+        event_key = self._sim_session_key(event)
+        try:
+            removed = await self.memory_store.delete_entries_by_id(event_key, want)
+        except Exception as e:
+            logger.debug(f"life-sim: life_sim_forget_memory 删除失败: {e}")
+            return "删除记忆失败,请稍后重试。"
+        if removed == 0:
+            return f"未删除任何记忆(已不存在或 id 不匹配):{'、'.join(want)}"
+        return f"✅ 已删除 {removed} 条记忆。"
 
     async def life_sim_save_world_lore(
         self, event, content: str, section: str = "general"
@@ -1692,11 +3652,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         """
         永久保存世界观信息
 
-        适用场景:
+        适用场景(**只存世界设定与规则,不存剧情事件/记忆**):
         - 世界规则(魔法体系 / 科技水平 / 宗教等)
         - 政治格局 / 势力分布 / 重要国家或组织
-        - 地理 / 历史背景 / 重要事件
+        - 地理 / 历史背景(稳定的世界观背景)
         - 已确认的重要 NPC 设定
+
+        注意:某个具体剧情事件发生了什么属于向量记忆(自动记录),不要存这里。
 
         Args:
             content(string): 世界观内容(详细描述,一段或多段)
@@ -1716,13 +3678,16 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         """
         永久保存角色设定(支持多角色,按 character 分组累积)
 
-        适用场景:
+        适用场景(**只存角色设定,不存剧情事件/记忆**):
         - 形态变化(变身 / 进化 / 解锁新形态 / 退化)
         - 外貌变化(受伤 / 服装 / 装饰 / 年龄增长)
         - 性格变化(觉醒 / 黑化 / 成长 / 信念改变)
-        - 重要记忆 / 关系变化
+        - 关系 / 定位变化
         - 习得技能 / 称号 / 职业变更
         - 重要 NPC 的设定
+
+        注意:战斗中发生了什么、说了什么话、旅途细节属于向量记忆(每轮自动记录),
+        不要存进这里。
 
         Args:
             content(string): 角色设定内容(详细描述)
@@ -1832,6 +3797,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             成功 / 失败消息。
         """
         scope = self._sim_session_key(event)
+        branch = ""
         if not narrative or not isinstance(narrative, str):
             return "❌ narrative 不能为空"
 
@@ -1847,6 +3813,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             "previous",
         }:
             session = await self._load_sim(event)
+            branch = _narrative_branch(session)
             resolved_id = (session or {}).get("last_narrative_id") or ""
             auto = True
             if not resolved_id:
@@ -1855,7 +3822,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         # 修订前先抓旧状态,暂存到 staging(供 /undo 回滚;快照本身不存全文,
         # 只有修订发生时才记录 pre-revision 状态,避免每轮重复数据)
         pre_state = None
-        existing = await self.narrative_store.get(scope, resolved_id)
+        existing = await self.narrative_store.get(scope, resolved_id, branch=branch)
         if existing is not None:
             pre_state = {
                 "id": resolved_id,
@@ -1864,7 +3831,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 "revised_at": existing.get("revised_at", ""),
             }
 
-        ok = await self.narrative_store.revise(scope, resolved_id, narrative)
+        ok = await self.narrative_store.revise(
+            scope, resolved_id, narrative, branch=branch
+        )
         if ok:
             # 标记本轮已 revise — 避免 _auto_record_narrative 把修订后的
             # 文本再次当成"新一轮"记录,造成内容几乎相同的重复记录
@@ -1881,6 +3850,121 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
     # ════════════════════════════════════════════════════════════════
     # 指令
     # ════════════════════════════════════════════════════════════════
+
+    @filter.command("头像", alias={"set_avatar", "设置头像", "头像设置"})
+    async def cmd_set_avatar(self, event: AstrMessageEvent):
+        """/头像 <角色名> <图片> - 设置角色头像;\n/头像 列表 · /头像 查看 [角色名]"""
+        # 提取参数(去掉命令本身)
+        arg = self._extract_after_cmd(
+            event, ("头像", "set_avatar", "设置头像", "头像设置")
+        )
+        stripped = arg.strip()
+        # 头像按会话 scope 分区(群/私聊彼此隔离)
+        scope = self._sim_session_key(event)
+
+        # 列表操作优先(不需要图片)
+        if stripped in ("列表", "list", "-l"):
+            names = self.avatar_store.list_names(scope)
+            if not names:
+                yield event.plain_result("📭 还没有设置任何头像")
+            else:
+                yield event.plain_result(
+                    "已设置头像:\n"
+                    + "\n".join(f"• {n}" for n in names)
+                    + f"\n💡 共 {len(names)} 个, `/头像 查看 <角色名>` 看具体图片"
+                )
+            return
+
+        # 查看头像(不需要图片): /头像 查看 [角色名]
+        if stripped in ("查看",) or stripped.startswith("查看 ") or stripped == "view":
+            target = stripped[2:].strip() if stripped.startswith("查看 ") else ""
+            if not target:
+                # 不带角色名 → 逐个展示全部
+                names = self.avatar_store.list_names(scope)
+                if not names:
+                    yield event.plain_result("📭 还没有设置任何头像")
+                    return
+                yield event.plain_result(
+                    "🖼️ 已设置头像:" + "\n".join(f"• {n}" for n in names)
+                )
+                for n in names:
+                    path = self.avatar_store.get_avatar(n, scope)
+                    # 必须复制一份,不能把已存储的头像本身登记为临时文件,
+                    # 否则框架会在事件结束后把它删掉(见 _temporary_avatar_copy 注释)。
+                    if path:
+                        shown = self._temporary_avatar_copy(path, event)
+                        if shown:
+                            yield event.image_result(shown)
+                return
+            # 指定角色名 → 只展示该角色
+            path = self.avatar_store.resolve(target, scope)
+            if not path:
+                available = "、".join(self.avatar_store.list_names(scope))
+                yield event.plain_result(
+                    f"❌ 未找到角色「{target}」的头像。"
+                    + (f"\n现有角色: {available}" if available else "")
+                    + "\n💡 `/头像 列表` 查看全部"
+                )
+                return
+            shown = self._temporary_avatar_copy(path, event)
+            if shown:
+                yield event.image_result(shown)
+            yield event.plain_result(f"🖼️ 角色「{target}」的头像")
+            return
+
+        # 提取图片:当前消息无图时回退到引用消息的图片(手机端常无法同发文字+图)
+        imgs = await _extract_image_with_quoted(event)
+        if not imgs:
+            yield event.plain_result(
+                "❌ 请附带一张角色头像图片:\n`/头像 阿龙 <图片>`\n\n也可**引用**(回复)一张图片后跟随该命令。\n查看已设置: `/头像 列表`"
+            )
+            return
+        if not arg:
+            yield event.plain_result("❌ 请指定角色名,例如:\n`/头像 阿龙 <图片>`")
+            return
+
+        # 取第一张图片
+        try:
+            img = imgs[0]
+            path = await img.convert_to_file_path()
+        except Exception as e:
+            yield event.plain_result(f"❌ 图片下载失败:{e}")
+            return
+
+        name = arg.strip()
+        # 重新从文件读字节(convert_to_file_path 已处理网络/本地)
+        try:
+            data = await asyncio.to_thread(_read_all_bytes, path)
+        except Exception as e:
+            yield event.plain_result(f"❌ 读取图片失败:{e}")
+            return
+
+        saved = self.avatar_store.save_avatar(name, data, scope=scope)
+        if saved:
+            yield event.plain_result(f"✅ 已为「{name}」设置头像")
+        else:
+            yield event.plain_result("❌ 保存失败,请检查图片格式 / 角色名")
+
+    @filter.command("删除头像", alias={"del_avatar", "清除头像"})
+    async def cmd_del_avatar(self, event: AstrMessageEvent):
+        """/删除头像 <角色名> - 删除角色头像"""
+        arg = self._extract_after_cmd(event, ("删除头像", "del_avatar", "清除头像"))
+        if not arg:
+            yield event.plain_result("❌ 用法: `/删除头像 阿龙`")
+            return
+        names = [n.strip() for n in arg.replace(" ", ",").split(",") if n.strip()]
+        if not names:
+            yield event.plain_result("❌ 用法: `/删除头像 阿龙`")
+            return
+        scope = self._sim_session_key(event)
+        deleted = []
+        for n in names:
+            if self.avatar_store.delete(n, scope):
+                deleted.append(n)
+        if deleted:
+            yield event.plain_result(f"🗑️ 已删除: {', '.join(deleted)}")
+        else:
+            yield event.plain_result("ℹ️ 没有找到对应的头像")
 
     @filter.command("创建", alias={"create"})
     async def cmd_create(self, event: AstrMessageEvent):
@@ -1961,9 +4045,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         yield event.plain_result(
             f"🎬 命运开始转动 [模式 {mode} - {MODE_NAMES[mode]}],正在编织你的人生..."
             + (
-                f"\n⚠️ 已随旧会话清理 {n_branches} 个剧情分支存档。"
+                f"\n⚠️ 已随旧会话清理 {n_branches} 个剧情分支存档、{self._last_clear_mem_count} 条向量记忆。"
                 if n_branches
-                else ""
+                else (
+                    f"\n⚠️ 已随旧会话清理 {self._last_clear_mem_count} 条向量记忆。"
+                    if self._last_clear_mem_count
+                    else ""
+                )
             )
         )
         result = await self._generate(event, session, first_input, mode, imgs)
@@ -2145,9 +4233,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 else ""
             )
             branch_note = f",{n_branches} 个分支存档" if n_branches else ""
+            mem_note = f",{self._last_clear_mem_count} 条向量记忆" if self._last_clear_mem_count else ""
             yield event.plain_result(
                 "🗑️ 会话已删除"
-                f"{char_note}{sess_note}{branch_note}。\n"
+                f"{char_note}{sess_note}{branch_note}{mem_note}。\n"
                 "使用 /创建 <世界观> 可以开始一段新的人生。"
             )
             return
@@ -2173,31 +4262,56 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         返回展示统计 dict;没有可回滚的 user 消息时返回 None。
         """
         messages = session.get("messages", [])
-        user_indices = [i for i, m in enumerate(messages) if m.get("role") == "user"]
+        # 只统计真实用户轮次:历史压缩产生的摘要消息(_summary)不是一轮 /do,
+        # 混入会把 take 数错(进而算错回滚目标轮)。
+        user_indices = [
+            i
+            for i, m in enumerate(messages)
+            if m.get("role") == "user" and not m.get("_summary")
+        ]
         if not user_indices:
             return None
 
         take = min(n, len(user_indices))
         cut_idx = user_indices[-take]
+        cut_msg = messages[cut_idx]
         removed = messages[cut_idx:]
         messages = messages[:cut_idx]
 
         # 回滚持久化 lore:用 turn 计数,不受压缩影响
         current_turn = session.get("lore_turn", 0)
-        # target_turn = 当前 turn - take + 1 = 第一个被回滚的 turn;
-        # 该 turn 的快照 = "该 turn 尚未执行任何工具调用"的状态,正好是我们要恢复到的状态。
-        # max(1, ...) 防止 target_turn=0 时找不到快照(从 turn=1 开始计数)。
-        target_turn = max(1, current_turn - take + 1)
+        # 目标 turn = 第一个被回滚的 turn 的"开始前"状态。
+        # 优先用被截断首条 user 消息上盖的 turn 戳:新会话每轮 /do 都会盖章,
+        # 消息与轮次一一对应,即使历史里有失败/空输出轮导致 lore_turn 虚高也不受影响;
+        # 老会话(无 turn 戳)用快照指纹推断(见 _legacy_rollback_target_turn),
+        # 仍无法推断才按 lore_turn 倒推(旧行为)。
+        stamped_turn = cut_msg.get("turn") if isinstance(cut_msg, dict) else None
+        if (
+            isinstance(stamped_turn, int)
+            and not isinstance(stamped_turn, bool)
+            and stamped_turn >= 1
+        ):
+            target_turn = stamped_turn
+        else:
+            target_turn = self._legacy_rollback_target_turn(
+                session, take, len(user_indices)
+            )
+            if target_turn is None:
+                target_turn = max(1, current_turn - take + 1)
         snapshots = session.get("lore_snapshots") or []
         target_snapshot = next(
             (s for s in reversed(snapshots) if s["turn"] == target_turn),
             None,
         )
         if target_snapshot:
-            session["world_lore"] = target_snapshot["world_lore"]
-            session["character_lore"] = target_snapshot["character_lore"]
+            (
+                session["world_lore"],
+                session["character_lore"],
+            ) = _resolve_snapshot_lore(session, target_snapshot)
         # 删掉被回滚的快照(turn > target_turn)
         session["lore_snapshots"] = [s for s in snapshots if s["turn"] <= target_turn]
+        # 快照去重表同步收敛,丢弃已无快照引用的版本
+        _compact_lore_versions(session)
         # 同时回滚 lore_turn 计数
         session["lore_turn"] = target_turn
         lore_restored = target_snapshot is not None
@@ -2210,10 +4324,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         )
         rpg_stats = None
         if target_rpg_snap is not None:
-            rpg_stats = self._rpg_restore(target_rpg_snap)
+            rpg_stats = self._rpg_restore(
+                _resolve_rpg_snapshot(session, target_rpg_snap)
+            )
         session["rpg_snapshots"] = [
             s for s in rpg_snapshots if s["turn"] <= target_turn
         ]
+        # 回滚后收敛去重表,丢弃已无快照引用的版本
+        _compact_rpg_versions(session)
 
         # 回滚剧情历史(新增的删掉、被修订的还原)
         narr_snapshots = session.get("narrative_snapshots") or []
@@ -2224,22 +4342,43 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         narr_stats = None
         if target_narr_snap is not None:
             narr_stats = await self._restore_narrative_history(
-                scope, target_narr_snap, narr_snapshots
+                scope,
+                target_narr_snap,
+                narr_snapshots,
+                branch=_narrative_branch(session),
             )
         session["narrative_snapshots"] = [
             s for s in narr_snapshots if s.get("turn", 0) <= target_turn
         ]
         # last_narrative_id 若指向被删除的记录,清空(下次 /do 会重写)
         if narr_stats and narr_stats.get("deleted", 0) > 0:
-            remaining = await self.narrative_store.list(scope)
+            branch = _narrative_branch(session)
+            remaining = await self.narrative_store.list(scope, branch)
             last_id = remaining[-1]["id"] if remaining else None
             if last_id != session.get("last_narrative_id"):
                 session["last_narrative_id"] = last_id
 
         session["messages"] = messages
 
+        # 回滚向量记忆:删除 turn >= target_turn 的记忆(第 target_turn 轮及之后
+        # 产生的剧情记忆,含该轮自动记录)。
+        # 与 lore/RPG/剧情历史同一步骤同步回滚,避免 /undo 后残留被否定的未来记忆。
+        mem_removed = 0
+        if self._cfg("memory_enable", True):
+            try:
+                mem_removed = await self.memory_store.delete_entries_from_turn(
+                    scope, target_turn
+                )
+            except Exception as e:
+                logger.debug(f"life-sim: 回滚向量记忆失败(跳过): {e}")
+
         # 统计(给展示用)
-        char_dict = (target_snapshot or {}).get("character_lore") or {}
+        _resolved_lore = (
+            _resolve_snapshot_lore(session, target_snapshot)
+            if target_snapshot
+            else ({}, {})
+        )
+        char_dict = _resolved_lore[1] or {}
         return {
             "turns": take,
             "removed": removed,
@@ -2255,8 +4394,110 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             },
             "rpg_stats": rpg_stats,
             "narr_stats": narr_stats,
-            "remaining_narr": len(await self.narrative_store.list(scope)),
+            "mem_removed": mem_removed,
+            "remaining_narr": len(
+                await self.narrative_store.list(scope, _narrative_branch(session))
+            ),
         }
+
+    @staticmethod
+    def _legacy_rollback_target_turn(
+        session: dict, take: int, user_turns: int
+    ) -> int | None:
+        """老会话(消息上没有 turn 戳)的回滚目标轮定位:用快照指纹推断。
+
+        背景:旧版在每次 /do 进入 LLM 调用前就递增 lore_turn 并拍快照;
+        若当轮调用失败/返回空文本(不落 user 消息、不产生剧情记录),
+        lore_turn 会虚高 —— /undo N 按 user 消息数回滚,却按 lore_turn 倒推目标轮,
+        导致目标轮偏晚、剧情历史只删了一条。
+
+        原理(不需要消息上的 turn 戳):
+        - 每个 /do(成功或失败)都会在 narrative_snapshots 追加一条(轮号=turn);
+        - 成功的一轮要么新建了剧情记录(narrative ids / lore / rpg 指纹变化,
+          体现在**下一条**快照),要么调用了 revise(本条快照的 `revised` 非空);
+        - 失败的一轮两者都不沾 → 快照指纹与上一条完全相同。
+        因此「真实轮」= 有指纹变化或有 revised 的快照轮;失败轮不会计入。
+        把真实轮按轮号升序与 user 消息一一对应,即可得到每条消息归属的轮号。
+
+        唯一例外:最后一轮若是普通成功轮,它的"新建记录"证据落在不存在的
+        下一条快照上 —— 此时真实轮数比消息数少 1,把最后一条快照的轮号补上即可。
+
+        返回:要回滚到的目标轮(即被撤销的第一条 user 消息的轮号);
+        无法可靠推断时返回 None(调用方回退到 lore_turn 倒推)。
+        """
+        narr_snaps = [
+            s for s in (session.get("narrative_snapshots") or []) if isinstance(s, dict)
+        ]
+        if not narr_snaps or take < 1 or user_turns < 1:
+            return None
+        narr_snaps.sort(key=lambda s: s.get("turn", 0))
+
+        def _j(obj) -> str:
+            return json.dumps(obj or [], sort_keys=True, ensure_ascii=False)
+
+        # 按 turn 建 lore / rpg 指纹查找表(新格式为 version 索引,旧格式内联内容)
+        lore_by_turn: dict = {}
+        for s in session.get("lore_snapshots") or []:
+            if not isinstance(s, dict) or not isinstance(s.get("turn"), int):
+                continue
+            vi = s.get("version")
+            lore_by_turn[s["turn"]] = (
+                ("v", vi)
+                if isinstance(vi, int)
+                else (_j(s.get("world_lore")), _j(s.get("character_lore")))
+            )
+        rpg_by_turn: dict = {}
+        for s in session.get("rpg_snapshots") or []:
+            if not isinstance(s, dict) or not isinstance(s.get("turn"), int):
+                continue
+            vi = s.get("version")
+            rpg_by_turn[s["turn"]] = (
+                ("v", vi)
+                if isinstance(vi, int)
+                else _j({k: s.get(k) for k in ("chars", "sessions") if k in s})
+            )
+
+        def _fp(snap: dict):
+            t = snap.get("turn")
+            return (
+                lore_by_turn.get(t),
+                _j(snap.get("ids")),
+                rpg_by_turn.get(t),
+            )
+
+        real_turns: set[int] = set()
+        for i, snap in enumerate(narr_snaps):
+            t = snap.get("turn")
+            if not isinstance(t, int):
+                continue
+            if snap.get("revised"):
+                real_turns.add(t)
+            if i + 1 < len(narr_snaps) and _fp(narr_snaps[i + 1]) != _fp(snap):
+                # 下一张快照与本章不同 → 本轮新建了记录 / lore / rpg 数据 → 本轮真实
+                real_turns.add(t)
+        real_list = sorted(real_turns)
+        if not real_list:
+            return None
+
+        missing = user_turns - len(real_list)
+        if missing < 0:
+            return None  # 指纹比消息还多(历史被压缩/摘要等异常),放弃推断
+        if missing:
+            last_turn = narr_snaps[-1].get("turn")
+            if not isinstance(last_turn, int):
+                return None
+            # 最后一轮普通成功轮的"新建记录"证据落在不存在的下一条快照上,
+            # 需要按消息数把它补成真实轮(首个缺失名额给最新的轮)。
+            real_list = sorted(set(real_list) | {last_turn})
+            if len(real_list) != user_turns:
+                return None
+
+        if take > len(real_list):
+            return None
+        k = user_turns - take  # 被撤销的第一条消息在真实轮列表中的下标(0-based)
+        if k < 0 or k >= len(real_list):
+            return None
+        return real_list[k]
 
     async def _cmd_undo_body(self, event: AstrMessageEvent):
         arg = self._extract_after_cmd(event, "undo").strip()
@@ -2341,6 +4582,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 lines.append("   📖 剧情历史已回滚(无变化)")
         else:
             lines.append("   ⚠️ 未找到该 turn 的剧情快照(剧情历史未回滚)")
+        if stats.get("mem_removed"):
+            lines.append(f"   🧠 向量记忆已删除 {stats['mem_removed']} 条")
+        # 预览被撤销的最后一个 user 输入(去掉 <system_reminder>、<Quoted Message> 等标签)
         # 预览被撤销的最后一个 user 输入(去掉 <system_reminder>、<Quoted Message> 等标签)
         last_user = next(
             (m for m in reversed(removed) if m.get("role") == "user"), None
@@ -2432,7 +4676,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 return
 
         scope = self._sim_session_key(event)
-        records = await self.narrative_store.list(scope)
+        session = await self._load_sim(event)
+        records = await self.narrative_store.list(scope, _narrative_branch(session))
         if not records:
             yield event.plain_result("📭 当前会话暂无剧情历史(每轮 /do 输出会自动记录)")
             return
@@ -2472,6 +4717,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         )
         use_jsonl = "jsonl" in arg
         scope = self._sim_session_key(event)
+        session = await self._load_sim(event)
 
         # 解析 last N / all
         want_all = "all" in arg.split() or "all" == arg
@@ -2488,7 +4734,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             )
             scope_label = "all"
         else:
-            records = await self.narrative_store.list(scope)
+            records = await self.narrative_store.list(scope, _narrative_branch(session))
             scope_label = scope
 
         if not records:
@@ -2519,7 +4765,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         out_path = os.path.join(self.data_dir, filename)
 
         # 文件写入单独 try,失败时立即报错退出(不要让 file 组件去读半截文件)
-        try:
+        def _write_export() -> None:
+            # 阻塞文件 IO 放到线程池,避免卡住事件循环
             if use_jsonl:
                 preamble = {
                     "_meta": {
@@ -2535,8 +4782,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 }
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(json.dumps(preamble, ensure_ascii=False) + "\n")
-                    for r in records:
-                        f.write(json.dumps(r, ensure_ascii=False) + "\n")
+                    f.writelines(
+                        json.dumps(r, ensure_ascii=False) + "\n" for r in records
+                    )
             else:
                 payload = {
                     "_meta": {
@@ -2570,6 +4818,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 }
                 with open(out_path, "w", encoding="utf-8") as f:
                     json.dump(payload, f, ensure_ascii=False, indent=2)
+
+        try:
+            await asyncio.to_thread(_write_export)
         except (OSError, TypeError, ValueError) as e:
             logger.warning(f"life-sim: 写剧情历史文件失败: {e}")
             try:
@@ -2623,6 +4874,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             return
 
         scope = self._sim_session_key(event)
+        session = await self._load_sim(event)
+        branch = _narrative_branch(session)
 
         if arg.lower() in ("all", "全部"):
             n = await self.narrative_store.delete_scope(scope)
@@ -2634,7 +4887,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         if not target:
             yield event.plain_result("❌ 请提供记录 ID")
             return
-        ok = await self.narrative_store.delete(scope, target)
+        ok = await self.narrative_store.delete(scope, target, branch=branch)
         if ok:
             yield event.plain_result(f"🗑️ 已删除剧情记录 `{target}`")
         else:
@@ -2664,7 +4917,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         刻意**不包含**分支列表 / current_branch — 它们属于会话运行时状态,
         分支快照只保存"从这一刻往后继续推进所需的全部状态"。
         """
-        scope = self._sim_session_key(event)
         mode = session.get("mode", "A")
         return {
             "world_setting": session.get("world_setting"),
@@ -2680,19 +4932,27 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             "last_narrative_id": session.get("last_narrative_id"),
             "lore_turn": session.get("lore_turn", 0),
             "lore_snapshots": copy.deepcopy(session.get("lore_snapshots") or []),
+            "_lore_versions": copy.deepcopy(session.get("_lore_versions") or []),
             "rpg_snapshots": copy.deepcopy(session.get("rpg_snapshots") or []),
+            "_rpg_versions": copy.deepcopy(session.get("_rpg_versions") or []),
             "narrative_snapshots": copy.deepcopy(
                 session.get("narrative_snapshots") or []
             ),
-            # RPG 存档/会话的磁盘快照 + 剧情历史全量 — 还原时整体回滚
+            # RPG 存档/会话的磁盘快照 — 还原时整体回滚
+            # 剧情历史不再内嵌:切换分支时用 `narrative_store.switch_to_branch`
+            # 直接复用同目录的分支历史文件(branch_<名>.json)
             "rpg_state": self._rpg_snapshot(event, mode),
-            "narrative_records": await self.narrative_store.list(scope),
         }
 
-    async def _branch_restore(self, branch: dict, event) -> dict:
+    async def _branch_restore(self, branch: dict, event, branch_name: str = "") -> dict:
         """把会话还原到分支保存时的状态,返回新 session dict。
 
-        current_branch 等运行时标记由调用方在还原后设置,不在这里处理。
+        剧情历史**不在这里复制** — 新设计里主线 = history.json、分支 =
+        branch_<名>.json 都是独立文件,切换只是把 `current_branch` 设为
+        branch_name,后续读写自动落到对应文件。分支历史文件缺失时,调用方
+        先用分支内嵌记录(旧格式 narrative_records)补齐,再走这里。
+
+        current_branch 由调用方在还原后设置,不在本函数内处理。
         """
         scope = self._sim_session_key(event)
         new_session = {
@@ -2707,7 +4967,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             "last_narrative_id": branch.get("last_narrative_id"),
             "lore_turn": branch.get("lore_turn", 0),
             "lore_snapshots": copy.deepcopy(branch.get("lore_snapshots") or []),
+            "_lore_versions": copy.deepcopy(branch.get("_lore_versions") or []),
             "rpg_snapshots": copy.deepcopy(branch.get("rpg_snapshots") or []),
+            "_rpg_versions": copy.deepcopy(branch.get("_rpg_versions") or []),
             "narrative_snapshots": copy.deepcopy(
                 branch.get("narrative_snapshots") or []
             ),
@@ -2716,9 +4978,15 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         rpg_state = branch.get("rpg_state")
         if rpg_state:
             self._rpg_restore(rpg_state)
-        # 剧情历史整体覆盖为分支点状态
-        records = branch.get("narrative_records") or []
-        await self.narrative_store.overwrite_all(scope, records)
+        # 剧情历史:优先直接复制同目录的分支历史文件(快,且 versions 自洽);
+        # 旧分支文件里内嵌的 narrative_records 则回退整体重建。
+        switched = False
+        if branch_name:
+            switched = await self.narrative_store.switch_to_branch(scope, branch_name)
+        if not switched:
+            records = branch.get("narrative_records") or []
+            if records:
+                await self.narrative_store.overwrite_all(scope, records)
         return new_session
 
     @filter.command("分支", alias={"branch"})
@@ -2791,7 +5059,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         if sub in ("当前", "now", "current", "info", "详情"):
             name = session.get("current_branch")
             turn_now = session.get("lore_turn", 0)
-            n_records = len(await self.narrative_store.list(scope))
+            n_records = len(
+                await self.narrative_store.list(scope, _narrative_branch(session))
+            )
             position = ""
             for m in reversed(session.get("messages") or []):
                 if m.get("role") == "assistant":
@@ -2845,6 +5115,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             capture["label"] = desc
             overwritten = name in branches
             await self.branch_store.save(scope, name, capture)
+            # 剧情历史同目录归档一份(切换时直接复制该文件,不重建)
+            await self.narrative_store.save_branch_history(scope, name)
             turn = capture.get("lore_turn", 0)
             overwrite_note = "(已覆盖同名分支)" if overwritten else ""
             yield event.plain_result(
@@ -2868,29 +5140,22 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                     f"❌ 分支「{name}」不存在。用 /分支 列表 查看已有分支。"
                 )
                 return
-            # 切换前:把当前进度自动保留到「主线」。
-            # - 「主线」槽位为空 → 首次切换,自动保存当前进度;
-            # - 当前正处「主线」延续线上且进度已超过存档点 → 刷新「主线」,
-            #   避免 主线→切换→再切回 时丢掉主线线上推进的进度。
-            #   若用户 /undo 回退到存档点之前,则不刷新(保留已存档的进度)。
-            auto_saved = False
-            refresh_main = "主线" not in branches
-            if not refresh_main:
-                main_b = branches.get("主线") or {}
-                refresh_main = session.get("current_branch") == "主线" and session.get(
-                    "lore_turn", 0
-                ) > main_b.get("lore_turn", 0)
-            if refresh_main:
-                auto = await self._branch_capture(session, event)
-                auto["label"] = "切换分支前的当前进度(自动保留)"
-                await self.branch_store.save(scope, "主线", auto)
-                auto_saved = True
-
+            # 新设计:主线 = history.json 恒在;分支 = branch_<名>.json 独立文件。
+            # 切换分支只改会话 current_branch 字段,历史读写自动落到对应文件,零复制。
+            # 兼容老分支(历史内嵌在分支快照 narrative_records):若分支历史文件不存在,
+            # 先用内嵌记录补齐一份。
             target = await self.branch_store.get(scope, name)
             if not target:
                 yield event.plain_result(f"❌ 分支「{name}」数据读取失败,请重试。")
                 return
-            new_session = await self._branch_restore(target, event)
+            if not await self.narrative_store.branch_exists(scope, name):
+                legacy_records = target.get("narrative_records") or []
+                if legacy_records:
+                    await self.narrative_store.overwrite_all(
+                        scope, legacy_records, branch=name
+                    )
+
+            new_session = await self._branch_restore(target, event, branch_name=name)
             new_session["current_branch"] = name  # 标记当前所在分支
             await self._save_sim(event, new_session)
 
@@ -2908,8 +5173,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             lines = [f"🌿 已切换到分支「{name}」(第 {target.get('lore_turn', 0)} 轮)"]
             if position:
                 lines.append(f"   📍 当前进度:{position}")
-            if auto_saved:
-                lines.append("   💾 切换前的主线已自动保存为「主线」,可随时切回。")
             lines.append("   直接 /do 继续推进即可。")
             yield event.plain_result("\n".join(lines))
             return
@@ -2929,6 +5192,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 yield event.plain_result(f"❌ 分支「{name}」不存在。")
                 return
             await self.branch_store.delete(scope, name)
+            # 同目录的分支历史文件一并清理
+            await self.narrative_store.delete_branch_history(scope, name)
             # 删除的正是当前分支时,回到「主线」标记(仅此时才需要落盘会话)
             if session.get("current_branch") == name:
                 session["current_branch"] = None
@@ -2947,7 +5212,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
     @filter.command("lore", alias={"设定", "角色设定", "人物设定"})
     async def cmd_lore(self, event: AstrMessageEvent):
-        """/lore [角色名|世界观] - 查看角色/世界观持久化设定"""
+        """/lore [角色名|世界观] - 查看角色/世界观持久化设定
+
+        /lore 删除 <角色名> - 删除指定角色的当前持久化设定(不动快照,/undo 可恢复)
+        """
         session = await self._load_sim(event)
         if not session:
             yield event.plain_result(
@@ -2960,6 +5228,33 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         ).strip()
         char_lore = self._normalize_character_lore(session.get("character_lore"))
         world_lore = session.get("world_lore") or []
+
+        # ── 删除角色 ──
+        tokens = arg.split(None, 1)
+        if tokens and tokens[0] in ("删除", "del", "delete", "remove"):
+            target = (tokens[1] if len(tokens) > 1 else "").strip()
+            if not target:
+                yield event.plain_result("❌ 用法:`/lore 删除 <角色名>`")
+                return
+            matched_keys = _match_lore_characters(char_lore, target)
+            if not matched_keys:
+                available = "、".join(n for n in char_lore if char_lore[n])
+                yield event.plain_result(
+                    f"❌ 未找到角色「{target}」。"
+                    + (f"现有角色:{available}" if available else "暂无角色设定")
+                    + "\n💡 /lore 查看总览 · /lore 删除 <角色名>"
+                )
+                return
+            removed = {mn: len(char_lore.pop(mn) or []) for mn in matched_keys}
+            session["character_lore"] = char_lore
+            await self._save_sim(event, session)
+            total = sum(removed.values())
+            lines = [f"🗑️ 已删除 {len(matched_keys)} 个角色 key、共 {total} 条设定:"]
+            for mn in matched_keys:
+                lines.append(f"  👤 {mn}: {removed.get(mn, 0)} 条")
+            lines.append("   💡 lore 快照未动,误删可用 /undo 回滚恢复。")
+            yield event.plain_result("\n".join(lines))
+            return
 
         # ── 总览 ──
         if not arg:
@@ -2977,6 +5272,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             lines += [
                 "",
                 "💡 /lore <角色名> 查看该角色全部设定 · /lore 世界观 查看世界设定",
+                "💡 /lore 删除 <角色名> 删除该角色全部设定",
             ]
             yield event.plain_result("\n".join(lines))
             return
@@ -2987,7 +5283,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 yield event.plain_result("🌍 暂无世界观设定。")
                 return
             lines = ["🌍 持久化世界观(时间轴):"]
-            lines.extend(self._render_lore_timeline(world_lore, indent="  "))
+            lines.extend(
+                self._render_lore_timeline(
+                    world_lore,
+                    indent="  ",
+                    max_content_chars=300,
+                    max_total_chars=3500,
+                )
+            )
             yield event.plain_result("\n".join(lines))
             return
 
@@ -3015,7 +5318,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             lines = [f"👤 {mn} 设定(时间轴):"]
             lines.extend(
                 self._render_lore_timeline(
-                    entries, indent="  ", hard_sections={"appearance", "forms"}
+                    entries,
+                    indent="  ",
+                    hard_sections={"appearance", "forms"},
+                    max_content_chars=300,
+                    max_total_chars=3500,
                 )
             )
             yield event.plain_result("\n".join(lines))
