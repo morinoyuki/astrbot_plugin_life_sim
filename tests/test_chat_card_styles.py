@@ -12,7 +12,7 @@ if ROOT not in sys.path:
 
 from im_render import markdown as md
 from im_render.engine import ChatRenderer
-from im_render.rows import ChoiceRow, TagRow
+from im_render.rows import ChoiceRow, TagRow, _measure_fallback
 
 
 def test_ordered_list_parsed():
@@ -85,6 +85,50 @@ def test_tag_emoji_width_not_overflow():
             assert w >= emoji_measured, f"标签 {t!r} 文字将溢出胶囊"
 
 
+def test_choice_truncation_not_overflow():
+    """行动选项卡文字过长截断时,label 右端(含省略号)必须落在卡片右边界内。
+
+    旧 bug:截断测量不含省略号,且 avail 基准比实际绘制起点差约 4px,
+    叠加省略号会把「…」挤出卡片右边界。
+    """
+    from PIL import Image, ImageDraw
+
+    r = ChatRenderer(width=800, font_size=30, theme="light")
+    fs = 30
+    # 超长选项,含 hint
+    long_label = (
+        "一个非常非常非常长的行动选项,内容多到必须截断并加省略号,"
+        "用来验证省略号不会越出卡片右边界而且文字不能溢出到界外"
+    )
+    row = ChoiceRow(r, 1, long_label, "后果很大")
+    assert row.label.endswith("…"), f"超长 label 应被截断加省略号: {row.label!r}"
+
+    draw = ImageDraw.Draw(Image.new("RGB", (4, 4)))
+    # 与 _paint_on 一致的可容纳右端:
+    #   有 hint: label_right = width - h_pad - pad_h - hint宽 - 14
+    hw = int(_measure_fallback(draw, row.hint, int(fs * 0.72)))
+    label_right = r.width - r.h_pad - row.pad_h - hw - 14
+    tx = r.h_pad + row.pad_h + 4 + row.badge_d + 14
+    label_end = tx + _measure_fallback(draw, row.label, fs)
+    assert (
+        label_end <= label_right
+    ), f"截断后 label 越界: 右端 {label_end:.1f} > 可容纳 {label_right}"
+
+    # 无 hint 情况
+    row2 = ChoiceRow(r, 2, long_label + "再来一点更长的文字", "")
+    assert row2.label.endswith("…")
+    label_right2 = r.width - r.h_pad - row2.pad_h
+    tx2 = r.h_pad + row2.pad_h + 4 + row2.badge_d + 14
+    label_end2 = tx2 + _measure_fallback(draw, row2.label, fs)
+    assert (
+        label_end2 <= label_right2
+    ), f"无 hint 仍越界: 右端 {label_end2:.1f} > {label_right2}"
+
+    # 短 label 不误加省略号
+    row3 = ChoiceRow(r, 3, "短选项", "低风险")
+    assert row3.label == "短选项"
+
+
 if __name__ == "__main__":
     test_ordered_list_parsed()
     print("✓ 有序列表解析为 ordered list")
@@ -96,4 +140,6 @@ if __name__ == "__main__":
     print("✓ ChoiceRow/TagRow 构造与 hint 拆分")
     test_tag_emoji_width_not_overflow()
     print("✓ <t> 胶囊含 emoji 宽度不溢出")
+    test_choice_truncation_not_overflow()
+    print("✓ 行动选项卡超长截断不越界(省略号在界内)")
     print("\nPASS")

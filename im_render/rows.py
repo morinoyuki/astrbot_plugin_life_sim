@@ -657,16 +657,27 @@ class ChoiceRow(Row):
         self.badge_d = int(fs * 1.05)
         self.pad_v = max(8, int(fs * 0.28))
         self.pad_h = int(fs * 0.55)
-        avail = r.width - r.h_pad * 2 - self.badge_d - 14 - self.pad_h * 2
         draw = ImageDraw.Draw(Image.new("RGB", (4, 4)))
+        ell = "…"
+        # label 实际绘制起点 tx = x0 + pad_h + 4 + badge_d + 14 (见 _paint_on),
+        # 用与绘制完全一致的偏移算可用宽度,避免截断测量与落笔位置错位。
+        tx_offset = self.pad_h + 4 + self.badge_d + 14
+        x0 = r.h_pad
         if self.hint:
-            # 用 emoji 感知测量,与 _paint_on 里 _draw_fallback 一致(含 emoji 的 hint 不溢出)
-            avail -= int(_measure_fallback(draw, self.hint, int(fs * 0.72))) + 14
+            # hint 从右侧绘制(hx = x1 - pad_h - hint_w),label 须停在 hint 左缘 14px 前
+            hw = int(_measure_fallback(draw, self.hint, int(fs * 0.72)))
+            label_right = r.width - r.h_pad - self.pad_h - hw - 14
+        else:
+            label_right = r.width - r.h_pad - self.pad_h
+        avail = label_right - (x0 + tx_offset)
+        # 截断测量把省略号宽度一并计入,保证 label + "…" 不会越出右边界
         label = self.label
-        while _measure_fallback(draw, label, self.fs) > avail and len(label) > 2:
+        while len(label) > 2 and _measure_fallback(
+            draw, label + ell, self.fs
+        ) > avail:
             label = label[:-1]
         if label != self.label:
-            self.label = label + "…"
+            self.label = label + ell
         self.height = max(self.badge_d, font_metrics(self.f)) + self.pad_v * 2
 
     def _paint_on(self, canvas: Image.Image, y: int) -> None:
