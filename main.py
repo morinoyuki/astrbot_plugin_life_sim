@@ -4910,10 +4910,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         return name[:30], desc.strip()
 
     async def _branch_capture(self, session: dict, event) -> dict:
-        """把当前会话状态完整快照为一个分支(含消息 / lore / RPG / 剧情历史)。
+        """把当前会话状态完整快照为一个分支(含消息 / lore / RPG)。
 
         快照由调用方写入 BranchStore(独立于会话存储),切换分支时用
         `_branch_restore` 整体还原。
+        剧情历史**不再内嵌** — 新设计里主线/分支各用独立文件(branch_<名>.json),
+        保存分支时由 save_branch_history 单独归档,切换时直接改 current_branch 字段,
+        零复制。
         刻意**不包含**分支列表 / current_branch — 它们属于会话运行时状态,
         分支快照只保存"从这一刻往后继续推进所需的全部状态"。
         """
@@ -4939,18 +4942,16 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 session.get("narrative_snapshots") or []
             ),
             # RPG 存档/会话的磁盘快照 — 还原时整体回滚
-            # 剧情历史不再内嵌:切换分支时用 `narrative_store.switch_to_branch`
-            # 直接复用同目录的分支历史文件(branch_<名>.json)
+            # 剧情历史不再内嵌:主线/分支各用独立文件,切换只改 current_branch
             "rpg_state": self._rpg_snapshot(event, mode),
         }
 
     async def _branch_restore(self, branch: dict, event, branch_name: str = "") -> dict:
         """把会话还原到分支保存时的状态,返回新 session dict。
 
-        剧情历史**不在这里复制** — 新设计里主线 = history.json、分支 =
-        branch_<名>.json 都是独立文件,切换只是把 `current_branch` 设为
-        branch_name,后续读写自动落到对应文件。分支历史文件缺失时,调用方
-        先用分支内嵌记录(旧格式 narrative_records)补齐,再走这里。
+        新设计里主线 = history.json、分支 = branch_<名>.json 都是独立文件,
+        切换只改会话 current_branch 字段,后续读写自动落到对应文件,零复制。
+        分支历史文件由调用方在切换前确保存在,这里不做任何文件操作。
 
         current_branch 由调用方在还原后设置,不在本函数内处理。
         """
@@ -4978,15 +4979,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         rpg_state = branch.get("rpg_state")
         if rpg_state:
             self._rpg_restore(rpg_state)
-        # 剧情历史:优先直接复制同目录的分支历史文件(快,且 versions 自洽);
-        # 旧分支文件里内嵌的 narrative_records 则回退整体重建。
-        switched = False
-        if branch_name:
-            switched = await self.narrative_store.switch_to_branch(scope, branch_name)
-        if not switched:
-            records = branch.get("narrative_records") or []
-            if records:
-                await self.narrative_store.overwrite_all(scope, records)
+        # 剧情历史:新设计里主线 = history.json、分支 = branch_<名>.json 都是独立文件,
+        # 切换只改会话 current_branch 字段,后续读写自动落到对应文件,零复制。
+        # 分支历史文件由调用方在切换前确保存在(从旧 narrative_records 补齐或已存档),
+        # 这里不再做任何复制/覆盖操作。
         return new_session
 
     @filter.command("分支", alias={"branch"})
