@@ -2996,6 +2996,19 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         # 去重 + 迁移旧格式(把内联整份 lore 收敛到 `_lore_versions` 索引表)
         _compact_lore_versions(session)
 
+    @staticmethod
+    def _narrative_cumulative_ids(snapshots: list[dict]) -> set[str]:
+        """给定一系列 narrative 快照,返回累计已知的剧情记录 id 集合。
+
+        新格式里只有最早的基线快照存全量 `ids`,其余存本轮增量 `added`;
+        累计 = 两者并集。兼容旧格式(每张都存全量 ids)。
+        """
+        out: set[str] = set()
+        for s in snapshots or []:
+            out.update(s.get("ids") or [])
+            out.update(s.get("added") or [])
+        return out
+
     async def _snapshot_narrative_history(
         self, session: dict, turn: int, scope: str
     ) -> None:
@@ -3003,28 +3016,42 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
         每次 turn 开始时调用(LLM 调用前)抓取当前 scope 的所有记录。
 
-        **只存记录 ID 列表,不再复制 narrative 全文** — 旧的实现每轮把全部记录
-        的完整剧情文本再存一份(25 个快照 × 每轮增长的记录数 = O(n²) 重复数据,
-        一次 /do 就能膨胀几十 KB)。
-        - `ids`:全部记录 ID(轻量,用于回滚时判断哪些是快照点后新增、要删除)
+        **增量存储,消除跨快照的冗余 id 列表** — 剧情记录在单条线内是追加式增长的,
+        相邻快照的累计 id 集合几乎完全重叠。若每张都存全量列表,25 张快照 ×
+        每轮增长的记录数 = O(n²) 重复数据。改为:
+        - 最早一张基线快照存全量 `ids`;
+        - 后续快照只存本轮新增的 `added`(相对前序累计集合的增量);
+        - 剪枝丢弃最旧快照时,把次旧快照升级为全量基线(roll-up),
+          保证任意目标轮都能由「基线 + 后续增量」重建完整累计集合。
         - `revised`:修订前的记录状态,由 `life_sim_revise_narrative` 在修订时
           暂存到本轮快照(只有修订发生的轮次才非空)
 
         限制:最多保留 25 个快照,与 lore / rpg 一致。
         """
-        # 只存记录 ID 列表(轻量);快照标记所属 branch,回滚时按当前线隔离
         records = await self.narrative_store.list(scope, _narrative_branch(session))
         snapshots = session.setdefault("narrative_snapshots", [])
-        snapshots.append(
-            {
+        cur_ids = [r["id"] for r in records]
+        if snapshots:
+            seen = self._narrative_cumulative_ids(snapshots)
+            snap = {
                 "turn": turn,
                 "scope": scope,
-                "ids": [r["id"] for r in records],
+                "added": [i for i in cur_ids if i not in seen],
                 "revised": [],
             }
-        )
-        if len(snapshots) > 25:
-            del snapshots[: len(snapshots) - 25]
+        else:
+            snap = {"turn": turn, "scope": scope, "ids": cur_ids, "revised": []}
+        snapshots.append(snap)
+        # 剪枝:最多 25 张。丢弃最旧基线时,把次旧快照升级为全量基线(roll-up),
+        # 使新最旧快照始终携带完整累计集合,便于任意轮重建。
+        while len(snapshots) > 25:
+            if len(snapshots) >= 2:
+                nxt = dict(snapshots[1])
+                nxt["ids"] = sorted(self._narrative_cumulative_ids(snapshots[:2]))
+                nxt.pop("added", None)
+                nxt["revised"] = list(nxt.get("revised") or [])
+                snapshots[1] = nxt
+            del snapshots[0]
 
     async def _restore_narrative_history(
         self,
@@ -3047,10 +3074,18 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             target_ids = {r["id"] for r in old_records}
             target_map = {r["id"]: r for r in old_records}
         else:
-            target_ids = set(snap.get("ids") or [])
-            target_map: dict = {}
+            source = all_snaps if all_snaps else [snap]
             target_turn = snap.get("turn", 0)
-            for s in reversed(all_snaps or []):
+            # 目标轮的累计记录集合 = 基线快照 ids + 直到 target_turn 的每轮增量 added,
+            # 由「基线 + 增量」重建,兼容旧格式(每张全量 ids)。
+            target_ids: set = set()
+            for s in source:
+                if s.get("turn", 0) > target_turn:
+                    break
+                target_ids.update(s.get("ids") or [])
+                target_ids.update(s.get("added") or [])
+            target_map: dict = {}
+            for s in reversed(source):
                 if s.get("turn", 0) < target_turn:
                     break
                 for state in s.get("revised") or []:
@@ -4457,11 +4492,22 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 else _j({k: s.get(k) for k in ("chars", "sessions") if k in s})
             )
 
+        # 累计剧情 id 集合(基线 ids + 各轮增量 added),供指纹比较 ——
+        # 与旧格式(每张全量 ids)语义一致:能正确识别"本轮是否新建了记录"。
+        cum_ids: dict[int, list] = {}
+        running: set = set()
+        for s in narr_snaps:
+            t = s.get("turn")
+            running |= set(s.get("ids") or [])
+            running |= set(s.get("added") or [])
+            if isinstance(t, int):
+                cum_ids[t] = sorted(running)
+
         def _fp(snap: dict):
             t = snap.get("turn")
             return (
                 lore_by_turn.get(t),
-                _j(snap.get("ids")),
+                _j(cum_ids.get(t)),
                 rpg_by_turn.get(t),
             )
 
@@ -4985,6 +5031,42 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         # 这里不再做任何复制/覆盖操作。
         return new_session
 
+    async def _reconcile_branch_history(
+        self, scope: str, branch_snap: dict, branch_name: str
+    ) -> None:
+        """切换分支前,校准目标分支历史文件与分支快照的已存剧情状态一致。
+
+        背景:新设计里每个分支的历史独立成文件(branch_<名>.json),分支快照保存时
+        把当时的剧情快照(narrative_snapshots)一并存下。若该分支上次离开后未被重新
+        保存(离开时未自动归档),文件里会残留上次推进的记录,而快照里没有 ——
+        切回后 /undo 会用快照的 ids 判定哪些记录该删,把快照点之后这些残留记录
+        连同真正要撤的一起删掉,误删多条。
+
+        这里按"分支快照已知的剧情记录集合"(= 所有 narrative_snapshot 的 ids 之并
+        ∪ last_narrative_id),把历史文件里该集合之外的残留记录清掉,使文件与快照
+        一致,undo 才能精确回滚。分支快照无任何剧情快照(老格式)时不做处理
+        (交给调用方 legacy 路径)。
+        """
+        # 分支快照已知的剧情记录 = 所有 narrative_snapshot 的 ids 之并 ∪ last_narrative_id。
+        # 注意:每个快照是"本轮开始前"拍的,不含本轮自己新增的记录,所以最后一轮的
+        # 记录不会出现在任何快照里 —— 只能靠 last_narrative_id 补上。
+        snaps = [
+            s
+            for s in (branch_snap.get("narrative_snapshots") or [])
+            if isinstance(s, dict)
+        ]
+        # 已知记录 = 所有快照的累计 ids(基线 ids + 各轮增量 added)之并
+        expected = self._narrative_cumulative_ids(snaps)
+        lid = branch_snap.get("last_narrative_id")
+        if lid:
+            expected.add(lid)
+        if not expected:
+            return
+        current = await self.narrative_store.list(scope, branch_name)
+        for r in current:
+            if r["id"] not in expected:
+                await self.narrative_store.delete(scope, r["id"], branch=branch_name)
+
     @filter.command("分支", alias={"branch"})
     async def cmd_branch(self, event: AstrMessageEvent):
         """/分支 [保存|切换|列表|删除] - 剧情分支管理(TE/BE/HE 多结局存档)"""
@@ -5140,6 +5222,27 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             # 切换分支只改会话 current_branch 字段,历史读写自动落到对应文件,零复制。
             # 兼容老分支(历史内嵌在分支快照 narrative_records):若分支历史文件不存在,
             # 先用内嵌记录补齐一份。
+            # 切换前:把当前线(主线/分支)的进度自动保留,之后才能切回续玩。
+            # - 离开主线 → 自动保存/刷新「主线」(主线的剧情历史就是 history.json,
+            #   current_branch='主线' 归一为空,无需另存分支文件);
+            # - 离开某分支 → 刷新该分支自身快照,保留推进进度。
+            # 仅当该线比已存档点更靠前时才刷新(用户 /undo 回退到存档点之前则不覆盖,
+            # 保留更靠前的存档点)。刷新能保证该线快照与它的历史文件一致,避免切回后
+            # /undo 把快照点之后的记录误删。
+            auto_saved = ""  # 离开时被自动保存的线名(用于反馈提示)
+            cur_line = _narrative_branch(session)  # "" = 主线
+            target_line = "" if name == "主线" else name  # 「主线」归一到主线
+            if target_line != cur_line:
+                # 离开主线 → 自动保存/刷新「主线」;离开某分支 → 刷新该分支自身快照
+                save_line = "主线" if cur_line == "" else cur_line
+                saved_b = branches.get(save_line) or {}
+                if save_line not in branches or session.get("lore_turn", 0) > saved_b.get(
+                    "lore_turn", 0
+                ):
+                    auto = await self._branch_capture(session, event)
+                    auto["label"] = "切换分支前的当前进度(自动保留)"
+                    await self.branch_store.save(scope, save_line, auto)
+                    auto_saved = save_line
             target = await self.branch_store.get(scope, name)
             if not target:
                 yield event.plain_result(f"❌ 分支「{name}」数据读取失败,请重试。")
@@ -5150,6 +5253,15 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                     await self.narrative_store.overwrite_all(
                         scope, legacy_records, branch=name
                     )
+
+            # 校准目标分支历史文件与分支快照的已存剧情状态一致:分支快照(保存时)携带
+            # narrative_snapshots,由「基线 ids + 各轮增量 added」重建出该分支已存剧情的
+            # 完整记录集合。若历史文件里存在该集合之外的残留记录(上次访问推进后未重新
+            # 保存,快照没记录到),按快照清掉 —— 否则切回后 /undo 会把这些残留当作快照点
+            # 之后的"未来"记录一并删掉,误删多条。切到当前所在线 / 切到主线(主线的
+            # history.json 是活文件,快照随离开自动刷新,不会残留)时不做,只校准真正的分支文件。
+            if name != "主线" and target_line != cur_line:
+                await self._reconcile_branch_history(scope, target, name)
 
             new_session = await self._branch_restore(target, event, branch_name=name)
             new_session["current_branch"] = name  # 标记当前所在分支
@@ -5169,6 +5281,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             lines = [f"🌿 已切换到分支「{name}」(第 {target.get('lore_turn', 0)} 轮)"]
             if position:
                 lines.append(f"   📍 当前进度:{position}")
+            if auto_saved:
+                lines.append(f"   💾 切换前的进度已自动保存为「{auto_saved}」,可随时切回。")
             lines.append("   直接 /do 继续推进即可。")
             yield event.plain_result("\n".join(lines))
             return
