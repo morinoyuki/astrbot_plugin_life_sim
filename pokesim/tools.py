@@ -26,7 +26,6 @@ from .items import (
     BAG_ITEMS,
     KIND_ORDER,
     KIND_ZH,
-    bag_item_label,
     item_label,
     resolve_bag_item,
     resolve_item,
@@ -52,6 +51,8 @@ EGG_ZH = {
     "dragon": "龙",
     "undiscovered": "未发现",
 }
+
+GENDER_ZH = {"M": "♂", "F": "♀"}
 
 _STAT_ALIAS = {
     "攻击": "atk",
@@ -188,6 +189,8 @@ class PokemonMixin:
             f" | 特性 {mon.ability_name}"
             + (f" | 道具 {item_label(mon.item)}" if mon.item else "")
             + f" | 太晶 {dex.type_label(mon.tera_type)}"
+            + (f" | {GENDER_ZH.get(mon.gender, '')}" if mon.gender else "")
+            + f" | 亲密度 {mon.friendship}"
         )
         if mon.level < 100:
             growth = dex.growth_of(mon.species)
@@ -503,6 +506,7 @@ class PokemonMixin:
         item: str = "",
         moves: str = "",
         tera_type: str = "",
+        gender: str = "",
     ) -> str:
         """把一只宝可梦加入队伍(最多 6 只)。生成时会按图鉴自动补全能力值与招式。
 
@@ -515,6 +519,7 @@ class PokemonMixin:
             item(string): Optional. 持有道具(仅收录对战常用道具)。
             moves(string): Optional. 招式列表,逗号分隔(最多 4 个);留空自动生成合理招式。
             tera_type(string): Optional. 太晶属性,留空用本系第一属性。
+            gender(string): Optional. 性别 M/F(部分进化需要,如焰后蜥)。留空按图鉴比例随机。
         """
         dex = get_dex()
         data = self._poke_load(event)
@@ -531,6 +536,7 @@ class PokemonMixin:
                 item=item,
                 moves=self._parse_moves(moves) or None,
                 tera_type=tera_type,
+                gender=gender,
             )
         except ValueError as e:
             return f"❌ {e}"
@@ -691,12 +697,27 @@ class PokemonMixin:
         self._poke_save(event, data)
         return f"✅ {mon.display} 已更新: " + ", ".join(changes)
 
-    async def poke_evolve(self, event, target: str, into: str = "") -> str:
-        """让宝可梦进化(达到等级条件或指定进化形态)。
+    async def poke_evolve(
+        self,
+        event,
+        target: str,
+        into: str = "",
+        method: str = "",
+        item: str = "",
+        trade: bool = False,
+        force: bool = False,
+        daytime: str = "",
+    ) -> str:
+        """让宝可梦进化,支持等级/亲密度/招式/携带物/使用道具/交换等全部方式。
 
         Args:
             target(string): 队伍序号(1 起)或名称。
-            into(string): Optional. 指定进化形态(中/英/标识);留空则按等级自动判断。
+            into(string): Optional. 指定进化形态(中/英/标识);多分支(如伊布)时必须指定。
+            method(string): Optional. 强制进化方式: level/friendship/move/hold/item/trade/extra。
+            item(string): Optional. 用于使用道具/携带进化的道具名。
+            trade(bool): Optional. 是否通过交换进化(trade 型)。默认 false。
+            force(bool): Optional. 忽略未满足的条件强行进化(仅用于叙事需要)。
+            daytime(string): Optional. day/night,用于昼夜限定进化。
         """
         dex = get_dex()
         data = self._poke_load(event)
@@ -705,25 +726,123 @@ class PokemonMixin:
             return f"❌ 队伍里找不到「{target}」。"
         idx, p = found
         mon = Pokemon.from_dict(p)
-        new_key = ""
+        use_item = item
+        if item:
+            r = resolve_item(item) or resolve_bag_item(item)
+            if r:
+                use_item = r[0]
+        held = use_item or mon.item
+        opts = dex.evolution_options(
+            mon.species,
+            level=mon.level,
+            moves=mon.moves,
+            item=held,
+            friendship=mon.friendship,
+            gender=mon.gender,
+            trade=trade,
+            daytime=daytime or None,
+            stats=mon.stats,
+        )
+        if not opts:
+            return f"⚠️ {mon.display} 没有已知的进化形态。"
+        kind_alias = {
+            "level": "level",
+            "friendship": "levelFriendship",
+            "move": "levelMove",
+            "hold": "levelHold",
+            "item": "useItem",
+            "trade": "trade",
+            "extra": "levelExtra",
+        }
+        want_kind = kind_alias.get(method.strip().lower(), "")
+        chosen = None
         if into:
             r = dex.resolve_species(into)
-            if r:
-                new_key = r[0]
+            if r is None:
+                return f"❌ 未找到宝可梦「{into}」。"
+            for o in opts:
+                if o["target"] == r[0] or o["target"] == into:
+                    chosen = o
+                    break
+            if chosen is None:
+                lines = [
+                    f"- {dex.species.get(o['target'], {}).get('zh', o['target'])}"
+                    f"({o['kind']}{' / ' + o['reason'] if o['reason'] else ''})"
+                    for o in opts
+                ]
+                return (
+                    f"❌ {mon.display} 不能进化成「{into}」。可选:\n" + "\n".join(lines)
+                )
         else:
-            new_key = dex.evolution(mon.species, mon.level) or ""
-        if not new_key:
-            return f"⚠️ {mon.display} 目前没有可用的等级进化。可用 into 指定进化形态。"
+            cands = [o for o in opts if o["met"] and (not want_kind or o["kind"] == want_kind)]
+            if force and not cands:
+                cands = [o for o in opts if not want_kind or o["kind"] == want_kind]
+            if len(cands) == 1:
+                chosen = cands[0]
+            elif len(cands) > 1:
+                lines = [
+                    f"- {dex.species.get(o['target'], {}).get('zh', o['target'])}"
+                    f"({o['kind']}{' / ' + o['reason'] if o['reason'] else ''})"
+                    for o in cands
+                ]
+                return (
+                    f"⚠️ {mon.display} 有多个进化分支,请用 into 指定:\n"
+                    + "\n".join(lines)
+                )
+        if chosen is None:
+            lines = [
+                f"- {dex.species.get(o['target'], {}).get('zh', o['target'])}"
+                f"({o['kind']}{' / ' + o['reason'] if o['reason'] else ''})"
+                + ("✅" if o["met"] else "❌")
+                for o in opts
+            ]
+            return (
+                f"⚠️ {mon.display} 当前不满足进化条件(可用 force 或指定 into):\n"
+                + "\n".join(lines)
+            )
+        if not chosen["met"] and not force:
+            need: list[str] = []
+            if chosen["kind"] == "levelFriendship":
+                need.append(
+                    f"亲密度需≥{dex._friendship_need(chosen['reason'])}"
+                    f"(当前 {mon.friendship})"
+                )
+            if chosen["level"]:
+                need.append(f"等级需≥{chosen['level']}(当前 {mon.level})")
+            if chosen["item"]:
+                need.append(f"需携带/使用 {chosen['item']}")
+            if chosen["move"]:
+                need.append(f"需学会「{chosen['move']}」")
+            if chosen["reason"]:
+                need.append(chosen["reason"])
+            return (
+                f"⚠️ {mon.display} 还不能进化成 "
+                f"{dex.species.get(chosen['target'], {}).get('zh', chosen['target'])}:"
+                + "、".join(need or ["条件未满足"])
+            )
+        msgs = self._do_evolve(mon, chosen["target"])
+        p.clear()
+        p.update(mon.to_dict())
+        self._poke_save(event, data)
+        return "\n".join(msgs) + "\n" + self._fmt_mon(mon, idx + 1)
+
+    def _do_evolve(self, mon: Pokemon, new_key: str) -> list[str]:
+        """执行进化:重算数值/特性/太晶属性,返回日志。"""
+        dex = get_dex()
         old_zh = mon.entry.get("zh", mon.species)
+        old_types = set(mon.entry.get("types") or [])
         mon.species = new_key
-        # 保留可学招式,补全新形态能力
+        new_entry = dex.species.get(new_key, {})
         mon.stats = dex.compute_stats(new_key, mon.level, mon.ivs, mon.evs, mon.nature)
         mon.max_hp = mon.stats["hp"]
         mon.cur_hp = mon.max_hp
         mon.fainted = False
         mon.faint_logged = False
-        # 特性若新形态不再拥有,换默认特性
-        new_entry = dex.species.get(new_key, {})
+        if not mon.tera_type or (mon.tera_type in old_types and mon.tera_type not in set(new_entry.get("types") or [])):
+            mon.tera_type = new_entry.get("requiredTeraType") or (new_entry.get("types") or ["Normal"])[0]
+        fixed = (new_entry.get("gender") or "").upper()[:1]
+        if fixed in ("M", "F"):
+            mon.gender = fixed
         allowed = {
             (dex.resolve_ability(a) or ("", ""))[0]
             for a in (new_entry.get("abilities") or {}).values()
@@ -732,14 +851,17 @@ class PokemonMixin:
             default = (new_entry.get("abilities") or {}).get("0")
             ar = dex.resolve_ability(default) if default else None
             mon.ability = ar[0] if ar else ""
-        # 补充该形态可学但尚未掌握的招式(不自动替换)
-        p.clear()
-        p.update(mon.to_dict())
-        self._poke_save(event, data)
-        return (
-            f"✨ 恭喜!{old_zh} 进化成了 {new_entry.get('zh', new_key)}!\n"
-            + self._fmt_mon(mon, idx + 1)
-        )
+        msgs = [f"✨ {old_zh} 进化成了 {new_entry.get('zh', new_key)}!"]
+        for mv in dex.level_up_moves(new_key, 0, mon.level):
+            if mv in mon.moves:
+                continue
+            label = (dex.moves.get(mv) or {}).get("zh", mv)
+            if len(mon.moves) < 4:
+                mon.moves.append(mv)
+                mon.pp[mv] = int((dex.moves.get(mv) or {}).get("pp", 10) or 10)
+                msgs.append(f"   {mon.display} 学会了「{label}」!")
+                break
+        return msgs
 
     async def poke_heal_party(self, event) -> str:
         """回复全队 HP 与异常状态(宝可梦中心)。
@@ -846,7 +968,9 @@ class PokemonMixin:
             else:
                 msgs.append(f"💪 {dex.stat_label(stat)} 的努力值已满。")
         exp_gain = max(50, dex.base_exp(mon.species) * n * 2)
+        mon.friendship = min(255, int(mon.friendship) + min(150, 3 * n))
         msgs += self._gain_exp(mon, exp_gain)
+        msgs.append(f"❤️ 亲密度 {mon.friendship}/255")
         msgs.insert(0, f"🏋️ {mon.display} 完成了 {n} 轮训练(获得 {exp_gain} 经验)。")
         p.clear()
         p.update(mon.to_dict())
@@ -896,19 +1020,25 @@ class PokemonMixin:
                     msgs.append(
                         f"   {mon.display} 想学「{label}」,但招式已满(用 poke_learn_move 替换)。"
                     )
-            evo = dex.evolution(mon.species, mon.level)
-            if evo and not (dex.species.get(evo) or {}).get("battleOnly"):
-                old_zh = mon.entry.get("zh", mon.species)
-                mon.species = evo
-                mon.stats = dex.compute_stats(
-                    evo, mon.level, mon.ivs, mon.evs, mon.nature
+            evos = dex.level_evolutions(
+                mon.species,
+                level=mon.level,
+                moves=mon.moves,
+                item=mon.item,
+                friendship=mon.friendship,
+                gender=mon.gender,
+                stats=mon.stats,
+            )
+            mon.friendship = min(255, int(mon.friendship) + 5)
+            if len(evos) == 1:
+                msgs += ["   " + m for m in self._do_evolve(mon, evos[0]["target"])]
+            elif len(evos) > 1:
+                names = "、".join(
+                    dex.species.get(o["target"], {}).get("zh", o["target"])
+                    for o in evos
                 )
-                mon.max_hp = mon.stats["hp"]
-                mon.cur_hp = mon.max_hp
-                mon.fainted = False
-                mon.faint_logged = False
                 msgs.append(
-                    f"   ✨ {old_zh} 进化成了 {dex.species.get(evo, {}).get('zh', evo)}!"
+                    f"   {mon.display} 可以进化成 {names},用 poke_evolve into=... 选择。"
                 )
         return msgs
 
@@ -944,6 +1074,7 @@ class PokemonMixin:
             msgs += self._gain_exp(p, share)
             if ev_gain:
                 msgs += self._gain_evs(p, ev_gain)
+            p.friendship = min(255, int(p.friendship) + 2)
         return msgs
 
     def _gain_evs(self, mon: Pokemon, evs: dict) -> list[str]:
@@ -1109,17 +1240,12 @@ class PokemonMixin:
         msgs: list[str] = []
         consumed = True
 
-        # ── 进化石 ──
-        if eff.get("evolve_stone"):
-            new_key = self._stone_evolution(dex, mon.species, key)
-            if not new_key:
+        # ── 使用道具进化(进化石 / 苹果 / 铠甲等)──
+        if eff.get("evolve_stone") or eff.get("evolve_item"):
+            opts = dex.use_item_evolutions(mon.species, key)
+            if not opts:
                 return f"⚠️ {mon.display} 对 {entry['zh']} 没有反应。"
-            old = mon.display
-            mon.species = new_key
-            mon.stats = dex.compute_stats(new_key, mon.level, mon.ivs, mon.evs, mon.nature)
-            mon.max_hp = mon.stats["hp"]
-            mon.full_heal()
-            msgs.append(f"✨ {old} 使用了 {entry['zh']},进化成了 {dex.species[new_key]['zh']}!")
+            msgs += self._do_evolve(mon, opts[0]["target"])
         # ── 神奇糖果 ──
         elif eff.get("level_up"):
             if mon.level >= 100:
@@ -1167,22 +1293,6 @@ class PokemonMixin:
                 del bag[key]
         self._poke_save(event, data)
         return "\n".join(msgs)
-
-    @staticmethod
-    def _stone_evolution(dex, species: str, stone_key: str) -> str:
-        """找该宝可梦用对应进化石能变成的形态(比对 evoItem 英文名)。"""
-        entry = dex.species.get(species) or {}
-        zh = bag_item_label(stone_key)
-        for e in entry.get("evos") or []:
-            cand = dex.species.get(e) or {}
-            if cand.get("battleOnly"):
-                continue
-            item = str(cand.get("evoItem") or "")
-            if not item:
-                continue
-            if item == zh or item.lower().replace(" ", "-") == stone_key:
-                return e
-        return ""
 
     # ──────────────────────────── 对战工具 ────────────────────────────
 

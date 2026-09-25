@@ -329,6 +329,27 @@ def build() -> None:
             entry["evos"] = [norm_id(e) for e in v["evos"]]
         species[key] = entry
 
+    # 把 evos/prevo/baseSpecies 归一为实际 key(Showdown 对形态用连字符名,
+    # 如 evos 写 "Kommo-o"/"Raichu-Alola",而 key 是 kommoo/raichualola),
+    # 并剔除指不存在形态的引用(如纯外观形态 basculegion-f)。
+    def _canon(x: str) -> str:
+        return "".join(ch for ch in str(x).lower() if ch.isalnum())
+
+    canon_index: dict[str, str] = {}
+    for k, v in species.items():
+        canon_index.setdefault(_canon(k), k)
+        canon_index.setdefault(_canon(v.get("name", "")), k)
+    for v in species.values():
+        if v.get("evos"):
+            v["evos"] = [
+                e2
+                for e in v["evos"]
+                if (e2 := canon_index.get(_canon(e), e)) in species
+            ]
+        for f in ("prevo", "baseSpecies"):
+            if v.get(f):
+                v[f] = canon_index.get(_canon(v[f]), v[f])
+
     # ── moves ────────────────────────────────────────────────
     move_fields = (
         "num",

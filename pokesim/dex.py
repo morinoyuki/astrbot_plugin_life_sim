@@ -18,6 +18,7 @@ from __future__ import annotations
 import difflib
 import json
 import os
+import re
 from functools import cache, lru_cache
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -349,6 +350,172 @@ class Dex:
             if lv and level >= int(lv):
                 return e
         return None
+
+    # ─────────────── 进化判定 ───────────────
+
+    FRIENDSHIP_EVO = 160
+
+    @staticmethod
+    def _norm_item(s: str | None) -> str:
+        return "".join(ch for ch in str(s or "").lower() if ch.isalnum())
+
+    def item_matches(self, user_item: str | None, evo_item: str | None) -> bool:
+        if not user_item or not evo_item:
+            return False
+        a = self._norm_item(user_item)
+        b = self._norm_item(evo_item)
+        return bool(a) and (a == b or a in b or b in a)
+
+    @staticmethod
+    def _friendship_need(reason: str) -> int:
+        m = re.search(r"(\d+)\s*(?:friendship|affection)", reason, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+        return 160
+
+    @staticmethod
+    def _daytime_ok(reason: str, daytime: str | None) -> bool:
+        low = reason.lower()
+        needs_night = "night" in low or "midnight" in low or "full moon" in low
+        needs_day = "during the day" in low or "daytime" in low
+        if not needs_night and not needs_day:
+            return True
+        if not daytime:
+            return False  # 需要昼夜信息才能判定
+        if needs_night:
+            return daytime == "night"
+        return daytime == "day"
+
+    @staticmethod
+    def _stat_ok(reason: str, stats: dict | None) -> bool:
+        if not stats:
+            return True
+        low = reason.lower()
+        if "atk stat" in low and "def stat" in low:
+            atk = int(stats.get("atk", 0))
+            dfn = int(stats.get("def", 0))
+            if "equal" in low:
+                return atk == dfn
+            if ">" in low:
+                return atk > dfn
+            if "<" in low:
+                return atk < dfn
+        return True
+
+    def _move_type(self, move_key: str) -> str:
+        return str((self.moves.get(move_key) or {}).get("type") or "")
+
+    def evolution_options(
+        self,
+        species_key: str,
+        *,
+        level: int = 1,
+        moves=( ),
+        item: str | None = None,
+        friendship: int = 70,
+        gender: str = "",
+        trade: bool = False,
+        daytime: str | None = None,
+        stats: dict | None = None,
+    ) -> list[dict]:
+        """列出当前状态下所有进化选项,每项 {target, kind, reason, met, ...}。"""
+        entry = self.species.get(species_key) or {}
+        moveset = set(moves or ())
+        out: list[dict] = []
+        for e in entry.get("evos") or []:
+            ce = self.species.get(e) or {}
+            if ce.get("battleOnly") or ce.get("isCosmeticForme"):
+                continue
+            kind = ce.get("evoType", "level") or "level"
+            reason = ce.get("evoCondition") or ""
+            req_level = int(ce.get("evoLevel") or 0)
+            req_item = ce.get("evoItem")
+            req_move = ce.get("evoMove")
+            met = False
+            if kind in ("level", ""):
+                met = level >= (req_level or 1)
+            elif kind == "levelFriendship":
+                met = level >= (req_level or 1) and friendship >= self._friendship_need(reason)
+            elif kind == "levelMove":
+                rm = self.resolve_move(req_move) if req_move else None
+                met = bool(rm) and rm[0] in moveset and level >= (req_level or 1)
+            elif kind == "levelHold":
+                met = self.item_matches(item, req_item) and level >= (req_level or 1)
+                met = met and self._daytime_ok(reason, daytime)
+            elif kind == "useItem":
+                met = self.item_matches(item, req_item)
+            elif kind == "trade":
+                met = bool(trade) and (not req_item or self.item_matches(item, req_item))
+            elif kind == "levelExtra":
+                met = self._extra_met(ce, moveset, friendship)
+            else:  # other:特殊条件,需手动 force
+                met = False
+            fixed = (ce.get("gender") or "").upper()[:1]
+            if fixed in ("M", "F") and gender and gender != fixed:
+                met = False
+            if kind in ("levelFriendship", "levelMove", "levelHold", "levelExtra"):
+                met = met and self._daytime_ok(reason, daytime)
+            met = met and self._stat_ok(reason, stats)
+            low = reason.lower()
+            if "female" in low and gender and gender != "F":
+                met = False
+            if re.search(r"\bmale\b", low) and gender and gender != "M":
+                met = False
+            out.append(
+                {
+                    "target": e,
+                    "kind": kind,
+                    "reason": reason,
+                    "met": met,
+                    "level": req_level,
+                    "item": req_item,
+                    "move": req_move,
+                }
+            )
+        return out
+
+    def _extra_met(self, ce: dict, moveset: set, friendship: int) -> bool:
+        reason = (ce.get("evoCondition") or "").lower()
+        if "fairy" in reason:
+            return friendship >= 100 and any(
+                self._move_type(m) == "Fairy" for m in moveset
+            )
+        # 磁场 / 特殊地点等:模拟中视为可达成(由叙事决定)
+        return True
+
+    def level_evolutions(
+        self,
+        species_key: str,
+        *,
+        level: int,
+        moves=(),
+        item: str | None = None,
+        friendship: int = 70,
+        gender: str = "",
+        daytime: str | None = None,
+        stats: dict | None = None,
+    ) -> list[dict]:
+        """升级时可自动触发的进化(等级/亲密度/招式/携带物/特殊)。"""
+        kinds = {"level", "levelFriendship", "levelMove", "levelHold", "levelExtra"}
+        opts = self.evolution_options(
+            species_key,
+            level=level,
+            moves=moves,
+            item=item,
+            friendship=friendship,
+            gender=gender,
+            daytime=daytime,
+            stats=stats,
+        )
+        return [o for o in opts if o["met"] and o["kind"] in kinds]
+
+    def use_item_evolutions(self, species_key: str, item: str | None) -> list[dict]:
+        """使用道具可触发的进化。"""
+        return [
+            o
+            for o in self.evolution_options(species_key, item=item)
+            if o["met"] and o["kind"] == "useItem"
+        ]
 
     # ─────────────── 经验 / 成长曲线 ───────────────
 

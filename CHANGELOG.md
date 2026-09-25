@@ -11,6 +11,8 @@
   - **确定性对战引擎**(`pokesim/engine.py`):第 5 世代以后的伤害公式、属性相克(STAB/太晶)、会心/随机数/天气/场地/墙/入场陷阱、异常状态、能力等级、混乱/寄生种子、常用特性与道具、换人与倒下替换、seed 驱动的可复现随机。
   - **太晶化**:本系太晶 STAB ×2(其它属性按原系计);星晶保留原属性防御并对原属性招式给 1.2 倍加成;`Tera Blast` 随太晶属性变化;对手可由 AI 自行太晶。
   - **经验与训练**:战斗胜利按第 5 世代公式结算经验,三种以上成长曲线自动升级,升级时自动学新招(满 4 招给提示)、满足条件自动进化;胜利同时按对手种族的**努力值产出**给存活宝可梦加努力值;`poke_train` 刷经验与努力值(单项 ≤252、总 ≤510)。
+  - **完整进化逻辑**:等级 / 亲密度 / 学会特定招式 / 携带道具 / 昼夜 / 使用进化石与进化道具 / 交换进化 / 能力值分支 / 性别限制 / 特殊条件;多分支需 `into=` 指定,`poke_evolve trade=true` 走交换进化,`poke_use_item` 用道具进化;修复了 Showdown 形态 id 差异导致的 52 个进化引用悬空(Kommo-o 系 / 阿罗拉形态等)。
+  - **亲密度与性别**:新增亲密度(战斗/训练/升级提升)与性别(按图鉴比例自动分配,可指定),已接入进化判定与展示。
   - **捕获与背包**:`poke_bag` 管理道具(精灵球/伤药/状态/复活/PP/战斗强化/进化石/树果等 60+ 种),野生战用 `poke_battle_turn` 的 `"catch 高级球"` 投球捕获(捕获率公式 + 精灵球条件加成 + 状态修正,捕获成功自动入队/进电脑);`poke_use_item` 战斗外使用,`"item 伤药"` 战斗中使用,`"run"` 逃跑。
   - **多玩家 / PvP**:队伍改为**按玩家区分**(群聊 = 群号+用户 id),每位玩家一支独立队伍;`poke_trainer` 设训练家名、`poke_trainers` 列出同群训练家、`poke_battle_pvp opponent="<uid>"` 与真人真实队伍对战,双方 HP/PP/异常写回各自存档。
   - **23 个 `poke_*` 工具**:`poke_dex_species/move/ability/item`、`poke_type_matchup`、`poke_learnset`、`poke_team`、`poke_add_pokemon`、`poke_remove_pokemon`、`poke_learn_move`、`poke_edit_pokemon`、`poke_evolve`、`poke_heal_party`、`poke_trainer`、`poke_trainers`、`poke_train`、`poke_bag`、`poke_use_item`、`poke_battle_start/pvp/status/turn/end`。

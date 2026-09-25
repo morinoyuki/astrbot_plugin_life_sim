@@ -97,6 +97,48 @@ for _k, (_zh, _t) in _TYPE_ITEMS.items():
 
 
 ITEMS: dict[str, dict] = _ITEMS
+
+# 进化相关道具(使用道具进化 / 携带升级进化 / 交换进化)。
+# 同时作为可携带道具与背包道具收录;对战时无特殊效果。
+_EVO_ITEMS: dict[str, tuple[str, str]] = {
+    "fire-stone": ("火之石", "对特定宝可梦使用后进化。"),
+    "water-stone": ("水之石", "对特定宝可梦使用后进化。"),
+    "thunder-stone": ("雷之石", "对特定宝可梦使用后进化。"),
+    "leaf-stone": ("叶之石", "对特定宝可梦使用后进化。"),
+    "moon-stone": ("月之石", "对特定宝可梦使用后进化。"),
+    "sun-stone": ("日之石", "对特定宝可梦使用后进化。"),
+    "shiny-stone": ("光之石", "对特定宝可梦使用后进化。"),
+    "dusk-stone": ("暗之石", "对特定宝可梦使用后进化。"),
+    "dawn-stone": ("觉醒之石", "对特定宝可梦使用后进化。"),
+    "ice-stone": ("冰之石", "对特定宝可梦使用后进化。"),
+    "sweet-apple": ("甜甜苹果", "对特定宝可梦使用后进化。"),
+    "tart-apple": ("酸酸苹果", "对特定宝可梦使用后进化。"),
+    "syrupy-apple": ("糖浆苹果", "对特定宝可梦使用后进化。"),
+    "cracked-pot": ("破裂的茶壶", "对特定宝可梦使用后进化。"),
+    "unremarkable-teacup": ("平凡的茶杯", "对特定宝可梦使用后进化。"),
+    "auspicious-armor": ("祝福之铠", "对特定宝可梦使用后进化。"),
+    "malicious-armor": ("咒术之铠", "对特定宝可梦使用后进化。"),
+    "metal-alloy": ("合金", "对特定宝可梦使用后进化。"),
+    "oval-stone": ("浑圆之石", "携带并在白天升级后进化。"),
+    "razor-claw": ("锋锐之爪", "携带并在夜晚升级后进化。"),
+    "razor-fang": ("锐利之牙", "携带并在夜晚升级后进化。"),
+    "metal-coat": ("金属膜", "携带后交换进化,或对特定宝可梦起作用。"),
+    "dragon-scale": ("龙之鳞片", "携带后交换进化。"),
+    "deep-sea-scale": ("深海之鳞", "携带后交换进化。"),
+    "deep-sea-tooth": ("深海之牙", "携带后交换进化。"),
+    "kings-rock": ("王者之证", "携带后交换进化。"),
+    "electirizer": ("电力增幅器", "携带后交换进化。"),
+    "magmarizer": ("岩浆增幅器", "携带后交换进化。"),
+    "protector": ("护具", "携带后交换进化。"),
+    "reaper-cloth": ("灵界之布", "携带后交换进化。"),
+    "sachet": ("香袋", "携带后交换进化。"),
+    "whipped-dream": ("泡沫奶油", "携带后交换进化。"),
+    "prism-scale": ("美丽鳞片", "携带后交换进化。"),
+    "up-grade": ("升级数据", "携带后交换进化。"),
+}
+for _ek, (_ezh, _edesc) in _EVO_ITEMS.items():
+    _ITEMS.setdefault(_ek, {"zh": _ezh, "desc": _edesc, "effect": {}})
+
 _ITEM_IDX: dict[str, str] = {}
 for _key, _v in ITEMS.items():
     for _alias in (_key, _v["zh"]):
@@ -115,6 +157,10 @@ def resolve_item(query: str) -> tuple[str, dict] | None:
     key = _ITEM_IDX.get(_norm(raw))
     if key:
         return key, ITEMS[key]
+    # 背包表里的道具(如树果/消耗品)也可作为携带道具解析
+    bag_key = raw if raw in BAG_ITEMS else _BAG_IDX.get(_norm(raw), "")
+    if bag_key:
+        return bag_key, BAG_ITEMS[bag_key]
     return None
 
 
@@ -206,6 +252,13 @@ _BAG: dict[str, dict] = {
     "ability-patch": {"zh": "特性膏药", "kind": "rare", "desc": "切换到隐藏特性。", "effect": {"ability_patch": True}},
 }
 
+# 进化道具并入背包(其中的进化石稍后会被 _STONES 覆写为 kind=stone)
+for _ek, (_ezh, _edesc) in _EVO_ITEMS.items():
+    _BAG.setdefault(
+        _ek,
+        {"zh": _ezh, "kind": "evo", "desc": _edesc, "effect": {"evolve_item": _ek}},
+    )
+
 # 进化石
 _STONES = {
     "fire-stone": ("火之石", "Fire"),
@@ -243,8 +296,9 @@ KIND_ZH = {
     "berry": "树果",
     "rare": "稀有用具",
     "stone": "进化石",
+    "evo": "进化道具",
 }
-KIND_ORDER = ["ball", "medicine", "status", "revive", "pp", "battle", "berry", "stone", "rare"]
+KIND_ORDER = ["ball", "medicine", "status", "revive", "pp", "battle", "berry", "stone", "evo", "rare"]
 
 
 def resolve_bag_item(query: str) -> tuple[str, dict] | None:

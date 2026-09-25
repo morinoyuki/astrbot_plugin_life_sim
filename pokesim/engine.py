@@ -115,6 +115,8 @@ class Pokemon:
     item: str = ""
     moves: list[str] = field(default_factory=list)
     tera_type: str = ""
+    gender: str = ""
+    friendship: int = 70
     ivs: dict = field(default_factory=dict)
     evs: dict = field(default_factory=dict)
     stats: dict = field(default_factory=dict)
@@ -200,6 +202,8 @@ class Pokemon:
             "item": self.item,
             "moves": list(self.moves),
             "tera_type": self.tera_type,
+            "gender": self.gender,
+            "friendship": self.friendship,
             "ivs": dict(self.ivs),
             "evs": dict(self.evs),
             "stats": dict(self.stats),
@@ -230,6 +234,8 @@ class Pokemon:
             "ability",
             "item",
             "tera_type",
+            "gender",
+            "friendship",
             "max_hp",
             "cur_hp",
             "status",
@@ -2064,6 +2070,8 @@ def create_pokemon(
     tera_type: str = "",
     ivs: dict | None = None,
     evs: dict | None = None,
+    gender: str = "",
+    friendship: int = 70,
 ) -> Pokemon:
     """按图鉴数据创建一只宝可梦。species 支持中英文名或标识。"""
     dex = get_dex()
@@ -2117,6 +2125,19 @@ def create_pokemon(
         r = resolve_item(item)
         item_key = r[0] if r else ""
 
+    # 性别:优先固定性别字段,否则按性别比例随机
+    gen = (gender or entry.get("gender") or "").strip().upper()[:1]
+    if gen not in ("M", "F"):
+        gr = entry.get("genderRate")
+        if gr is None or int(gr) < 0:
+            gen = ""
+        elif int(gr) == 0:
+            gen = "M"
+        elif int(gr) >= 8:
+            gen = "F"
+        else:
+            gen = "F" if random.random() < int(gr) / 8.0 else "M"
+
     mon = Pokemon(
         species=key,
         level=level,
@@ -2127,6 +2148,8 @@ def create_pokemon(
         item=item_key,
         moves=move_keys,
         tera_type=tera,
+        gender=gen,
+        friendship=max(0, min(255, int(friendship))),
         ivs=ivs,
         evs=evs,
         stats=stats,

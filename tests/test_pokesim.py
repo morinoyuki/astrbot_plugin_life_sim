@@ -295,6 +295,91 @@ def test_pokemon_train_and_pvp():
     _train_pvp_scenario()
 
 
+def test_evolution_methods():
+    from pokesim.dex import get_dex
+
+    d = get_dex()
+
+    def met(sp, **kw):
+        return {o["target"] for o in d.evolution_options(sp, **kw) if o["met"]}
+
+    # 等级
+    assert "charmeleon" in met("charmander", level=16)
+    assert "charmeleon" not in met("charmander", level=15)
+    # 亲密度
+    assert "pikachu" in met("pichu", level=10, friendship=160)
+    assert "pikachu" not in met("pichu", level=10, friendship=100)
+    # 使用道具
+    assert "ninetales" in met("vulpix", item="fire-stone")
+    assert "flapple" in met("applin", item="tart-apple")
+    assert "appletun" not in met("applin", item="tart-apple")
+    # 交换(可携带道具)
+    assert "machamp" in met("machoke", trade=True)
+    assert "steelix" in met("onix", trade=True, item="metal-coat")
+    assert "steelix" not in met("onix", trade=True, item="dragon-scale")
+    # 升级时学会特定招式
+    assert "ambipom" in met("aipom", level=32, moves=["doublehit"])
+    assert "ambipom" not in met("aipom", level=32, moves=["swift"])
+    # 携带物 + 昼夜
+    assert "gliscor" in met("gligar", level=40, item="razor-fang", daytime="night")
+    assert "gliscor" not in met("gligar", level=40, item="razor-fang", daytime="day")
+    # 特殊(妖精招式)
+    assert "sylveon" in met("eevee", level=20, friendship=200, moves=["babydolleyes"])
+    assert "sylveon" not in met("eevee", level=20, friendship=50, moves=["babydolleyes"])
+    # 昼夜分支
+    assert "espeon" in met("eevee", level=20, friendship=200, daytime="day")
+    assert "umbreon" not in met("eevee", level=20, friendship=200, daytime="day")
+    assert "umbreon" in met("eevee", level=20, friendship=200, daytime="night")
+    # 性别限制
+    assert not met("salandit", level=40, gender="M")
+    assert "salazzle" in met("salandit", level=40, gender="F")
+    # 能力值分支
+    assert "hitmonlee" in met("tyrogue", level=20, stats={"atk": 50, "def": 40})
+    assert "hitmonchan" in met("tyrogue", level=20, stats={"atk": 40, "def": 50})
+    assert "hitmontop" in met("tyrogue", level=20, stats={"atk": 45, "def": 45})
+    # 悬空引用已清零
+    for k, v in d.species.items():
+        for e in v.get("evos") or []:
+            assert e in d.species, f"{k} -> {e} missing"
+
+
+def _evo_tool_scenario():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _FakePlugin(tmp)
+        ev = _Event()
+
+        async def run():
+            # 交换进化
+            await p.poke_add_pokemon(ev, "豪力", level=30, moves="karatechop")
+            out = await p.poke_evolve(ev, "1", trade=True)
+            assert "怪力" in out
+            # 携带物 + 夜晚
+            await p.poke_add_pokemon(ev, "天蝎", level=40, moves="slash")
+            await p.poke_edit_pokemon(ev, "2", item="razor-fang")
+            out = await p.poke_evolve(ev, "2", daytime="night")
+            assert "天蝎王" in out
+            # 使用进化石
+            await p.poke_add_pokemon(ev, "六尾", level=20, moves="ember")
+            await p.poke_bag(ev, item="火之石", count=1)
+            out = await p.poke_use_item(ev, "3", "火之石")
+            assert "九尾" in out
+            # 性别限制
+            await p.poke_add_pokemon(ev, "夜盗火蜥", level=40, moves="ember", gender="M")
+            out = await p.poke_evolve(ev, "4", into="焰后蜥")
+            assert "还不能进化" in out
+            # 多分支需指定
+            await p.poke_add_pokemon(ev, "伊布", level=20, moves="quickattack")
+            out = await p.poke_evolve(ev, "5")
+            assert "分支" in out or "不满足" in out
+
+        asyncio.run(run())
+
+
+def test_pokemon_evolution():
+    test_evolution_methods()
+    _evo_tool_scenario()
+
+
 if __name__ == "__main__":
     test_dex_lookup_and_types()
     test_dex_stats_and_learnset()
@@ -304,4 +389,5 @@ if __name__ == "__main__":
     test_pokemon_tools()
     test_pokemon_items_and_catch()
     test_pokemon_train_and_pvp()
+    test_pokemon_evolution()
     print("all pokesim tests passed")
