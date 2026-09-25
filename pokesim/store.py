@@ -46,6 +46,7 @@ class PokeStore:
                 data.setdefault("scope", scope)
                 data.setdefault("party", [])
                 data.setdefault("box", [])
+                data.setdefault("bag", {})
                 data.setdefault("battle", None)
                 return data
         except (OSError, ValueError):
@@ -54,6 +55,7 @@ class PokeStore:
             "scope": scope,
             "party": [],
             "box": [],
+            "bag": {},
             "battle": None,
             "updated_at": 0,
         }

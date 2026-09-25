@@ -192,6 +192,109 @@ def test_pokemon_tools():
     _scenario()
 
 
+def _items_scenario():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _FakePlugin(tmp)
+        ev = _Event()
+
+        async def run():
+            await p.poke_add_pokemon(ev, "皮卡丘", level=30, moves="thunderbolt,quickattack,growl")
+            await p.poke_add_pokemon(ev, "六尾", level=20, moves="ember,quickattack")
+
+            # 背包
+            bag = await p.poke_bag(ev)
+            assert "空" in bag
+            added = await p.poke_bag(ev, item="精灵球", count=5)
+            assert "精灵球×5" in added
+            await p.poke_bag(ev, item="大师球", count=1)
+            await p.poke_bag(ev, item="伤药", count=3)
+            await p.poke_bag(ev, item="火之石", count=1)
+            await p.poke_bag(ev, item="神奇糖果", count=2)
+
+            # 野生战 + 大师球必中捕获
+            start = await p.poke_battle_start(ev, "绿毛虫|5")
+            assert "野生对战" in start
+            turn = await p.poke_battle_turn(ev, "catch 大师球")
+            assert "成功捕获了" in turn
+            team = await p.poke_team(ev)
+            assert "绿毛虫" in team  # 自动入队
+
+            # 战斗中使用道具(合法:回复类) + 逃走
+            await p.poke_battle_start(ev, "小拉达|30")
+            bad = await p.poke_battle_turn(ev, "item 精灵球")
+            assert "catch" in bad  # 精灵球应提示用 catch
+            await p.poke_battle_turn(ev, "switch 2")
+            heal = await p.poke_battle_turn(ev, "item 伤药")
+            assert "伤药" in heal
+            await p.poke_battle_start(ev, "绿毛虫|5")
+            run = await p.poke_battle_turn(ev, "run")
+            assert "成功逃" in run
+
+            # 战斗外道具:神奇糖果升级
+            lv_out = await p.poke_use_item(ev, "1", "神奇糖果")
+            assert "Lv31" in lv_out
+
+            # 进化石
+            stone = await p.poke_use_item(ev, "六尾", "火之石")
+            assert "九尾" in stone
+
+            # 非野生战不能捕获/逃跑
+            await p.poke_battle_start(ev, "小拉达|10;波波|10")
+            caught = await p.poke_battle_turn(ev, "catch 精灵球")
+            assert "野生" in caught
+
+        asyncio.run(run())
+
+
+def test_pokemon_items_and_catch():
+    _items_scenario()
+
+
+def _train_pvp_scenario():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _FakePlugin(tmp)
+        a = _Event(sid="1001")
+        b = _Event(sid="1002")
+
+        async def run():
+            await p.poke_trainer(a, "小智")
+            await p.poke_trainer(b, "小茂")
+            await p.poke_add_pokemon(
+                a, "皮卡丘", level=5, moves="thundershock,quickattack,growl"
+            )
+            await p.poke_add_pokemon(
+                b, "小火龙", level=5, moves="ember,scratch,growl"
+            )
+            trainers = await p.poke_trainers(a)
+            assert "小智" in trainers and "小茂" in trainers
+
+            # 训练:经验 + 努力值 + 升级
+            tr = await p.poke_train(a, "1", sessions=20, focus="速度")
+            assert "努力值" in tr and "升到了" in tr
+            team = await p.poke_team(a)
+            assert "经验" in team
+
+            # PvP
+            start = await p.poke_battle_pvp(a, "1002")
+            assert "PvP" in start
+            for _ in range(30):
+                st = await p.poke_battle_status(a)
+                if "战斗结束" in st:
+                    break
+                r = await p.poke_battle_turn(a, "move thundershock")
+                if "战斗结束" in r:
+                    break
+            # 对手队伍被写回(战斗后 HP 不是满的)
+            bteam = await p.poke_team(b)
+            assert "小火龙" in bteam
+
+        asyncio.run(run())
+
+
+def test_pokemon_train_and_pvp():
+    _train_pvp_scenario()
+
+
 if __name__ == "__main__":
     test_dex_lookup_and_types()
     test_dex_stats_and_learnset()
@@ -199,4 +302,6 @@ if __name__ == "__main__":
     test_engine_tera_and_switch()
     test_engine_serialization()
     test_pokemon_tools()
+    test_pokemon_items_and_catch()
+    test_pokemon_train_and_pvp()
     print("all pokesim tests passed")

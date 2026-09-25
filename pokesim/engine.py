@@ -21,9 +21,10 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from .dex import STAT_ORDER, get_dex
-from .items import ITEMS, item_label
+from .items import BAG_ITEMS, ITEMS, item_label
 
 # ──────────────────────────── 常量 ────────────────────────────
 
@@ -107,6 +108,7 @@ class Pokemon:
 
     species: str
     level: int = 5
+    exp: int = 0
     nickname: str = ""
     nature: str = "hardy"
     ability: str = ""
@@ -191,6 +193,7 @@ class Pokemon:
         return {
             "species": self.species,
             "level": self.level,
+            "exp": self.exp,
             "nickname": self.nickname,
             "nature": self.nature,
             "ability": self.ability,
@@ -221,6 +224,7 @@ class Pokemon:
         p = cls(species=d.get("species", ""))
         for k in (
             "level",
+            "exp",
             "nickname",
             "nature",
             "ability",
@@ -403,6 +407,11 @@ class Battle:
     awaiting_switch: bool = False
     player_damaged: bool = False
     enemy_damaged: bool = False
+    wild: bool = False
+    bag: dict = field(default_factory=dict)
+    captured: dict | None = None
+    run_attempts: int = 0
+    escaped: bool = False
 
     # ── 序列化 ──
     def to_dict(self) -> dict:
@@ -420,6 +429,11 @@ class Battle:
             "finished": self.finished,
             "winner": self.winner,
             "awaiting_switch": self.awaiting_switch,
+            "wild": self.wild,
+            "bag": dict(self.bag),
+            "captured": self.captured,
+            "run_attempts": self.run_attempts,
+            "escaped": self.escaped,
         }
 
     @classmethod
@@ -439,6 +453,11 @@ class Battle:
         b.finished = bool(d.get("finished", False))
         b.winner = d.get("winner", "")
         b.awaiting_switch = bool(d.get("awaiting_switch", False))
+        b.wild = bool(d.get("wild", False))
+        b.bag = dict(d.get("bag") or {})
+        b.captured = d.get("captured")
+        b.run_attempts = int(d.get("run_attempts", 0) or 0)
+        b.escaped = bool(d.get("escaped", False))
         return b
 
     # ── 展示 ──
@@ -457,7 +476,7 @@ class Battle:
         return " ".join(bits)
 
     def summary(self) -> str:
-        lines = [f"【第 {self.turn} 回合】"]
+        lines = [f"【第 {self.turn} 回合】" + ("(野生战)" if self.wild else "")]
         for label, side in (("我方", self.player), ("对方", self.enemy)):
             mon = side.mon
             if mon is None:
@@ -491,7 +510,14 @@ class Battle:
                     f"{label}场地: " + " ".join(hz + sc)
                 )
         if self.finished:
-            lines.append(f"战斗结束: {'我方胜利' if self.winner == 'player' else '对方胜利'}")
+            if self.escaped:
+                lines.append("战斗结束: 成功逃走")
+            elif self.captured:
+                lines.append("战斗结束: 捕获成功")
+            else:
+                lines.append(
+                    f"战斗结束: {'我方胜利' if self.winner == 'player' else '对方胜利'}"
+                )
         elif self.awaiting_switch:
             lines.append("⚠️ 我方宝可梦倒下,需要换人(用 switch <序号>)")
         return "\n".join(lines)
@@ -569,9 +595,17 @@ class Battle:
             act = player_action if who == "player" else enemy_action
             side = self.player if who == "player" else self.enemy
             other = self.enemy if who == "player" else self.player
-            if act.get("type") != "move":
-                continue
-            self._execute_move(side, other, act)
+            atype = act.get("type")
+            if atype == "switch":
+                continue  # 换人已在上面处理
+            if atype == "move":
+                self._execute_move(side, other, act)
+            elif atype == "item":
+                self._execute_battle_item(side, other, act)
+            elif atype == "catch":
+                self._execute_catch(side, other, act)
+            elif atype == "run":
+                self._execute_run(side, other)
             self._check_faints()
             if self.finished:
                 break
@@ -581,26 +615,33 @@ class Battle:
         return list(self.log)
 
     # ── 行动顺序 ──
+    _NON_MOVE_PRIORITY: ClassVar[dict[str, int]] = {
+        "switch": 6,
+        "item": 6,
+        "catch": 6,
+        "run": 6,
+    }
+
+    def _action_priority(self, action: dict, side: Side) -> int:
+        atype = action.get("type")
+        if atype in self._NON_MOVE_PRIORITY:
+            return self._NON_MOVE_PRIORITY[atype]
+        if atype != "move":
+            return 0
+        mv = get_dex().moves.get(action.get("move", ""), {})
+        pri = int(mv.get("priority", 0) or 0)
+        mon = side.mon
+        if mon and mv.get("category") == "Status" and mon.has_ability("prankster"):
+            pri += 1
+        return pri
+
     def _action_order(self, pa: dict, ea: dict) -> list[str]:
-        pt = pa.get("type")
-        et = ea.get("type")
-        if pt == "switch" and et != "switch":
-            return ["enemy"]
-        if et == "switch" and pt != "switch":
-            return ["player"]
         pm = self.player.mon
         em = self.enemy.mon
         if pm is None or em is None:
             return ["player", "enemy"]
-        pmv = get_dex().moves.get(pa.get("move", ""), {}) if pt == "move" else {}
-        emv = get_dex().moves.get(ea.get("move", ""), {}) if et == "move" else {}
-        pp = int(pmv.get("priority", 0) or 0)
-        ep = int(emv.get("priority", 0) or 0)
-        # 恶作剧之心等:变化招式优先度 +1
-        if pt == "move" and pmv.get("category") == "Status" and pm.has_ability("prankster"):
-            pp += 1
-        if et == "move" and emv.get("category") == "Status" and em.has_ability("prankster"):
-            ep += 1
+        pp = self._action_priority(pa, self.player)
+        ep = self._action_priority(ea, self.enemy)
         if pp != ep:
             return ["player", "enemy"] if pp > ep else ["enemy", "player"]
         ps = pm.battle_stat("spe", self)
@@ -821,6 +862,200 @@ class Battle:
 
         if mon.cur_hp <= 0:
             mon.fainted = True
+
+    # ── 道具 / 捕获 / 逃走 ──
+    @staticmethod
+    def _who(side: Side) -> str:
+        return "我方" if side.name == "player" else "对方"
+
+    def _consume(self, side: Side, key: str) -> bool:
+        """从背包扣除一件道具;返回是否成功。"""
+        if side is not self.player:
+            return True
+        if int(self.bag.get(key, 0)) <= 0:
+            return False
+        self.bag[key] = int(self.bag[key]) - 1
+        if self.bag[key] <= 0:
+            del self.bag[key]
+        return True
+
+    def _execute_battle_item(self, side: Side, foe_side: Side, action: dict) -> None:
+        key = action.get("item") or ""
+        entry = BAG_ITEMS.get(key)
+        if entry is None or entry.get("kind") == "ball":
+            self.log.append(f"{self._who(side)} 对道具的使用没有效果。")
+            return
+        if not self._consume(side, key):
+            self.log.append(f"背包里没有 {entry['zh']} 了。")
+            return
+        target = side.mon
+        if action.get("target") is not None:
+            try:
+                idx = int(action["target"])
+            except (TypeError, ValueError):
+                idx = -1
+            if 0 <= idx < len(side.party):
+                target = side.party[idx]
+        if target is None:
+            return
+        self.log.append(f"{self._who(side)} 使用了 {entry['zh']}!")
+        self._apply_item_effect(target, entry.get("effect") or {})
+
+    def _apply_item_effect(self, mon: Pokemon, eff: dict) -> None:
+        if mon.fainted:
+            if eff.get("revive_full") or eff.get("revive"):
+                self._revive(mon, 1.0 if eff.get("revive_full") else float(eff.get("revive", 0.5)))
+                self.log.append(f"{mon.display} 恢复了战斗能力!")
+            else:
+                self.log.append("但是没有效果……")
+            return
+        if eff.get("heal_full"):
+            healed = mon.heal(mon.max_hp)
+            self.log.append(f"{mon.display} 的 HP 完全回复了!({healed})")
+        elif eff.get("heal_hp"):
+            healed = mon.heal(int(eff["heal_hp"]))
+            self.log.append(f"{mon.display} 回复了 {healed} HP。")
+        elif eff.get("heal_hp_frac"):
+            healed = mon.heal(max(1, int(mon.max_hp * float(eff["heal_hp_frac"]))))
+            self.log.append(f"{mon.display} 回复了 {healed} HP。")
+        cure = eff.get("cure_status")
+        if cure and mon.status and (cure is True or mon.status in cure):
+            old = STATUS_ZH.get(mon.status, mon.status)
+            mon.status = ""
+            mon.status_turns = 0
+            self.log.append(f"{mon.display} 的{old}被治愈了!")
+        if eff.get("pp_restore_all"):
+            for mv in mon.moves:
+                mon.pp[mv] = int((get_dex().moves.get(mv) or {}).get("pp", 10) or 10)
+            self.log.append(f"{mon.display} 的全部招式 PP 完全回复了!")
+        elif eff.get("pp_restore"):
+            amount = int(eff["pp_restore"])
+            for mv in mon.moves:
+                mx = int((get_dex().moves.get(mv) or {}).get("pp", 10) or 10)
+                mon.pp[mv] = min(mx, int(mon.pp.get(mv, mx)) + amount)
+            self.log.append(f"{mon.display} 回复了招式的 PP。")
+        for stat, stages in (eff.get("stat_boost") or {}).items():
+            msg = mon.boost(stat, int(stages))
+            if msg:
+                self.log.append(msg)
+        if eff.get("focus_energy"):
+            mon.volatiles["focusenergy"] = 1
+            self.log.append(f"{mon.display} 进入了易击中要害的状态!")
+        if eff.get("guard_spec"):
+            mon.volatiles["guardspec"] = 1
+            self.log.append(f"{mon.display} 受到会心一击的概率降低了!")
+
+    @staticmethod
+    def _revive(mon: Pokemon, frac: float = 0.5) -> None:
+        mon.cur_hp = max(1, int(mon.max_hp * frac)) if frac < 1 else mon.max_hp
+        mon.fainted = False
+        mon.faint_logged = False
+        mon.status = ""
+        mon.status_turns = 0
+
+    def _catch_rate(self, mon: Pokemon) -> int:
+        e = mon.entry
+        if "captureRate" in e:
+            return int(e["captureRate"])
+        base = e.get("baseSpecies")
+        if base:
+            r = get_dex().resolve_species(base)
+            if r and "captureRate" in r[1]:
+                return int(r[1]["captureRate"])
+        return 45
+
+    def _ball_bonus(self, entry: dict, mon: Pokemon) -> float:
+        eff = entry.get("effect") or {}
+        bonus = float(eff.get("ball_bonus", 1.0))
+        tags = set(mon.entry.get("tags") or [])
+        types = set(mon.types)
+        if eff.get("ball_net") and ({"Water", "Bug"} & types):
+            bonus *= float(eff["ball_net"])
+        if eff.get("ball_quick") and self.turn <= 1:
+            bonus *= float(eff["ball_quick"])
+        if eff.get("ball_timer"):
+            bonus *= min(4.0, 1.0 + 0.1 * self.turn)
+        if eff.get("ball_repeat"):
+            bonus *= float(eff["ball_repeat"])
+        if eff.get("ball_nest") or eff.get("ball_level"):
+            lv = mon.level
+            bonus *= 4.0 if lv < 20 else 3.0 if lv < 25 else 2.0 if lv < 30 else 1.0
+        if eff.get("ball_heavy"):
+            w = float(mon.entry.get("weightkg", 10) or 10)
+            bonus *= 4.0 if w >= 200 else 2.0 if w >= 100 else 1.0
+        if eff.get("ball_beast") and ("Ultra Beast" in tags or "Paradox" in tags):
+            bonus *= float(eff["ball_beast"])
+        if eff.get("ball_dusk"):
+            bonus *= float(eff["ball_dusk"])
+        return bonus
+
+    def _execute_catch(self, side: Side, foe_side: Side, action: dict) -> None:
+        if not self.wild or side is not self.player:
+            self.log.append("只有在野生对战中才能投掷精灵球。")
+            return
+        mon = foe_side.mon
+        if mon is None:
+            return
+        key = action.get("item") or "poke-ball"
+        entry = BAG_ITEMS.get(key)
+        if entry is None or entry.get("kind") != "ball":
+            self.log.append("这不是精灵球。")
+            return
+        if not self._consume(side, key):
+            self.log.append(f"背包里没有 {entry['zh']} 了。")
+            return
+        self.log.append(f"投出了 {entry['zh']}!")
+        eff = entry.get("effect") or {}
+        rate = self._catch_rate(mon)
+        bonus = self._ball_bonus(entry, mon)
+        status = (
+            2.5
+            if mon.status in ("slp", "frz")
+            else 1.5
+            if mon.status in ("brn", "par", "psn", "tox")
+            else 1.0
+        )
+        if eff.get("ball_master"):
+            caught, shakes = True, 3
+        else:
+            a = ((3 * mon.max_hp - 2 * mon.cur_hp) * rate * bonus) / (3 * mon.max_hp) * status
+            if a >= 255:
+                caught, shakes = True, 3
+            else:
+                b = 65536 / ((255 / a) ** 0.1875) if a > 0 else 0.0
+                rng = self._rng(20)
+                shakes = sum(1 for _ in range(4) if rng.random() * 65536 < b)
+                caught = shakes == 4
+        if caught:
+            if eff.get("ball_heal"):
+                mon.full_heal()
+            self.captured = mon.to_dict()
+            self.log.append(f"恭喜!成功捕获了 {mon.display}!")
+            self.finished = True
+            self.winner = "player"
+        else:
+            self.log.append(f"精灵球摇晃了 {shakes} 次……")
+            self.log.append(f"{mon.display} 挣脱了精灵球!")
+
+    def _execute_run(self, side: Side, foe_side: Side) -> None:
+        if not self.wild:
+            self.log.append("无法从与训练家的对战中逃走!")
+            return
+        mon, foe = side.mon, foe_side.mon
+        if mon is None or foe is None:
+            return
+        ps = mon.battle_stat("spe", self)
+        es = foe.battle_stat("spe", self)
+        odds = ps * 32 // max(1, (es // 4) % 256) + 30 * self.run_attempts
+        rng = self._rng(21)
+        if odds > 255 or rng.randrange(256) < odds:
+            self.log.append("成功逃走了!")
+            self.finished = True
+            self.escaped = True
+            self.winner = "player"
+        else:
+            self.run_attempts += 1
+            self.log.append("没能逃掉!")
 
     def _pre_move_status(self, mon: Pokemon) -> bool:
         """处理睡眠 / 冰冻 / 麻痹,返回是否可以行动。"""
@@ -1885,6 +2120,7 @@ def create_pokemon(
     mon = Pokemon(
         species=key,
         level=level,
+        exp=dex.exp_for_level(dex.growth_of(key), level),
         nickname=nickname.strip(),
         nature=nature_key,
         ability=ability_key,
@@ -1908,6 +2144,8 @@ def start_battle(
     weather: str = "",
     terrain: str = "",
     seed: int = 0,
+    wild: bool = False,
+    bag: dict | None = None,
 ) -> Battle:
     ok_weather = {
         "sun": "sun",
@@ -1939,6 +2177,8 @@ def start_battle(
         terrain=terrain,
         terrain_turns=5 if terrain else 0,
         seed=int(seed or 0),
+        wild=bool(wild),
+        bag=dict(bag or {}),
     )
     # 首发选第一只未倒下的
     for side in (battle.player, battle.enemy):

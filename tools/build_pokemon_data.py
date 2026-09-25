@@ -189,6 +189,22 @@ def build() -> None:
         if r["local_language_id"] == ZH_HANS:
             nature_zh[r["nature_id"]] = r["name"]
 
+    # 捕获率 / 稀有度 / 成长曲线(按全国图鉴号取自 PokeAPI pokemon_species)
+    growth_ident = {r["id"]: r["identifier"] for r in fetch_csv("growth_rates.csv")}
+    species_meta: dict[str, dict] = {}
+    for r in fetch_csv("pokemon_species.csv"):
+        species_meta[r["id"]] = {
+            "captureRate": int(r.get("capture_rate") or 45),
+            "growth": growth_ident.get(r.get("growth_rate_id", ""), "medium"),
+            "isLegendary": r.get("is_legendary") == "1",
+            "isMythical": r.get("is_mythical") == "1",
+        }
+    # 基础经验值(击倒时给予的经验),默认形态优先
+    base_exp_by_species: dict[str, int] = {}
+    for r in fetch_csv("pokemon.csv"):
+        if r.get("is_default") == "1" and r.get("species_id"):
+            base_exp_by_species[r["species_id"]] = int(r.get("base_experience") or 0)
+
     # ── species ──────────────────────────────────────────────
     species = {}
     for key, v in sd["pokedex"].items():
@@ -210,6 +226,17 @@ def build() -> None:
             "baseStats": dict(v.get("baseStats", {})),
             "abilities": dict(v.get("abilities", {})),
         }
+        sm = species_meta.get(str(num))
+        if sm:
+            entry["captureRate"] = sm["captureRate"]
+            entry["growthRate"] = sm["growth"]
+            if sm["isLegendary"]:
+                entry["isLegendary"] = True
+            if sm["isMythical"]:
+                entry["isMythical"] = True
+        be = base_exp_by_species.get(str(num))
+        if be:
+            entry["baseExp"] = be
         for f in (
             "heightm",
             "weightkg",

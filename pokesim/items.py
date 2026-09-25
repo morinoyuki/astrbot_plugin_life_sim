@@ -123,3 +123,149 @@ def item_label(key: str | None) -> str:
         return ""
     entry = ITEMS.get(key)
     return entry["zh"] if entry else key
+
+
+# ════════════════════════════════════════════════════════════════
+# 背包道具(可消耗):精灵球 / 伤药 / 状态回复 / 复活 / PP 回复 /
+# 战斗强化 / 进化石 / 稀有用具。effect 由 engine 与 tools 解释。
+# ════════════════════════════════════════════════════════════════
+
+# effect 支持的键:
+#   ball_bonus: 固定捕获加成; ball_master: 必中;
+#   ball_net / ball_nest / ball_timer / ball_quick / ball_dusk /
+#   ball_repeat / ball_beast / ball_heavy / ball_level: 条件加成(engine 计算)
+#   heal_hp / heal_hp_frac / heal_full: 回复 HP
+#   cure_status: True(全部) 或 ["brn",...]; revive / revive_full: 复活
+#   pp_restore / pp_restore_all: PP 回复
+#   stat_boost: {stat: stages} 仅战斗中使用
+
+_BAG: dict[str, dict] = {
+    # ── 精灵球 ──
+    "poke-ball": {"zh": "精灵球", "kind": "ball", "desc": "捕获宝可梦的基本球。", "effect": {"ball_bonus": 1.0}},
+    "great-ball": {"zh": "超级球", "kind": "ball", "desc": "比精灵球更容易捕获。", "effect": {"ball_bonus": 1.5}},
+    "ultra-ball": {"zh": "高级球", "kind": "ball", "desc": "捕获性能很高的球。", "effect": {"ball_bonus": 2.0}},
+    "master-ball": {"zh": "大师球", "kind": "ball", "desc": "必定捕获任何宝可梦。", "effect": {"ball_master": True}},
+    "premier-ball": {"zh": "纪念球", "kind": "ball", "desc": "纪念用的稀有球,性能同精灵球。", "effect": {"ball_bonus": 1.0}},
+    "heal-ball": {"zh": "治愈球", "kind": "ball", "desc": "捕获后回复宝可梦的 HP 与异常状态。", "effect": {"ball_bonus": 1.0, "ball_heal": True}},
+    "net-ball": {"zh": "捕网球", "kind": "ball", "desc": "对水/虫属性宝可梦效果极佳。", "effect": {"ball_bonus": 1.0, "ball_net": 3.5}},
+    "dusk-ball": {"zh": "黑暗球", "kind": "ball", "desc": "在洞窟/夜晚更容易捕获。", "effect": {"ball_bonus": 1.0, "ball_dusk": 3.0}},
+    "quick-ball": {"zh": "先机球", "kind": "ball", "desc": "战斗刚开始时极易捕获。", "effect": {"ball_bonus": 1.0, "ball_quick": 5.0}},
+    "timer-ball": {"zh": "计时球", "kind": "ball", "desc": "回合越多越容易捕获。", "effect": {"ball_bonus": 1.0, "ball_timer": True}},
+    "repeat-ball": {"zh": "重复球", "kind": "ball", "desc": "对已捕获过的种类更容易捕获。", "effect": {"ball_bonus": 1.0, "ball_repeat": 3.5}},
+    "nest-ball": {"zh": "巢穴球", "kind": "ball", "desc": "对手等级越低越容易捕获。", "effect": {"ball_bonus": 1.0, "ball_nest": True}},
+    "level-ball": {"zh": "等级球", "kind": "ball", "desc": "对手等级越低越容易捕获。", "effect": {"ball_bonus": 1.0, "ball_level": True}},
+    "heavy-ball": {"zh": "沉重球", "kind": "ball", "desc": "对体重大的宝可梦更容易捕获。", "effect": {"ball_bonus": 1.0, "ball_heavy": True}},
+    "beast-ball": {"zh": "究极球", "kind": "ball", "desc": "对究极异兽效果极佳。", "effect": {"ball_bonus": 1.0, "ball_beast": 5.0}},
+    # ── 伤药 / 回复 ──
+    "potion": {"zh": "伤药", "kind": "medicine", "desc": "回复 20 HP。", "effect": {"heal_hp": 20}},
+    "super-potion": {"zh": "好伤药", "kind": "medicine", "desc": "回复 60 HP。", "effect": {"heal_hp": 60}},
+    "hyper-potion": {"zh": "厉害伤药", "kind": "medicine", "desc": "回复 120 HP。", "effect": {"heal_hp": 120}},
+    "max-potion": {"zh": "全满药", "kind": "medicine", "desc": "完全回复 HP。", "effect": {"heal_full": True}},
+    "full-restore": {"zh": "全复药", "kind": "medicine", "desc": "完全回复 HP 并治愈异常状态。", "effect": {"heal_full": True, "cure_status": True}},
+    "fresh-water": {"zh": "美味之水", "kind": "medicine", "desc": "回复 30 HP。", "effect": {"heal_hp": 30}},
+    "soda-pop": {"zh": "汽水", "kind": "medicine", "desc": "回复 50 HP。", "effect": {"heal_hp": 50}},
+    "lemonade": {"zh": "柠檬汁", "kind": "medicine", "desc": "回复 80 HP。", "effect": {"heal_hp": 80}},
+    "moomoo-milk": {"zh": "哞哞鲜奶", "kind": "medicine", "desc": "回复 100 HP。", "effect": {"heal_hp": 100}},
+    # ── 状态回复 ──
+    "antidote": {"zh": "解毒药", "kind": "status", "desc": "治愈中毒。", "effect": {"cure_status": ["psn", "tox"]}},
+    "burn-heal": {"zh": "灼伤药", "kind": "status", "desc": "治愈灼伤。", "effect": {"cure_status": ["brn"]}},
+    "ice-heal": {"zh": "解冻药", "kind": "status", "desc": "治愈冰冻。", "effect": {"cure_status": ["frz"]}},
+    "awakening": {"zh": "解眠药", "kind": "status", "desc": "唤醒睡眠。", "effect": {"cure_status": ["slp"]}},
+    "paralyze-heal": {"zh": "解麻药", "kind": "status", "desc": "治愈麻痹。", "effect": {"cure_status": ["par"]}},
+    "full-heal": {"zh": "万灵药", "kind": "status", "desc": "治愈任何异常状态。", "effect": {"cure_status": True}},
+    # ── 复活 ──
+    "revive": {"zh": "活力碎片", "kind": "revive", "desc": "复活并回复一半 HP。", "effect": {"revive": 0.5}},
+    "max-revive": {"zh": "活力块", "kind": "revive", "desc": "复活并完全回复 HP。", "effect": {"revive_full": True}},
+    # ── PP 回复 ──
+    "ether": {"zh": "元气之粉", "kind": "pp", "desc": "回复一个招式 10 点 PP。", "effect": {"pp_restore": 10}},
+    "max-ether": {"zh": "特攻之粉", "kind": "pp", "desc": "完全回复一个招式的 PP。", "effect": {"pp_restore_all": 1}},
+    "elixir": {"zh": "秘药", "kind": "pp", "desc": "回复全部招式各 10 点 PP。", "effect": {"pp_restore": 10, "pp_all": True}},
+    "max-elixir": {"zh": "厉害秘药", "kind": "pp", "desc": "完全回复全部招式的 PP。", "effect": {"pp_restore_all": 1, "pp_all": True}},
+    # ── 战斗强化道具(仅战斗中使用) ──
+    "x-attack": {"zh": "力量强化", "kind": "battle", "desc": "战斗中提升攻击。", "effect": {"stat_boost": {"atk": 1}}},
+    "x-defense": {"zh": "防御强化", "kind": "battle", "desc": "战斗中提升防御。", "effect": {"stat_boost": {"def": 1}}},
+    "x-special": {"zh": "特攻强化", "kind": "battle", "desc": "战斗中提升特攻。", "effect": {"stat_boost": {"spa": 1}}},
+    "x-sp-defense": {"zh": "特防强化", "kind": "battle", "desc": "战斗中提升特防。", "effect": {"stat_boost": {"spd": 1}}},
+    "x-speed": {"zh": "速度强化", "kind": "battle", "desc": "战斗中提升速度。", "effect": {"stat_boost": {"spe": 1}}},
+    "dire-hit": {"zh": "要害强化", "kind": "battle", "desc": "战斗中提升会心一击率。", "effect": {"focus_energy": True}},
+    "guard-spec": {"zh": "要害防御", "kind": "battle", "desc": "防止对手要害一击。", "effect": {"guard_spec": True}},
+    # ── 树果(可携带或使用) ──
+    "oran-berry": {"zh": "橙橙果", "kind": "berry", "desc": "回复 10 HP。", "effect": {"heal_hp": 10}},
+    "cheri-berry": {"zh": "蔓莓果", "kind": "berry", "desc": "治愈麻痹。", "effect": {"cure_status": ["par"]}},
+    "chesto-berry": {"zh": "迷雾果", "kind": "berry", "desc": "唤醒睡眠。", "effect": {"cure_status": ["slp"]}},
+    "pecha-berry": {"zh": "桃桃果", "kind": "berry", "desc": "治愈中毒。", "effect": {"cure_status": ["psn", "tox"]}},
+    "rawst-berry": {"zh": "苦味果", "kind": "berry", "desc": "治愈灼伤。", "effect": {"cure_status": ["brn"]}},
+    "aspear-berry": {"zh": "亚开果", "kind": "berry", "desc": "治愈冰冻。", "effect": {"cure_status": ["frz"]}},
+    "lum-berry": {"zh": "木子果", "kind": "berry", "desc": "治愈任何异常状态。", "effect": {"cure_status": True}},
+    "sitrus-berry": {"zh": "文柚果", "kind": "berry", "desc": "回复最大 HP 的 1/4。", "effect": {"heal_hp_frac": 0.25}},
+    # ── 稀有用具 ──
+    "rare-candy": {"zh": "神奇糖果", "kind": "rare", "desc": "提升 1 级。", "effect": {"level_up": 1}},
+    "pp-up": {"zh": "PP 提升剂", "kind": "rare", "desc": "提升一个招式的 PP 上限。", "effect": {"pp_up": 1}},
+    "pp-max": {"zh": "PP 极限提升剂", "kind": "rare", "desc": "将招式的 PP 上限提到最大。", "effect": {"pp_up": 999}},
+    "ability-capsule": {"zh": "特性胶囊", "kind": "rare", "desc": "切换到另一个普通特性。", "effect": {"ability_switch": True}},
+    "ability-patch": {"zh": "特性膏药", "kind": "rare", "desc": "切换到隐藏特性。", "effect": {"ability_patch": True}},
+}
+
+# 进化石
+_STONES = {
+    "fire-stone": ("火之石", "Fire"),
+    "water-stone": ("水之石", "Water"),
+    "thunder-stone": ("雷之石", "Electric"),
+    "leaf-stone": ("叶之石", "Grass"),
+    "moon-stone": ("月之石", "Moon"),
+    "sun-stone": ("日之石", "Sun"),
+    "shiny-stone": ("光之石", "Shiny"),
+    "dusk-stone": ("暗之石", "Dusk"),
+    "dawn-stone": ("觉醒之石", "Dawn"),
+    "ice-stone": ("冰之石", "Ice"),
+}
+for _k, (_zh, _tag) in _STONES.items():
+    _BAG[_k] = {
+        "zh": _zh,
+        "kind": "stone",
+        "desc": "特定的宝可梦使用后会进化。",
+        "effect": {"evolve_stone": _tag},
+    }
+
+BAG_ITEMS: dict[str, dict] = _BAG
+_BAG_IDX: dict[str, str] = {}
+for _key, _v in BAG_ITEMS.items():
+    for _alias in (_key, _v["zh"]):
+        _BAG_IDX.setdefault(_norm(_alias), _key)
+
+KIND_ZH = {
+    "ball": "精灵球",
+    "medicine": "回复",
+    "status": "状态回复",
+    "revive": "复活",
+    "pp": "PP 回复",
+    "battle": "战斗强化",
+    "berry": "树果",
+    "rare": "稀有用具",
+    "stone": "进化石",
+}
+KIND_ORDER = ["ball", "medicine", "status", "revive", "pp", "battle", "berry", "stone", "rare"]
+
+
+def resolve_bag_item(query: str) -> tuple[str, dict] | None:
+    """把背包道具名解析成 (key, entry)。"""
+    if not query:
+        return None
+    raw = str(query).strip()
+    if raw in BAG_ITEMS:
+        return raw, BAG_ITEMS[raw]
+    key = _BAG_IDX.get(_norm(raw))
+    if key:
+        return key, BAG_ITEMS[key]
+    # 兼容持有道具表里的名字(背包里也可能存)
+    r = resolve_item(raw)
+    if r and r[0] in BAG_ITEMS:
+        return r[0], BAG_ITEMS[r[0]]
+    return None
+
+
+def bag_item_label(key: str | None) -> str:
+    if not key:
+        return ""
+    entry = BAG_ITEMS.get(key)
+    return entry["zh"] if entry else key

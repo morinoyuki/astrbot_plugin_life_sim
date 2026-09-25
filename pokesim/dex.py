@@ -278,9 +278,35 @@ class Dex:
         out.sort(key=lambda x: (x["level"] is None, x["level"] or 0, x["move"]))
         return out
 
+    def _own_learnset(self, species_key: str) -> dict[str, str]:
+        """仅该形态自己的招式表(不含进化前),用于等级提升与默认配招。"""
+        row = self.learnsets.get(species_key)
+        if row:
+            return row
+        base = (self.species.get(species_key) or {}).get("baseSpecies")
+        if base:
+            r = self.resolve_species(base)
+            if r:
+                return self.learnsets.get(r[0], {}) or {}
+        return {}
+
+    def level_up_moves(self, species_key: str, old_level: int, new_level: int) -> list[str]:
+        """返回在 (old_level, new_level] 区间内新学会的等级招(按等级升序)。"""
+        row = self._own_learnset(species_key)
+        got: list[tuple[int, str]] = []
+        for move, codes in row.items():
+            for c in codes.split(","):
+                if c.startswith("L"):
+                    lv = int(c[1:] or 0)
+                    if old_level < lv <= new_level:
+                        got.append((lv, move))
+                        break
+        got.sort()
+        return [m for _, m in got]
+
     def level_moves(self, species_key: str, level: int) -> list[str]:
-        """当前等级应已掌握的全部等级招(按习得等级升序)。"""
-        row = self.learnset(species_key)
+        """当前等级应已掌握的全部等级招(按习得等级升序,仅该形态自身)。"""
+        row = self._own_learnset(species_key)
         got: list[tuple[int, str]] = []
         for move, codes in row.items():
             for c in codes.split(","):
@@ -323,6 +349,79 @@ class Dex:
             if lv and level >= int(lv):
                 return e
         return None
+
+    # ─────────────── 经验 / 成长曲线 ───────────────
+
+    def growth_of(self, species_key: str) -> str:
+        e = self.species.get(species_key) or {}
+        if e.get("growthRate"):
+            return e["growthRate"]
+        base = e.get("baseSpecies")
+        if base:
+            r = self.resolve_species(base)
+            if r and r[1].get("growthRate"):
+                return r[1]["growthRate"]
+        return "medium"
+
+    def base_exp(self, species_key: str) -> int:
+        e = self.species.get(species_key) or {}
+        if e.get("baseExp"):
+            return int(e["baseExp"])
+        base = e.get("baseSpecies")
+        if base:
+            r = self.resolve_species(base)
+            if r and r[1].get("baseExp"):
+                return int(r[1]["baseExp"])
+        return 60
+
+    def exp_for_level(self, growth: str, level: int) -> int:
+        """升到 `level` 级所需的累计经验(第 3 世代后曲线)。"""
+        n = max(0, min(100, int(level)))
+        if n <= 0:
+            return 0
+        if growth == "fast":
+            val = 4 * n**3 / 5
+        elif growth == "medium-slow":
+            val = 6 * n**3 / 5 - 15 * n**2 + 100 * n - 140
+        elif growth == "slow":
+            val = 5 * n**3 / 4
+        elif growth == "slow-then-very-fast":
+            r = n % 3
+            if n <= 50:
+                val = n**3 * (100 - n) / 50
+            elif n <= 68:
+                val = n**3 * (150 - n) / 100
+            elif n <= 98:
+                val = n**3 * (1274 + r * r - 9 * r - 20 * (n // 3)) / 1000
+            else:
+                val = n**3 * (160 - n) / 100
+        elif growth == "fast-then-very-slow":
+            if n <= 15:
+                val = n**3 * (24 + (n + 1) // 3) / 50
+            elif n <= 35:
+                val = n**3 * (14 + n) / 50
+            else:
+                val = n**3 * (32 + n // 2) / 50
+        else:  # medium-fast
+            val = n**3
+        return max(0, int(val))
+
+    def level_from_exp(self, growth: str, exp: int) -> int:
+        """根据累计经验反推等级(1-100)。"""
+        exp = max(0, int(exp))
+        level = 1
+        while level < 100 and self.exp_for_level(growth, level + 1) <= exp:
+            level += 1
+        return level
+
+    def exp_yield(self, species_key: str, level: int, trainer: bool = False) -> int:
+        """击倒一只宝可梦获得的经验值(第 5 世代后简化公式)。"""
+        base = self.base_exp(species_key)
+        lv = max(1, int(level))
+        exp = base * lv // 7
+        if trainer:
+            exp = exp * 3 // 2
+        return max(1, exp)
 
 
 def _sort_methods(codes: set[str]) -> list[str]:

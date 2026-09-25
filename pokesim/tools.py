@@ -9,20 +9,43 @@
 
 from __future__ import annotations
 
+import re
+
 from .dex import STAT_ORDER, get_dex
 from .engine import (
     STATUS_ZH,
     Battle,
     Pokemon,
+    Side,
     battle_from_dict,
     battle_to_dict,
     create_pokemon,
     start_battle,
 )
-from .items import item_label, resolve_item
+from .items import (
+    BAG_ITEMS,
+    KIND_ORDER,
+    KIND_ZH,
+    bag_item_label,
+    item_label,
+    resolve_bag_item,
+    resolve_item,
+)
 from .store import PokeStore
 
 MAX_PARTY = 6
+
+_STAT_ALIAS = {
+    "攻击": "atk",
+    "物攻": "atk",
+    "防御": "def",
+    "物防": "def",
+    "特攻": "spa",
+    "特防": "spd",
+    "速度": "spe",
+    "体力": "hp",
+    "生命": "hp",
+}
 
 
 class PokemonMixin:
@@ -40,22 +63,20 @@ class PokemonMixin:
         return store
 
     def _poke_scope(self, event) -> str:
-        """与模拟会话同域:群聊=群号,私聊=用户 id。"""
-        try:
-            if hasattr(self, "_sim_session_key"):
-                return str(self._sim_session_key(event))
-        except Exception:
-            pass
+        """每个玩家一支队伍:群聊=群号+用户 id(支持多玩家),私聊=用户 id。"""
         try:
             gid = str(event.get_group_id() or "")
         except Exception:
             gid = ""
-        if gid:
-            return gid
         try:
-            return str(event.get_sender_id())
+            uid = str(event.get_sender_id() or "")
         except Exception:
-            return "default"
+            uid = ""
+        if gid and uid:
+            return f"group_{gid}_{uid}"
+        if gid:
+            return f"group_{gid}"
+        return uid or "default"
 
     def _poke_load(self, event) -> dict:
         return self._poke_store().load(self._poke_scope(event))
@@ -150,6 +171,18 @@ class PokemonMixin:
             + (f" | 道具 {item_label(mon.item)}" if mon.item else "")
             + f" | 太晶 {dex.type_label(mon.tera_type)}"
         )
+        if mon.level < 100:
+            growth = dex.growth_of(mon.species)
+            base = dex.exp_for_level(growth, mon.level)
+            need = dex.exp_for_level(growth, mon.level + 1)
+            lines.append(
+                f"   经验 {mon.exp - base}/{need - base} (累计 {mon.exp})"
+            )
+        evs = " ".join(
+            f"{dex.stat_label(s)}+{v}" for s, v in mon.evs.items() if v
+        )
+        if evs:
+            lines.append(f"   努力值: {evs}")
         mv = []
         for m in mon.moves:
             info = dex.moves.get(m) or {}
@@ -386,11 +419,32 @@ class PokemonMixin:
                 get_dex().species.get(b.get("species", ""), {}).get("zh", b.get("species", ""))
                 for b in box
             ))
+        bag_line = self._fmt_bag(data)
+        if bag_line:
+            lines.append(bag_line)
         b = data.get("battle")
         if b:
             battle = battle_from_dict(b)
             lines.append("\n⚔️ 当前对战:\n" + battle.summary())
         return "\n".join(lines)
+
+    @staticmethod
+    def _fmt_bag(data: dict) -> str:
+        bag = data.get("bag") or {}
+        if not bag:
+            return "🎒 背包: 空"
+        by_kind: dict[str, list[str]] = {}
+        for key, cnt in bag.items():
+            entry = BAG_ITEMS.get(key)
+            label = entry["zh"] if entry else key
+            kind = (entry or {}).get("kind", "other")
+            by_kind.setdefault(kind, []).append(f"{label}×{cnt}")
+        order = KIND_ORDER + [k for k in by_kind if k not in KIND_ORDER]
+        parts = []
+        for kind in order:
+            if kind in by_kind:
+                parts.append(f"{KIND_ZH.get(kind, kind)}: " + "、".join(by_kind[kind]))
+        return "🎒 背包: " + " | ".join(parts)
 
     async def poke_add_pokemon(
         self,
@@ -658,6 +712,402 @@ class PokemonMixin:
         self._poke_save(event, data)
         return f"💊 全队已回复({len(party)} 只)。"
 
+    # ──────────────────────────── 训练 / 升级 / 多玩家 ────────────────────────────
+
+    async def poke_trainer(self, event, name: str = "") -> str:
+        """设置或查看自己的训练家名称(用于多玩家/PvP 显示)。
+
+        Args:
+            name(string): Optional. 训练家名称;留空则查看当前名称。
+        """
+        data = self._poke_load(event)
+        if not name:
+            return f"🗃️ 训练家: {data.get('trainer') or '(未设置)'} | 队伍 {len(self._party_of(data))} 只"
+        data["trainer"] = str(name).strip()
+        self._poke_save(event, data)
+        return f"✅ 训练家名称已设为「{data['trainer']}」。"
+
+    async def poke_trainers(self, event) -> str:
+        """列出同群内所有玩家的训练家与队伍概况(用于多玩家/淘汰赛编排)。
+
+        Args: 无。
+        """
+        gid = ""
+        try:
+            gid = str(event.get_group_id() or "")
+        except Exception:
+            gid = ""
+        store = self._poke_store()
+        rows = []
+        prefix = f"group_{gid}_"
+        for fn in store.list_scopes():
+            d = store.load(fn)
+            scope = str(d.get("scope") or fn)
+            if gid and not scope.startswith(prefix):
+                continue
+            party = d.get("party") or []
+            if not party:
+                continue
+            mons = [Pokemon.from_dict(p) for p in party]
+            best = max((m.level for m in mons), default=0)
+            uid = scope.removeprefix(prefix)
+            rows.append((d.get("trainer") or f"玩家{uid}", len(party), best, uid))
+        if not rows:
+            return "本群还没有其他训练家。用 poke_trainer 设置名称后开始集结吧。"
+        rows.sort(key=lambda r: -r[2])
+        lines = ["🏆 本群训练家一览(按最高等级):"]
+        for name, n, best, uid in rows:
+            lines.append(f"- {name} [uid={uid}] | {n} 只 | 最高 Lv{best}")
+        lines.append("(与某人对战:poke_battle_pvp opponent=\"<uid>\")")
+        return "\n".join(lines)
+
+    async def poke_train(self, event, target: str, sessions: int = 5, focus: str = "") -> str:
+        """训练宝可梦:获得经验并可提升某项努力值(触发升级/学招/进化)。
+
+        Args:
+            target(string): 队伍序号(1 起)或名称。
+            sessions(int): Optional. 训练量(1-50),越大获得经验/努力值越多,默认 5。
+            focus(string): Optional. 重点训练的能力(攻击/防御/特攻/特防/速度/HP,或 atk/def/spa/spd/spe);留空则不加努力值。
+        """
+        dex = get_dex()
+        data = self._poke_load(event)
+        found = self._find_member(data, target)
+        if not found:
+            return f"❌ 队伍里找不到「{target}」。"
+        _idx, p = found
+        mon = Pokemon.from_dict(p)
+        n = max(1, min(50, int(sessions or 5)))
+        msgs: list[str] = []
+        stat = self._resolve_stat(focus)
+        if focus and not stat:
+            return f"❌ 未知的训练方向「{focus}」。"
+        if stat:
+            cur = dict(mon.evs or {})
+            total = sum(int(v) for v in cur.values())
+            cur_val = int(cur.get(stat, 0))
+            gain = min(10 * n, 252 - cur_val, max(0, 510 - total))
+            if gain > 0:
+                cur[stat] = cur_val + gain
+                mon.evs = cur
+                mon.stats = dex.compute_stats(
+                    mon.species, mon.level, mon.ivs, mon.evs, mon.nature
+                )
+                mon.max_hp = mon.stats["hp"]
+                mon.cur_hp = min(mon.cur_hp, mon.max_hp)
+                msgs.append(
+                    f"💪 努力值 {dex.stat_label(stat)} +{gain}(现 {cur[stat]})"
+                )
+            else:
+                msgs.append(f"💪 {dex.stat_label(stat)} 的努力值已满。")
+        exp_gain = max(50, dex.base_exp(mon.species) * n * 2)
+        msgs += self._gain_exp(mon, exp_gain)
+        msgs.insert(0, f"🏋️ {mon.display} 完成了 {n} 轮训练(获得 {exp_gain} 经验)。")
+        p.clear()
+        p.update(mon.to_dict())
+        self._poke_save(event, data)
+        return "\n".join(msgs)
+
+    @staticmethod
+    def _resolve_stat(focus: str) -> str:
+        if not focus:
+            return ""
+        dex = get_dex()
+        f = str(focus).strip()
+        low = f.lower()
+        for s in STAT_ORDER:
+            if low in (s, dex.stat_label(s).lower()):
+                return s
+        return _STAT_ALIAS.get(f, "")
+
+    def _gain_exp(self, mon: Pokemon, amount: int) -> list[str]:
+        """增加经验并根据成长曲线升级(自动学招/进化),返回日志。"""
+        dex = get_dex()
+        msgs: list[str] = []
+        if amount:
+            mon.exp = int(mon.exp) + int(amount)
+        growth = dex.growth_of(mon.species)
+        while mon.level < 100 and mon.exp >= dex.exp_for_level(growth, mon.level + 1):
+            old_max = mon.max_hp
+            old_level = mon.level
+            mon.level += 1
+            mon.stats = dex.compute_stats(
+                mon.species, mon.level, mon.ivs, mon.evs, mon.nature
+            )
+            mon.max_hp = mon.stats["hp"]
+            mon.cur_hp = min(
+                mon.max_hp, mon.cur_hp + max(0, mon.max_hp - old_max)
+            )
+            msgs.append(f"⬆️ {mon.display} 升到了 Lv{mon.level}!")
+            for mv in dex.level_up_moves(mon.species, old_level, mon.level):
+                if mv in mon.moves:
+                    continue
+                label = (dex.moves.get(mv) or {}).get("zh", mv)
+                if len(mon.moves) < 4:
+                    mon.moves.append(mv)
+                    mon.pp[mv] = int((dex.moves.get(mv) or {}).get("pp", 10) or 10)
+                    msgs.append(f"   {mon.display} 学会了「{label}」!")
+                else:
+                    msgs.append(
+                        f"   {mon.display} 想学「{label}」,但招式已满(用 poke_learn_move 替换)。"
+                    )
+            evo = dex.evolution(mon.species, mon.level)
+            if evo and not (dex.species.get(evo) or {}).get("battleOnly"):
+                old_zh = mon.entry.get("zh", mon.species)
+                mon.species = evo
+                mon.stats = dex.compute_stats(
+                    evo, mon.level, mon.ivs, mon.evs, mon.nature
+                )
+                mon.max_hp = mon.stats["hp"]
+                mon.cur_hp = mon.max_hp
+                mon.fainted = False
+                mon.faint_logged = False
+                msgs.append(
+                    f"   ✨ {old_zh} 进化成了 {dex.species.get(evo, {}).get('zh', evo)}!"
+                )
+        return msgs
+
+    def _award_battle_exp(self, battle: Battle) -> list[str]:
+        """战斗胜利后,给存活的我方宝可梦分配经验(含升级/学招/进化日志)。"""
+        dex = get_dex()
+        if (
+            not battle.finished
+            or battle.winner != "player"
+            or battle.escaped
+            or battle.captured
+        ):
+            return []
+        defeated = [p for p in battle.enemy.party if p.fainted]
+        if not defeated:
+            return []
+        total = sum(
+            dex.exp_yield(p.species, p.level, trainer=not battle.wild)
+            for p in defeated
+        )
+        participants = [p for p in battle.player.party if not p.fainted]
+        if not participants:
+            participants = [p for p in battle.player.party if p.cur_hp > 0]
+        if not participants:
+            return []
+        share = max(1, total // len(participants))
+        msgs = [f"💰 获得经验总计 {total}(每只 {share})。"]
+        for p in participants:
+            msgs += self._gain_exp(p, share)
+        return msgs
+
+    async def poke_battle_pvp(self, event, opponent: str, weather: str = "", terrain: str = "") -> str:
+        """与另一位玩家的真实队伍对战(PvP,双方 HP/PP/异常都会写回各自存档)。
+
+        Args:
+            opponent(string): 对手的 QQ/用户 id(可直接写数字,或 "@123" / "<@123>")。
+            weather(string): Optional. 开场天气: sun/rain/sand/snow 或 晴天/下雨/沙暴/下雪。
+            terrain(string): Optional. 开场场地: electric/grassy/misty/psychic。
+        """
+        data = self._poke_load(event)
+        party = self._party_of(data)
+        if not party:
+            return "❌ 队伍是空的,先用 poke_add_pokemon 添加宝可梦。"
+        player_party = [Pokemon.from_dict(p) for p in party]
+        if not any(not m.fainted for m in player_party):
+            return "❌ 我方全队已失去战斗能力,先用 poke_heal_party。"
+        opp_scope = self._resolve_opp_scope(event, opponent)
+        if not opp_scope:
+            return "❌ 无法识别对手,请提供对手的 QQ/用户 id。"
+        if opp_scope == self._poke_scope(event):
+            return "❌ 不能和自己对战。"
+        opp_data = self._poke_store().load(opp_scope)
+        opp_party = opp_data.get("party") or []
+        if not opp_party:
+            return f"❌ 对手 {opp_data.get('trainer') or opp_scope} 还没有队伍。"
+        enemy_party = [Pokemon.from_dict(p) for p in opp_party]
+        if not any(not m.fainted for m in enemy_party):
+            return "❌ 对手全队已失去战斗能力。"
+        for m in enemy_party:
+            m.tera_type = m.tera_type or m.original_types[0]
+        battle = start_battle(
+            player_party,
+            enemy_party,
+            weather=weather,
+            terrain=terrain,
+            seed=int(data.get("updated_at", 0) or 0) % 100000,
+            wild=False,
+            bag=data.get("bag") or {},
+        )
+        lines = battle.start()
+        name = opp_data.get("trainer") or opp_scope
+        bd = battle_to_dict(battle)
+        bd["pvp_scope"] = opp_scope
+        bd["pvp_name"] = name
+        data["party"] = [m.to_dict() for m in player_party]
+        data["battle"] = bd
+        self._poke_save(event, data)
+        self._sync_pvp(opp_scope, battle)
+        return (
+            f"⚔️ PvP 对战开始:你 vs {name}!\n"
+            + "\n".join(lines)
+            + "\n\n"
+            + battle.summary()
+        )
+
+    def _resolve_opp_scope(self, event, opponent: str) -> str:
+        raw = str(opponent or "").strip()
+        if not raw:
+            return ""
+        if raw.startswith(("group_", "user_")):
+            return raw
+        m = re.search(r"\d{3,}", raw)
+        if not m:
+            return ""
+        uid = m.group(0)
+        try:
+            gid = str(event.get_group_id() or "")
+        except Exception:
+            gid = ""
+        return f"group_{gid}_{uid}" if gid else uid
+
+    def _sync_pvp(self, opp_scope: str, battle: Battle) -> None:
+        """把 PvP 中对手队伍的最新状态写回对手存档。"""
+        store = self._poke_store()
+        od = store.load(opp_scope)
+        od["party"] = [m.to_dict() for m in battle.enemy.party]
+        store.save(opp_scope, od)
+
+    # ──────────────────────────── 背包 / 道具 ────────────────────────────
+
+    async def poke_bag(self, event, item: str = "", count: int = 1) -> str:
+        """查看或修改背包道具。不给 item 时查看当前背包。
+
+        Args:
+            item(string): Optional. 道具名称(中/英/标识,如 "精灵球" / "pokeball" / "potion");留空则只查看。
+            count(int): Optional. 变更数量:正数获得,负数消耗/丢弃,默认 1。
+        """
+        data = self._poke_load(event)
+        party = self._party_of(data)
+        bag = data.setdefault("bag", {})
+        if not item:
+            return self._fmt_bag(data)
+        r = resolve_bag_item(item)
+        if r is None:
+            return f"❌ 背包里没有收录「{item}」这种道具。"
+        key, entry = r
+        n = int(count or 1)
+        if n == 0:
+            return "❌ count 不能为 0。"
+        if n > 0:
+            bag[key] = int(bag.get(key, 0)) + n
+        else:
+            have = int(bag.get(key, 0))
+            if have <= 0:
+                return f"❌ 背包里没有 {entry['zh']}。"
+            bag[key] = have + n
+            if bag[key] <= 0:
+                del bag[key]
+        self._poke_save(event, data)
+        return f"✅ 背包已更新:\n{self._fmt_bag(data)}" + (
+            f"\n(队伍 {len(party)} 只)" if party else ""
+        )
+
+    async def poke_use_item(self, event, target: str, item: str) -> str:
+        """对队伍中的宝可梦使用道具(战斗外):伤药 / 状态回复 / 复活 / PP 回复 /进化石 / 神奇糖果等。
+
+        Args:
+            target(string): 队伍序号(1 起)或名称。
+            item(string): 道具名称(中/英/标识,如 "伤药" / "potion" / "火之石")。
+        """
+        dex = get_dex()
+        data = self._poke_load(event)
+        if data.get("battle") and not (data["battle"] or {}).get("finished"):
+            return "⚠️ 对战中请用 poke_battle_turn 的 \"item 道具名\" 行动。"
+        found = self._find_member(data, target)
+        if not found:
+            return f"❌ 队伍里找不到「{target}」。"
+        _idx, p = found
+        r = resolve_bag_item(item)
+        if r is None:
+            return f"❌ 未收录道具「{item}」。"
+        key, entry = r
+        bag = data.setdefault("bag", {})
+        if int(bag.get(key, 0)) <= 0:
+            return f"❌ 背包里没有 {entry['zh']}。"
+        mon = Pokemon.from_dict(p)
+        eff = entry.get("effect") or {}
+        msgs: list[str] = []
+        consumed = True
+
+        # ── 进化石 ──
+        if eff.get("evolve_stone"):
+            new_key = self._stone_evolution(dex, mon.species, key)
+            if not new_key:
+                return f"⚠️ {mon.display} 对 {entry['zh']} 没有反应。"
+            old = mon.display
+            mon.species = new_key
+            mon.stats = dex.compute_stats(new_key, mon.level, mon.ivs, mon.evs, mon.nature)
+            mon.max_hp = mon.stats["hp"]
+            mon.full_heal()
+            msgs.append(f"✨ {old} 使用了 {entry['zh']},进化成了 {dex.species[new_key]['zh']}!")
+        # ── 神奇糖果 ──
+        elif eff.get("level_up"):
+            if mon.level >= 100:
+                return f"⚠️ {mon.display} 已经是 100 级。"
+            mon.level = min(100, mon.level + int(eff["level_up"]))
+            mon.stats = dex.compute_stats(mon.species, mon.level, mon.ivs, mon.evs, mon.nature)
+            mon.max_hp = mon.stats["hp"]
+            mon.full_heal()
+            msgs.append(f"{mon.display} 升到了 Lv{mon.level}!")
+        # ── 特性胶囊 / 膏药 ──
+        elif eff.get("ability_switch") or eff.get("ability_patch"):
+            slots = dex.species.get(mon.species, {}).get("abilities") or {}
+            want_hidden = bool(eff.get("ability_patch"))
+            cands = []
+            for slot, an in slots.items():
+                is_hidden = slot == "H"
+                if is_hidden != want_hidden:
+                    continue
+                ar = dex.resolve_ability(an)
+                if ar and ar[0] != mon.ability:
+                    cands.append(ar[0])
+            if not cands:
+                return f"⚠️ {mon.display} 没有可切换的特性。"
+            mon.ability = cands[0]
+            msgs.append(f"{mon.display} 的特性变成了 {mon.ability_name}!")
+        # ── 回复 / 状态 / 复活 / PP ──
+        else:
+            if mon.fainted and not (eff.get("revive") or eff.get("revive_full")):
+                return f"⚠️ {mon.display} 已失去战斗能力,需要用复活类道具。"
+            battle = Battle(
+                player=Side(name="player", party=[mon]),
+                enemy=Side(name="enemy", party=[]),
+            )
+            battle._apply_item_effect(mon, eff)
+            msgs.append(f"{mon.display} 使用了 {entry['zh']}。")
+            msgs.extend(battle.log)
+
+        if not msgs:
+            return f"⚠️ 无法对 {mon.display} 使用 {entry['zh']}。"
+        p.clear()
+        p.update(mon.to_dict())
+        if consumed:
+            bag[key] = int(bag.get(key, 0)) - 1
+            if bag[key] <= 0:
+                del bag[key]
+        self._poke_save(event, data)
+        return "\n".join(msgs)
+
+    @staticmethod
+    def _stone_evolution(dex, species: str, stone_key: str) -> str:
+        """找该宝可梦用对应进化石能变成的形态(比对 evoItem 英文名)。"""
+        entry = dex.species.get(species) or {}
+        zh = bag_item_label(stone_key)
+        for e in entry.get("evos") or []:
+            cand = dex.species.get(e) or {}
+            if cand.get("battleOnly"):
+                continue
+            item = str(cand.get("evoItem") or "")
+            if not item:
+                continue
+            if item == zh or item.lower().replace(" ", "-") == stone_key:
+                return e
+        return ""
+
     # ──────────────────────────── 对战工具 ────────────────────────────
 
     async def poke_battle_start(
@@ -670,6 +1120,7 @@ class PokemonMixin:
         enemy_item: str = "",
         weather: str = "",
         terrain: str = "",
+        wild: bool = True,
     ) -> str:
         """开始一场宝可梦对战(单打)。对手以分号分隔多只组成训练家队伍。
 
@@ -681,6 +1132,7 @@ class PokemonMixin:
             enemy_item(string): Optional. 对手道具(仅单只时生效)。
             weather(string): Optional. 开场天气: sun/rain/sand/snow 或 晴天/下雨/沙暴/下雪。
             terrain(string): Optional. 开场场地: electric/grassy/misty/psychic。
+            wild(bool): Optional. 是否野生战(可投球捕获/可逃跑)。多只对手时自动视为训练家战;默认 true。
         """
         data = self._poke_load(event)
         party = self._party_of(data)
@@ -723,12 +1175,20 @@ class PokemonMixin:
             weather=weather,
             terrain=terrain,
             seed=int(data.get("updated_at", 0) or 0) % 100000 + len(entries),
+            wild=bool(wild) and len(enemy_party) == 1,
+            bag=data.get("bag") or {},
         )
         lines = battle.start()
         data["party"] = [m.to_dict() for m in player_party]
         data["battle"] = battle_to_dict(battle)
         self._poke_save(event, data)
-        return "\n".join(lines) + "\n\n" + battle.summary()
+        kind = "野生" if battle.wild else "训练家"
+        return (
+            f"⚔️ {kind}对战开始!\n"
+            + "\n".join(lines)
+            + "\n\n"
+            + battle.summary()
+        )
 
     async def poke_battle_status(self, event) -> str:
         """查看当前对战状态与最近一次行动日志。
@@ -741,6 +1201,8 @@ class PokemonMixin:
             return "当前没有进行中的对战。"
         battle = battle_from_dict(b)
         out = battle.summary()
+        if b.get("pvp_name"):
+            out = f"【PvP vs {b['pvp_name']}】\n" + out
         if battle.log:
             out += "\n\n最近日志:\n" + "\n".join(battle.log[-12:])
         return out
@@ -749,7 +1211,7 @@ class PokemonMixin:
         """推进一回合对战。会返回结算日志与最新状态。
 
         Args:
-            action(string): 我方行动。格式:"move 招式名"(出招)、"tera move 招式名"(太晶化后出招)、"switch 序号"(换人)、"forfeit"(认输)。也可只写招式名。
+            action(string): 我方行动。支持 "move 招式名"(出招)、"tera move 招式名"(太晶化后出招)、"switch 序号"(换人)、"item 道具名"(战斗中使用背包道具)、"catch 精灵球名"(野生战投球)、"run"(野生战逃走)、"forfeit"(认输);也可只写招式名。
             enemy_action(string): Optional. 对手行动,默认 "auto" 由 AI 决定;也可写成与 action 相同的格式。
         """
         data = self._poke_load(event)
@@ -757,6 +1219,7 @@ class PokemonMixin:
         if not b:
             return "❌ 当前没有进行中的对战,请先 poke_battle_start。"
         battle = battle_from_dict(b)
+        already_finished = battle.finished
         pa = self._parse_battle_action(action, battle, side="player")
         if isinstance(pa, str):
             return pa
@@ -767,13 +1230,46 @@ class PokemonMixin:
             if isinstance(ea, str):
                 return ea
         lines = battle.step(pa, ea)
-        data["battle"] = battle_to_dict(battle)
-        # 同步我方队伍状态(HP/PP/异常)
+        pvp_scope = b.get("pvp_scope")
+        exp_msgs = [] if already_finished else self._award_battle_exp(battle)
+        bd = battle_to_dict(battle)
+        if pvp_scope:
+            bd["pvp_scope"] = pvp_scope
+            bd["pvp_name"] = b.get("pvp_name")
+        data["battle"] = bd
+        # 同步我方队伍状态(HP/PP/异常)与背包
         data["party"] = [m.to_dict() for m in battle.player.party]
+        data["bag"] = dict(battle.bag)
+        if pvp_scope:
+            self._sync_pvp(pvp_scope, battle)
+        # 捕获成功:把宝可梦加入队伍(满则进电脑)
+        extra = ""
+        if battle.captured:
+            caught = Pokemon.from_dict(battle.captured)
+            party = self._party_of(data)
+            if len(party) < MAX_PARTY:
+                party.append(caught.to_dict())
+                extra = f"\n📥 {caught.display} 加入了队伍!"
+            else:
+                data.setdefault("box", []).append(caught.to_dict())
+                extra = f"\n📦 队伍已满,{caught.display} 被送进了电脑。"
+            battle.captured = None
+            data["battle"] = battle_to_dict(battle)
+            if pvp_scope:
+                data["battle"]["pvp_scope"] = pvp_scope
+                data["battle"]["pvp_name"] = b.get("pvp_name")
         self._poke_save(event, data)
         out = "\n".join(lines)
+        if exp_msgs:
+            out += "\n" + "\n".join(exp_msgs)
         if battle.finished:
-            out += "\n\n🏁 " + ("胜利!对方全灭。" if battle.winner == "player" else "败北……我方全灭。")
+            if battle.escaped:
+                out += "\n\n🏁 成功逃走了。"
+            elif battle.winner == "player":
+                out += "\n\n🏁 胜利!对方全灭。"
+            else:
+                out += "\n\n🏁 败北……我方全灭。"
+        out += extra
         out += "\n\n" + battle.summary()
         return out
 
@@ -783,8 +1279,14 @@ class PokemonMixin:
         Args: 无。
         """
         data = self._poke_load(event)
-        if not data.get("battle"):
+        b = data.get("battle")
+        if not b:
             return "当前没有进行中的对战。"
+        if b.get("pvp_scope"):
+            self._sync_pvp(
+                b["pvp_scope"],
+                battle_from_dict(b),
+            )
         data["battle"] = None
         self._poke_save(event, data)
         return "✅ 已结束对战。"
@@ -798,6 +1300,32 @@ class PokemonMixin:
         low = s.lower()
         if low in ("forfeit", "认输", "投降", "放弃"):
             return {"type": "forfeit"}
+        if low in ("run", "escape", "逃走", "逃跑", "逃"):
+            return {"type": "run"}
+        # 使用道具
+        for kw in ("item ", "use ", "道具 ", "使用 "):
+            if low.startswith(kw):
+                name = s[len(kw):].strip()
+                r = resolve_bag_item(name)
+                if r is None:
+                    return f"❌ 未收录道具「{name}」。"
+                if r[1].get("kind") == "ball":
+                    return f"❌ {r[1]['zh']}是精灵球,请用 \"catch {r[1]['zh']}\"。"
+                return {"type": "item", "item": r[0]}
+        # 投球捕获
+        for kw in ("catch", "ball", "throw", "投球", "捕获", "捕捉"):
+            if low.startswith(kw):
+                name = s[len(kw):].strip()
+                if not name:
+                    key = "poke-ball"
+                else:
+                    r = resolve_bag_item(name)
+                    if r is None:
+                        return f"❌ 未收录精灵球「{name}」。"
+                    if r[1].get("kind") != "ball":
+                        return f"❌ {r[1]['zh']}不是精灵球。"
+                    key = r[0]
+                return {"type": "catch", "item": key}
         tera = False
         if low.startswith("tera ") or s.startswith("太晶"):
             tera = True
