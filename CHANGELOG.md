@@ -2,6 +2,23 @@
 
 本文件记录自 v1.0.0 以来的全部改动，版本与仓库语义化版本保持一致。
 
+## [1.2.0] - 2026-09-26
+
+### ✨ 新增功能
+
+- **模式 P — 宝可梦世界**:新增内置 Gen9 数据的宝可梦玩法模式,可由关键词/LLM 自动识别,也可用 `/创建 宝可梦 <设定>` 强制开启。
+  - **内置数据**(`pokesim/static/`,由 `tools/build_pokemon_data.py` 从 Pokémon Showdown + PokeAPI 生成):1480 种形态(含 Mega/地区形态/悖谬种)、950 个招式、320 个特性、属性相克表、招式学习表、性格;中英双语名称与效果说明;运行时不联网、不依赖第三方库。
+  - **确定性对战引擎**(`pokesim/engine.py`):第 5 世代以后的伤害公式、属性相克(STAB/太晶)、会心/随机数/天气/场地/墙/入场陷阱、异常状态、能力等级、混乱/寄生种子、常用特性与道具、换人与倒下替换、seed 驱动的可复现随机。
+  - **太晶化**:本系太晶 STAB ×2(其它属性按原系计);星晶保留原属性防御并对原属性招式给 1.2 倍加成;`Tera Blast` 随太晶属性变化;对手可由 AI 自行太晶。
+  - **17 个 `poke_*` 工具**:`poke_dex_species/move/ability/item`、`poke_type_matchup`、`poke_learnset`、`poke_team`、`poke_add_pokemon`、`poke_remove_pokemon`、`poke_learn_move`、`poke_edit_pokemon`、`poke_evolve`、`poke_heal_party`、`poke_battle_start/status/turn/end`。
+  - **队伍持久化**:`<data_dir>/pokemon/<scope>.json`,过 6 只自动进电脑;队伍与对战状态已接入 `/undo` / `/redo` 快照回滚,`/删除` / `/创建` 时清理。
+  - **新指令 `/队伍`**(别名 `team` / `宝可梦队伍`):直接查看队伍与对战状态。
+- **配置**:新增 `provider_mode_p`(模式 P 专属模型路由)。
+
+### 📦 工程化
+
+- 新增数据构建脚本 `tools/build_pokemon_data.py` 与测试 `tests/test_pokesim.py`;`.gitignore` 添加 `.pokemon_cache/` / `.pokemon_build/`。
+
 ## [1.1.0] - 2026-09-02
 
 ### ✨ 新增功能

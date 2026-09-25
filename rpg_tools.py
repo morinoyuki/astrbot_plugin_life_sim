@@ -647,12 +647,23 @@ class RPGMixin:
         群聊 scope = `{group_id}_*.json` 全部角色 + 同 group_id 的全部 session。
         私聊 scope = 当前 sender 的存档 + 该存档引用的 session(避免误删别人的私聊存档)。
         """
-        if mode not in ("B", "C"):
+        if mode not in ("B", "C", "P"):
             return {
                 "scope": {"group_id": "", "sender_uid": ""},
                 "chars": {},
                 "sessions": {},
             }
+
+        # 模式 P(宝可梦):没有 RPG 角色/会话,只需要快照队伍与对战状态。
+        if mode == "P":
+            scope = {
+                "group_id": self._get_group_id(event),
+                "sender_uid": self._uid(event),
+            }
+            snap: dict = {"scope": scope, "chars": {}, "sessions": {}}
+            if hasattr(self, "pokemon_capture"):
+                snap["pokemon"] = self.pokemon_capture(event)
+            return snap
 
         store = self.rpg_store
         group_id = self._get_group_id(event)
@@ -711,6 +722,10 @@ class RPGMixin:
         sender_uid = scope.get("sender_uid", "") or ""
         chars_snap: dict = snapshot.get("chars") or {}
         sessions_snap: dict = snapshot.get("sessions") or {}
+
+        # 宝可梦队伍/对战状态回滚(模式 P)
+        if snapshot.get("pokemon") is not None and hasattr(self, "pokemon_apply"):
+            self.pokemon_apply(snapshot["pokemon"])
 
         stats = {
             "restored_chars": 0,

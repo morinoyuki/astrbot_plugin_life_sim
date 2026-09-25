@@ -2,6 +2,7 @@
 - 模式 A: 纯叙事(默认)
 - 模式 B: 游戏世界 RPG(HP/等级/装备/经验) — 来自 rpg_tools.RPGMixin
 - 模式 C: DND 跑团(RPG + D20 骰子) — 来自 dice.DiceMixin
+- 模式 P: 宝可梦世界(Gen9 数据 + 培养/对战/太晶化) — 来自 pokesim.tools.PokemonMixin
 - 独立上下文: 叙事历史 KV 存储 + 显式 contexts
 - 4 个指令: /创建 /do /进度 /删除
 """
@@ -47,6 +48,7 @@ from .im_render import markdown as _md
 from .im_render.engine import render_narrative
 from .md_to_image import MdToImageMixin
 from .memory_store import MemoryStore
+from .pokesim.tools import PokemonMixin
 from .prompts import (
     CHAT_CARD_PROMPT,
     HELP_TEXT,
@@ -742,7 +744,7 @@ def _compact_rpg_versions(session: dict) -> None:
         if isinstance(vi, int) and 0 <= vi < len(old_versions):
             body = old_versions[vi]
         else:
-            body = {k: snap[k] for k in ("chars", "sessions") if k in snap}
+            body = {k: snap[k] for k in ("chars", "sessions", "pokemon") if k in snap}
         key = json.dumps(body, sort_keys=True, ensure_ascii=False)
         new_vi = index.get(key)
         if new_vi is None:
@@ -928,7 +930,7 @@ class _LifeSimToolHooks(BaseAgentRunHooks[AstrAgentContext]):
                 )
 
 
-class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
+class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
     def __init__(self, context: Context, config: AstrBotConfig = None):
         super().__init__(context)
         self.data_dir = StarTools.get_data_dir()
@@ -950,6 +952,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         self._sim_locks: dict[str, asyncio.Lock] = {}
         # 运行时工具集缓存(懒构建)— 工具集在运行期不变,避免每轮重建 + 重复解析 docstring
         self._cached_tool_set = None
+        self._cached_mode_tool_sets: dict[str, ToolSet] = {}
         # 工具调用期间的 lore 暂存:{event_key: {"world_lore": [...], "character_lore": {...}}}
         # 工具 handler 只写这里,_generate 结束时统一合并到 session 并落库,
         # 避免工具内 _load_sim 拿到新 dict B 后又被外层旧 dict A 全量覆写。
@@ -1200,6 +1203,12 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         await self.sim_store.delete(key)
         # 头像按 scope 分区,随会话一起清除(默认头像在根目录,不动)
         self.avatar_store.clear_scope(key)
+        # 宝可梦队伍/对战存档随会话清除
+        try:
+            if hasattr(self, "pokemon_purge"):
+                self.pokemon_purge(event)
+        except Exception as e:
+            logger.debug(f"life-sim: 清理宝可梦存档失败: {e}")
         n_mem = await self.memory_store.delete_scope(key)
         self._last_clear_mem_count = n_mem
         return await self.branch_store.delete_scope(key)
@@ -1919,9 +1928,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
     @staticmethod
     def _is_my_tool(name: str) -> bool:
-        """过滤:只保留本插件的工具(rpg_*/roll_dice/life_sim_save_*/life_sim_get_*/life_sim_revise_narrative/life_sim_recall_memory/life_sim_forget_memory)。"""
+        """过滤:只保留本插件的工具(rpg_*/poke_*/roll_dice/life_sim_*)。"""
         return bool(name) and (
-            name.startswith("rpg_")
+            name.startswith(("rpg_", "poke_"))
             or name
             in {
                 "roll_dice",
@@ -1934,22 +1943,50 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             }
         )
 
-    def _build_my_tool_set(self) -> ToolSet:
+    def _build_my_tool_set(self, mode: str = "") -> ToolSet:
         """直接从 self 自己的方法里收集本插件的工具,构建 ToolSet。
 
         不依赖 provider_manager.llm_tools(那是个间接层,会因版本/配置变化而不可用)。
-        我们的工具就在 self 上(dir(self) 能拿到),匹配 rpg_*/roll_dice 名称即可。
+        我们的工具就在 self 上(dir(self) 能拿到),匹配 rpg_*/poke_*/roll_dice 名称即可。
 
         对每个匹配的 bound method,解析其 docstring 构造 parameters schema(让 LLM 知道
         怎么调用),再 new 一个 FunctionTool(handler=bound,parameters=...) 装入 ToolSet。
         用 bound method 作为 handler 避免 unbound 调用时 event 变 self 的 bug。
 
-        运行时工具集不变,结果懒缓存到 self._cached_tool_set,避免每轮重建
-        (重建要 dir(self) + 逐个 docstring_parser 解析 + 查 provider_manager)。
+        传入 `mode` 时按模式过滤:RPG 模式(B/C)不注入 poke_*,宝可梦模式(P)不注入
+        rpg_*/roll_dice,减少无关工具对模型的干扰与 prompt 占用。
+        完整集与各模式过滤结果分别懒缓存。
         """
+        if mode:
+            cache = getattr(self, "_cached_mode_tool_sets", None)
+            if cache is None:
+                cache = {}
+                self._cached_mode_tool_sets = cache
+            if mode in cache:
+                return cache[mode]
         if self._cached_tool_set is not None:
-            return self._cached_tool_set
+            base = self._cached_tool_set
+        else:
+            base = self._build_full_tool_set()
+            self._cached_tool_set = base
+        if not mode:
+            return base
+        from astrbot.core.agent.tool import ToolSet
 
+        filtered = ToolSet()
+        for tool in base.tools:
+            name = tool.name
+            if mode == "P":
+                if name.startswith("rpg_") or name == "roll_dice":
+                    continue
+            elif name.startswith("poke_"):
+                continue
+            filtered.add_tool(tool)
+        self._cached_mode_tool_sets[mode] = filtered
+        return filtered
+
+    def _build_full_tool_set(self) -> ToolSet:
+        """构建完整工具集(包含 rpg_*/poke_*/骰子/记忆 等全部本插件工具)。"""
         from astrbot.core.agent.tool import FunctionTool, ToolSet
 
         tool_set = ToolSet()
@@ -1973,7 +2010,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
         if len(tool_set) == 0:
             logger.warning(
-                "life-sim: 未找到任何 rpg_*/roll_dice 工具,请检查插件是否正确注册。"
+                "life-sim: 未找到任何 rpg_*/poke_*/roll_dice 工具,请检查插件是否正确注册。"
             )
 
         web_search = self.context.provider_manager.llm_tools.get_func(
@@ -1985,7 +2022,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         if web_search and tavily_extract_web_page:
             tool_set.add_tool(web_search)
             tool_set.add_tool(tavily_extract_web_page)
-        self._cached_tool_set = tool_set
         return tool_set
 
     @staticmethod
@@ -2537,7 +2573,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         # 却按 lore_turn 倒推目标轮,导致目标轮偏晚、剧情历史只删了一条。
         # 现在:RPG 快照内容(存档文件会被本轮工具就地修改)必须在调用前抓取;
         # lore / 剧情历史快照与 turn 递增移到 LLM 成功后统一提交(见下)。
-        rpg_capture = self._rpg_snapshot(event, mode) if mode in ("B", "C") else None
+        rpg_capture = (
+            self._rpg_snapshot(event, mode) if mode in ("B", "C", "P") else None
+        )
 
         contexts = bind_checkpoint_messages(messages)
 
@@ -2552,7 +2590,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
         # system prompt 必须字节级稳定才能命中前缀缓存(ID 每轮都变,放里面会把
         # 后面整段历史缓存打爆);user 消息每轮本来就不同,放这里零额外成本。
         # 模式 A 无工具可调 revise,不需要注入。
-        if mode in ("B", "C"):
+        if mode in ("B", "C", "P"):
             last_nid = session.get("last_narrative_id")
             if last_nid:
                 user_input += _build_narrative_ref_tag(last_nid)
@@ -2581,8 +2619,8 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                     ),
                 )
             else:
-                # 传 tools 让 LLM 知道 rpg_*/roll_dice 可用(否则 tool_loop_agent 不会调任何工具)
-                tools = self._build_my_tool_set()
+                # 传 tools 让 LLM 知道 rpg_*/poke_*/roll_dice 可用(按模式过滤)
+                tools = self._build_my_tool_set(mode)
                 tool_hooks = _LifeSimToolHooks()
                 llm_resp = await self._run_llm_with_stats(
                     event,
@@ -4065,6 +4103,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 "1) 如需战斗/数值管理,先调 rpg_create_session 建会话再 rpg_join_session 建角色\n"
                 "2) 然后输出角色卡并开始开场叙事\n"
             )
+        elif mode == "P":
+            startup_steps = (
+                "1) 先和用户确认初始宝可梦,用 poke_add_pokemon 逐只加入队伍(文本中的选择也要主动建队)\n"
+                "2) 用 poke_team 确认队伍信息无误,再输出训练家角色卡(姓名/出身/家乡/初始宝可梦)\n"
+                "3) 然后开始开场叙事。遇到战斗时:先 poke_battle_start,再逐回合 poke_battle_turn,"
+                "把工具返回的战报改写成生动的叙事(招式名/伤害/异常状态以工具结果为准,不要自己编数值)\n"
+            )
         else:
             startup_steps = (
                 "1) 先输出角色卡(姓名/性别/出生地/天赋/家庭)\n"
@@ -4186,6 +4231,26 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
             lines.append(f"\n—— 最近一段 ——\n{tail}")
 
         yield event.plain_result("\n".join(lines))
+
+    @filter.command("队伍", alias={"team", "宝可梦队伍"})
+    async def cmd_team(self, event: AstrMessageEvent):
+        """/队伍 - 查看当前宝可梦队伍与对战状态(模式 P)"""
+        lock = self._get_sim_lock(self._sim_session_key(event))
+        if lock.locked():
+            yield event.plain_result(self._busy_message())
+            return
+        async with lock:
+            session = await self._load_sim(event)
+            if not session:
+                yield event.plain_result("❌ 当前没有进行中的转生模拟。")
+                return
+            if session.get("mode") != "P":
+                yield event.plain_result(
+                    "ℹ️ 当前不是宝可梦模式。用 `/创建 宝可梦 <设定>` 开始。"
+                )
+                return
+            text = await self.poke_team(event)
+            yield event.plain_result(text)
 
     @filter.command("dump")
     async def cmd_dump(self, event: AstrMessageEvent):
@@ -4611,7 +4676,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
                 lines.append(f"   🎮 RPG 数值已回滚:{', '.join(parts)}")
             else:
                 lines.append("   🎮 RPG 数值已回滚(无变化)")
-        elif session.get("mode") in ("B", "C"):
+        elif session.get("mode") in ("B", "C", "P"):
             lines.append("   ⚠️ 未找到该 turn 的 RPG 快照(数值未回滚),用 /删除 重建会话")
         narr_stats = stats["narr_stats"]
         if narr_stats is not None:
@@ -5001,7 +5066,6 @@ class LifeSimPlugin(DiceMixin, RPGMixin, MdToImageMixin, Star):
 
         current_branch 由调用方在还原后设置,不在本函数内处理。
         """
-        scope = self._sim_session_key(event)
         new_session = {
             "world_setting": branch.get("world_setting"),
             "mode": branch.get("mode", "A"),

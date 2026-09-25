@@ -228,3 +228,7 @@ $RECYCLE.BIN/
 data/
 .vscode/
 .ruff_cache/
+
+# Pokémon data 构建缓存/临时目录
+.pokemon_cache/
+.pokemon_build/

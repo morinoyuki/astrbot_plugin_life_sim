@@ -1,2 +1,6 @@
-# 暂无第三方依赖
+# 运行时第三方依赖
 pillowmd
+
+# 宝可梦模式(模式 P)的数据已内置于 pokesim/static/(物种/招式/学习表/属性相克/特性),
+# 运行时不需要任何额外依赖。如需重建数据(开发期,可选):
+#   .venv/bin/python tools/build_pokemon_data.py
