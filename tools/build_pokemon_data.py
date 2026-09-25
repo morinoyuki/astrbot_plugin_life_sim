@@ -183,6 +183,31 @@ def build() -> None:
         r["identifier"]: r["id"] for r in fetch_csv("abilities.csv")
     }
 
+    def _flavor(csv_name: str, id_field: str) -> dict[str, str]:
+        """取 zh-hans 的图鉴文字(同一实体取最新世代的文本)。"""
+        best: dict[str, tuple[int, str]] = {}
+        for r in fetch_csv(csv_name):
+            if r.get("language_id") != ZH_HANS:
+                continue
+            txt = (
+                (r.get("flavor_text") or "")
+                .replace("\n", " ")
+                .replace("\f", " ")
+                .replace("\u000c", " ")
+                .strip()
+            )
+            if not txt:
+                continue
+            key = r[id_field]
+            vg = int(r.get("version_group_id") or 0)
+            prev = best.get(key)
+            if prev is None or vg >= prev[0]:
+                best[key] = (vg, txt)
+        return {k: v[1] for k, v in best.items()}
+
+    move_desc = _flavor("move_flavor_text.csv", "move_id")
+    ability_desc = _flavor("ability_flavor_text.csv", "ability_id")
+
     nature_zh = {}
     nature_id_by_ident = {r["identifier"]: r["id"] for r in fetch_csv("natures.csv")}
     for r in fetch_csv("nature_names.csv"):
@@ -201,9 +226,36 @@ def build() -> None:
         }
     # 基础经验值(击倒时给予的经验),默认形态优先
     base_exp_by_species: dict[str, int] = {}
+    default_pokemon_species: dict[str, str] = {}
     for r in fetch_csv("pokemon.csv"):
         if r.get("is_default") == "1" and r.get("species_id"):
             base_exp_by_species[r["species_id"]] = int(r.get("base_experience") or 0)
+            default_pokemon_species[r["id"]] = r["species_id"]
+    # 努力值产出(击败时给予)
+    pstat = {"1": "hp", "2": "atk", "3": "def", "4": "spa", "5": "spd", "6": "spe"}
+    ev_by_species: dict[str, dict] = {}
+    for r in fetch_csv("pokemon_stats.csv"):
+        eff = int(r.get("effort") or 0)
+        if eff <= 0:
+            continue
+        sid = default_pokemon_species.get(r["pokemon_id"])
+        key = pstat.get(r.get("stat_id", ""))
+        if sid and key:
+            ev_by_species.setdefault(sid, {})[key] = eff
+    # 蛋群
+    egg_group_name = {r["id"]: r["identifier"] for r in fetch_csv("egg_groups.csv")}
+    egg_by_species: dict[str, list[str]] = {}
+    for r in fetch_csv("pokemon_egg_groups.csv"):
+        g = egg_group_name.get(r.get("egg_group_id", ""))
+        if g:
+            egg_by_species.setdefault(r["species_id"], []).append(g)
+
+    # 性别比例 / 孵化周期
+    for r in fetch_csv("pokemon_species.csv"):
+        m = species_meta.get(r["id"])
+        if m is not None:
+            m["genderRate"] = int(r.get("gender_rate") or -1)
+            m["hatchCounter"] = int(r.get("hatch_counter") or 0)
 
     # ── species ──────────────────────────────────────────────
     species = {}
@@ -211,6 +263,8 @@ def build() -> None:
         if "baseStats" not in v:
             continue
         num = int(v.get("num", 0) or 0)
+        if num <= 0:
+            continue  # 过滤 Pokémon Showdown 内置的 CAP 同人宝可梦
         base = v.get("baseSpecies")
         forme = v.get("forme")
         loc = species_names.get(str(num), {}) if num > 0 else {}
@@ -230,6 +284,8 @@ def build() -> None:
         if sm:
             entry["captureRate"] = sm["captureRate"]
             entry["growthRate"] = sm["growth"]
+            entry["genderRate"] = sm.get("genderRate", -1)
+            entry["hatchCounter"] = sm.get("hatchCounter", 0)
             if sm["isLegendary"]:
                 entry["isLegendary"] = True
             if sm["isMythical"]:
@@ -237,6 +293,12 @@ def build() -> None:
         be = base_exp_by_species.get(str(num))
         if be:
             entry["baseExp"] = be
+        ev = ev_by_species.get(str(num))
+        if ev:
+            entry["evs"] = ev
+        eggs = egg_by_species.get(str(num))
+        if eggs:
+            entry["eggGroups"] = eggs
         for f in (
             "heightm",
             "weightkg",
@@ -324,6 +386,9 @@ def build() -> None:
             eff = move_effects.get(str(meta.get("effect_id") or ""))
             if eff:
                 entry["desc"] = eff
+        fd = move_desc.get(str(num))
+        if fd:
+            entry["desc"] = fd
         if not entry.get("zh"):
             # 按 identifier 兜底匹配
             ident = norm_id(v.get("name", key))
@@ -331,8 +396,11 @@ def build() -> None:
                 if m["identifier"] == ident:
                     entry["zh"] = move_names.get(mid, "") or entry["zh"]
                     eff = move_effects.get(str(m.get("effect_id") or ""))
-                    if eff:
+                    if eff and not entry.get("desc"):
                         entry["desc"] = eff
+                    fd2 = move_desc.get(str(mid))
+                    if fd2:
+                        entry["desc"] = fd2
                     break
         if not entry.get("zh"):
             entry["zh"] = entry["name"]
@@ -349,6 +417,8 @@ def build() -> None:
             continue
         row = {}
         for move_key, codes in (v.get("learnset") or {}).items():
+            if move_key not in moves:
+                continue
             gens = sorted(
                 {int(c[0]) for c in codes if c and c[0].isdigit()}, reverse=True
             )
@@ -417,7 +487,7 @@ def build() -> None:
         abilities[ident] = {
             "name": name,
             "zh": ability_names.get(aid, name) if aid else name,
-            "desc": (ability_prose.get(aid, "") if aid else ""),
+            "desc": (ability_desc.get(str(aid)) or ability_prose.get(aid, "")) if aid else "",
         }
 
     # ── 写出 ────────────────────────────────────────────────

@@ -35,6 +35,24 @@ from .store import PokeStore
 
 MAX_PARTY = 6
 
+EGG_ZH = {
+    "monster": "怪兽",
+    "water1": "水中1",
+    "bug": "虫",
+    "flying": "飞行",
+    "field": "陆上",
+    "fairy": "妖精",
+    "grass": "植物",
+    "human-like": "人形",
+    "water3": "水中3",
+    "mineral": "矿物",
+    "amorphous": "不定形",
+    "water2": "水中2",
+    "ditto": "百变怪",
+    "dragon": "龙",
+    "undiscovered": "未发现",
+}
+
 _STAT_ALIAS = {
     "攻击": "atk",
     "物攻": "atk",
@@ -242,6 +260,34 @@ class PokemonMixin:
             abs_.append(f"{zh}({tag})")
         if abs_:
             lines.append("特性: " + "、".join(abs_))
+        gr = e.get("genderRate", -1)
+        if gr == -1:
+            lines.append("性别: 无性别")
+        elif gr == 0:
+            lines.append("性别: 仅雄性")
+        elif gr == 8:
+            lines.append("性别: 仅雌性")
+        elif 0 <= gr <= 8:
+            lines.append(f"性别: 雄性 {87.5 - gr * 12.5:g}% / 雌性 {gr * 12.5:g}%")
+        eg = e.get("eggGroups") or []
+        if eg:
+            lines.append(
+                f"蛋群: {'/'.join(EGG_ZH.get(g, g) for g in eg)}"
+                f" | 孵化周期: {e.get('hatchCounter', 0)}"
+            )
+        evs = e.get("evs") or {}
+        if evs:
+            lines.append(
+                "击败努力值: "
+                + " ".join(f"{dex.stat_label(s)}+{v}" for s, v in evs.items())
+            )
+        cr = e.get("captureRate")
+        if cr is not None:
+            lines.append(
+                f"捕获率: {cr}"
+                + (" (传说)" if e.get("isLegendary") else "")
+                + (" (幻之)" if e.get("isMythical") else "")
+            )
         # 相克
         eff = []
         for atk_t in dex.type_zh:
@@ -867,7 +913,7 @@ class PokemonMixin:
         return msgs
 
     def _award_battle_exp(self, battle: Battle) -> list[str]:
-        """战斗胜利后,给存活的我方宝可梦分配经验(含升级/学招/进化日志)。"""
+        """战斗胜利后,给存活的我方宝可梦分配经验与努力值(含升级日志)。"""
         dex = get_dex()
         if (
             not battle.finished
@@ -883,6 +929,10 @@ class PokemonMixin:
             dex.exp_yield(p.species, p.level, trainer=not battle.wild)
             for p in defeated
         )
+        ev_gain: dict[str, int] = {}
+        for p in defeated:
+            for s, v in (p.entry.get("evs") or {}).items():
+                ev_gain[s] = ev_gain.get(s, 0) + int(v)
         participants = [p for p in battle.player.party if not p.fainted]
         if not participants:
             participants = [p for p in battle.player.party if p.cur_hp > 0]
@@ -892,7 +942,33 @@ class PokemonMixin:
         msgs = [f"💰 获得经验总计 {total}(每只 {share})。"]
         for p in participants:
             msgs += self._gain_exp(p, share)
+            if ev_gain:
+                msgs += self._gain_evs(p, ev_gain)
         return msgs
+
+    def _gain_evs(self, mon: Pokemon, evs: dict) -> list[str]:
+        """增加努力值(单项 ≤252、总 ≤510),自动重算数值。"""
+        dex = get_dex()
+        cur = dict(mon.evs or {})
+        total = sum(int(v) for v in cur.values())
+        gained: list[str] = []
+        for stat, amt in evs.items():
+            if total >= 510:
+                break
+            cur_val = int(cur.get(stat, 0))
+            add = min(int(amt), 252 - cur_val, 510 - total)
+            if add <= 0:
+                continue
+            cur[stat] = cur_val + add
+            total += add
+            gained.append(f"{dex.stat_label(stat)}+{add}")
+        if not gained:
+            return []
+        mon.evs = cur
+        mon.stats = dex.compute_stats(mon.species, mon.level, mon.ivs, mon.evs, mon.nature)
+        mon.max_hp = mon.stats["hp"]
+        mon.cur_hp = min(mon.cur_hp, mon.max_hp)
+        return [f"💪 {mon.display} 努力值 " + "、".join(gained)]
 
     async def poke_battle_pvp(self, event, opponent: str, weather: str = "", terrain: str = "") -> str:
         """与另一位玩家的真实队伍对战(PvP,双方 HP/PP/异常都会写回各自存档)。
