@@ -721,6 +721,34 @@ def test_pokemon_sprites():
     assert av["皮卡丘"].endswith("pikachu.png")
 
 
+def test_tool_arg_coercion():
+    """LLM 传垃圾参数时应被安全转换或拒绝,绝不抛异常。"""
+    import lsim_pkg.main as M
+
+    assert M._coerce_int_arg("3") == 3
+    assert M._coerce_int_arg("3.7") == 3
+    assert M._coerce_int_arg(True) == 1
+    assert M._coerce_int_arg(None) is None
+    assert M._coerce_int_arg("abc") is None
+    assert M._coerce_bool_arg("true") is True
+    assert M._coerce_bool_arg("no") is False
+    assert M._coerce_bool_arg(1) is True
+    assert M._coerce_str_arg(None) == ""
+    assert M._coerce_str_arg(5) == "5"
+
+    int_schema = {"properties": {"level": {"type": "integer"}}}
+    assert M._coerce_tool_kwargs(int_schema, {"level": "12"}) == ({"level": 12}, None)
+    fixed, err = M._coerce_tool_kwargs(int_schema, {"level": "abc"})
+    assert fixed is None and "整数" in err
+    # None 的整数交默认值处理;None 的字符串转空串(保留必填)
+    assert M._coerce_tool_kwargs(int_schema, {"level": None}) == ({}, None)
+    str_schema = {"properties": {"nickname": {"type": "string"}}}
+    assert M._coerce_tool_kwargs(str_schema, {"nickname": None}) == ({"nickname": ""}, None)
+    assert M._coerce_tool_kwargs(str_schema, {"nickname": 42}) == ({"nickname": "42"}, None)
+    # 未声明的参数(如 event)原样透传
+    assert M._coerce_tool_kwargs(int_schema, {"event": object()}) != (None, None)
+
+
 if __name__ == "__main__":
     test_dex_lookup_and_types()
     test_dex_stats_and_learnset()
@@ -742,4 +770,5 @@ if __name__ == "__main__":
     test_location_module()
     test_pokemon_location_tools()
     test_pokemon_sprites()
+    test_tool_arg_coercion()
     print("all pokesim tests passed")

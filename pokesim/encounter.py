@@ -166,6 +166,7 @@ def _power_weight(entry: dict) -> float:
 
 def biome_types(area: str) -> set[str]:
     """从自由文本地点里解析出生态属性集合。"""
+    area = str(area or "")
     types: set[str] = set()
     for key, ts in BIOME_TYPES.items():
         if key in area:
@@ -174,6 +175,7 @@ def biome_types(area: str) -> set[str]:
 
 
 def is_night(area: str) -> bool:
+    area = str(area or "")
     return any(k in area for k in NIGHT_KEYS)
 
 

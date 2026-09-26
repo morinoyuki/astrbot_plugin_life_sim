@@ -467,6 +467,88 @@ def _normalize_character_query(character) -> list[str]:
     return []
 
 
+def _coerce_int_arg(v):
+    """把 LLM 传来的任意值安全转成 int;无法转换返回 None。"""
+    if isinstance(v, bool):
+        return int(v)
+    if isinstance(v, int):
+        return v
+    if isinstance(v, float):
+        return int(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            try:
+                return int(float(s))
+            except ValueError:
+                return None
+    return None
+
+
+_TRUE_WORDS = {"1", "true", "yes", "y", "on", "t", "是", "真", "对"}
+
+
+def _coerce_bool_arg(v) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() in _TRUE_WORDS
+    if isinstance(v, (int, float)):
+        return v != 0
+    return bool(v)
+
+
+def _coerce_str_arg(v) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    return str(v)
+
+
+def _coerce_tool_kwargs(parameters: dict, kwargs: dict) -> tuple[dict | None, str | None]:
+    """按工具 JSON schema 把 LLM 参数强制转成声明的类型。
+
+    LLM 经常把整数写成字符串(\"3\")、布尔写成 \"true\"、给字符串传 null/数字,或
+    把整数参数写成 \"abc\";直接 int()/.strip() 会抛异常。这里统一转换,
+    无法转换时返回可读的错误(交给模型重试)。
+    返回 (kwargs, error);error 非空时 kwargs 为 None。
+    """
+    props = (parameters or {}).get("properties") or {}
+    out: dict = {}
+    for k, v in kwargs.items():
+        spec = props.get(k)
+        if not isinstance(spec, dict):
+            out[k] = v
+            continue
+        t = spec.get("type")
+        if t == "integer":
+            if v is None:
+                continue  # 交给函数默认值
+            iv = _coerce_int_arg(v)
+            if iv is None:
+                return None, f"参数 {k} 需要整数,收到 {v!r}"
+            out[k] = iv
+        elif t == "number":
+            if v is None:
+                continue
+            try:
+                out[k] = float(v)
+            except (TypeError, ValueError):
+                return None, f"参数 {k} 需要数字,收到 {v!r}"
+        elif t == "boolean":
+            out[k] = _coerce_bool_arg(v)
+        elif t == "string":
+            out[k] = _coerce_str_arg(v)
+        else:
+            out[k] = v
+    return out, None
+
+
 def _parse_tool_from_docstring(docstring: str) -> tuple[str, dict]:
     """从 llm_tool 风格的 docstring 一次解析出 (description, parameters schema)。
 
@@ -2008,11 +2090,34 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
             # 是 bound method — 自己包成 FunctionTool(补 schema + bound handler)
             doc = getattr(attr, "__doc__", None) or ""
             description, parameters = _parse_tool_from_docstring(doc)
+
+            async def _safe_handler(
+                event,
+                _attr=attr,
+                _name=attr_name,
+                _params=parameters,
+                *args,
+                **kwargs,
+            ):
+                """LLM 参数容错 + 异常兜底:任何工具都不会把异常抛回框架。"""
+                fixed, err = _coerce_tool_kwargs(_params, kwargs)
+                if err:
+                    return f"❌ {_name}: {err}"
+                try:
+                    return await _attr(event, *args, **fixed)
+                except Exception as e:
+                    logger.warning(
+                        f"life-sim: 工具 {_name} 执行失败: {e}", exc_info=True
+                    )
+                    return f"❌ 工具 {_name} 执行失败({type(e).__name__}): {e}"
+
+            _safe_handler.__name__ = attr_name
+            _safe_handler.__doc__ = doc
             new_tool = FunctionTool(
                 name=attr_name,
                 parameters=parameters,
                 description=description,
-                handler=attr,  # bound method,event 参数不会被当成 self
+                handler=_safe_handler,
             )
             tool_set.add_tool(new_tool)
 
