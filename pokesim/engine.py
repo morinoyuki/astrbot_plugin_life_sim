@@ -526,6 +526,23 @@ class Battle:
                 )
         elif self.awaiting_switch:
             lines.append("⚠️ 我方宝可梦倒下,需要换人(用 switch <序号>)")
+        if not self.finished and self.player.mon is not None:
+            dex = get_dex()
+            mon = self.player.mon
+            if mon.moves:
+                mv = " ".join(
+                    f"{i}.{(dex.moves.get(m) or {}).get('zh', m)}"
+                    f"({mon.pp.get(m, 0)}/{(dex.moves.get(m) or {}).get('pp', 0)})"
+                    for i, m in enumerate(mon.moves, 1)
+                )
+                lines.append(f"可用招式: {mv}")
+            if len(self.player.party) > 1:
+                party = []
+                for i, pm in enumerate(self.player.party, 1):
+                    tag = "✗" if pm.fainted else STATUS_ZH.get(pm.status, pm.status)
+                    mark = "←" if i - 1 == self.player.active else ""
+                    party.append(f"{i}.{pm.display}[{pm.cur_hp}/{pm.max_hp}]{tag}{mark}")
+                lines.append("我方队伍: " + " ".join(party))
         return "\n".join(lines)
 
     # ── RNG ──

@@ -214,6 +214,7 @@ def _items_scenario():
             # 野生战 + 大师球必中捕获
             start = await p.poke_battle_start(ev, "绿毛虫|5")
             assert "野生对战" in start
+            assert "可用招式: 1." in start  # 战斗中展示可用招式
             turn = await p.poke_battle_turn(ev, "catch 大师球")
             assert "成功捕获了" in turn
             team = await p.poke_team(ev)
