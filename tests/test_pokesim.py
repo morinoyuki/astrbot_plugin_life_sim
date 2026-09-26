@@ -549,6 +549,19 @@ def test_trainer_team_generation():
         assert "Rock" in dex.species[m["species"]]["types"]
         assert 18 <= m["level"] <= 24
     assert gen["team"][-1]["is_ace"]
+    # 地区限定:关都岩石道馆
+    kanto = generate_team(
+        dex,
+        party=[{"level": 20}],
+        trainer="岩石道馆馆主",
+        region="关都",
+        rng=random.Random(5),
+    )
+    assert kanto["size"] >= 3
+    for m in kanto["team"]:
+        e = dex.species[m["species"]]
+        assert "Rock" in e["types"]
+        assert 1 <= int(e["num"]) <= 151
     # 等级跟随队首 + 难度修正
     easy = generate_team(dex, party=[{"level": 30}], trainer="训练家", difficulty="easy", rng=random.Random(1))
     hard = generate_team(dex, party=[{"level": 30}], trainer="训练家", difficulty="hard", rng=random.Random(1))

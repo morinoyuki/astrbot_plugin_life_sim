@@ -114,13 +114,29 @@ def is_wild_candidate(entry: dict) -> bool:
     return not any(x in forme for x in _FORM_EXCLUDE)
 
 
-def _regional_tag(entry: dict) -> str:
+def regional_tag(entry: dict) -> str:
     """该条目若为地区形态,返回形态地区名(如 Alola),否则空串。"""
     forme = str(entry.get("forme") or "")
     for tag in ("Alola", "Galar", "Hisui", "Paldea"):
         if tag in forme:
             return tag
     return ""
+
+
+def in_scope(entry: dict, region: str = "", gen: int = 0) -> bool:
+    """条目是否落在指定地区/世代的全国图鉴范围内(含地区形态归属)。"""
+    num = int(entry.get("num", 0) or 0)
+    gen_range = GENS.get(gen) if gen else None
+    if gen_range and not (gen_range[0] <= num <= gen_range[1]):
+        return False
+    reg = REGIONS.get(region) if region else None
+    if reg:
+        if not (reg[0] <= num <= reg[1]):
+            return False
+        etag = regional_tag(entry)
+        if etag and etag != reg[2]:
+            return False
+    return True
 
 
 def _stage_weight(entry: dict) -> float:
@@ -172,24 +188,14 @@ def _pool(
     dtypes = biome_types(area)
     night = is_night(area)
     reg = REGIONS.get(region) if region else None
-    gen_range = GENS.get(gen) if gen else None
+    reg_tag = reg[2] if reg else ""
 
     pool: list[tuple[str, float]] = []
     for key, entry in dex.species.items():
         if not is_wild_candidate(entry):
             continue
-        num = int(entry.get("num", 0) or 0)
-        if gen_range and not (gen_range[0] <= num <= gen_range[1]):
+        if not in_scope(entry, region, gen):
             continue
-        reg_tag = ""
-        if reg:
-            if not (reg[0] <= num <= reg[1]):
-                continue
-            reg_tag = reg[2]
-            etag = _regional_tag(entry)
-            # 有地区形态的,只保留与该地区匹配的形态
-            if etag and etag != reg_tag:
-                continue
         if (entry.get("isLegendary") or entry.get("isMythical")) and not allow_rare:
             continue
         tags = set(entry.get("tags") or [])
@@ -204,7 +210,7 @@ def _pool(
         weight *= _power_weight(entry)
         if night and (types & NIGHT_BOOST):
             weight *= 2.0
-        if reg and reg_tag and _regional_tag(entry) == reg_tag:
+        if reg and reg_tag and regional_tag(entry) == reg_tag:
             weight *= 1.6
         if allow_rare and (entry.get("isLegendary") or entry.get("isMythical")):
             weight *= 0.01
@@ -279,8 +285,10 @@ __all__ = [
     "GENS",
     "REGIONS",
     "biome_types",
+    "in_scope",
     "is_night",
     "is_wild_candidate",
+    "regional_tag",
     "roll_encounter",
     "roll_level",
 ]

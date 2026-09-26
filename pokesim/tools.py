@@ -1403,6 +1403,8 @@ class PokemonMixin:
         level: int = 0,
         size: int = 0,
         difficulty: str = "",
+        region: str = "",
+        gen: int = 0,
         weather: str = "",
         terrain: str = "",
         allow_rare: bool = False,
@@ -1420,6 +1422,8 @@ class PokemonMixin:
             level(int): Optional. 强制 NPC 等级(剧情需要固定强度时用);0 表示按玩家队首等级自动缩放。
             size(int): Optional. 强制队伍规模 1-6;0 表示按训练家级别决定。
             difficulty(string): Optional. 难度修正:easy/normal/hard 或 简单/普通/困难。
+            region(string): Optional. 地区,限定 NPC 宝可梦的全国图鉴范围:关都/城都/丰缘/神奥/合众/卡洛斯/阿罗拉/伽勒尔/帕底亚。
+            gen(int): Optional. 限定世代 1-9(与 region 二选一即可)。
             weather(string): Optional. 开场天气: sun/rain/sand/snow。
             terrain(string): Optional. 开场场地: electric/grassy/misty/psychic。
             allow_rare(bool): Optional. 是否允许传说/幻兽(冠军/四天王剧情可用),默认 false。
@@ -1447,6 +1451,8 @@ class PokemonMixin:
             level=int(level or 0),
             size=int(size or 0),
             difficulty=difficulty,
+            region=region,
+            gen=int(gen or 0),
             allow_rare=bool(allow_rare),
             rng=random.Random(),
         )

@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import random
 
-from .encounter import is_wild_candidate
+from .encounter import in_scope, is_wild_candidate
 
 # 训练家关键词(按优先级从上到下匹配)→ (队伍规模范围, 强度 0~1, 等级修正, 携道具率)
 TIERS: list[tuple[tuple[str, ...], tuple[int, int], float, int, float]] = [
@@ -141,6 +141,8 @@ def generate_team(
     level: int = 0,
     size: int = 0,
     difficulty: str = "",
+    region: str = "",
+    gen: int = 0,
     allow_rare: bool = False,
     rng: random.Random | None = None,
 ) -> dict:
@@ -172,6 +174,8 @@ def generate_team(
     weights: list[float] = []
     for key, entry in dex.species.items():
         if not is_wild_candidate(entry):
+            continue
+        if not in_scope(entry, region, gen):
             continue
         et = set(entry.get("types") or [])
         if types and not (et & types):
