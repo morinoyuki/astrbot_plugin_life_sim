@@ -67,11 +67,14 @@ class _FakePlugin:
     def __init__(self, data_dir):
         self.data_dir = data_dir
         self.sim_store = SimStore(data_dir)
+        self._sim_locks = {}
 
     # 纯逻辑方法直接复用真实实现(_normalize_character_lore 是 staticmethod,需显式包装)
     _sim_session_key = LifeSimPlugin._sim_session_key
     _extract_after_cmd = LifeSimPlugin._extract_after_cmd
     _normalize_character_lore = staticmethod(LifeSimPlugin._normalize_character_lore)
+    _get_sim_lock = LifeSimPlugin._get_sim_lock
+    _busy_message = LifeSimPlugin._busy_message
 
     async def _load_sim(self, event):
         return await self.sim_store.load(f"group_{event.group_id}")

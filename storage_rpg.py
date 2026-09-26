@@ -111,6 +111,10 @@ class RpgStore:
         uid = (sender_uid or "").strip()
         result = {"deleted_chars": 0, "deleted_sessions": []}
 
+        # 群 ID 与用户 ID 都为空时无法判定归属,直接不动 — 否则会扫掉全部私聊存档
+        if not gid and not uid:
+            return result
+
         prefix = f"{gid}_" if gid else ""
         for stem in self.list_chars():
             if gid:

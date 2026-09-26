@@ -303,6 +303,36 @@ class NarrativeStore:
 
         return await asyncio.to_thread(_run)
 
+    async def locate(self, scope: str, record_id: str) -> tuple[str, dict | None]:
+        """在主线 + 全部支线中查找记录 ID,返回 (所在支线名, 记录)。
+
+        找不到时返回 ("", None)。用于显式指定 record_id 时避开"不知道在
+        哪条支线"的问题(调用方默认只传当前支线,会漏掉其他支线的记录)。
+        """
+        def _run() -> tuple[str, dict | None]:
+            def _find(branch: str):
+                data = self._load_history(scope, branch)
+                for r in data["records"]:
+                    if r.get("id") == record_id:
+                        return self._expand_record(r, data["versions"])
+                return None
+
+            found = _find("")
+            if found is not None:
+                return "", found
+            scope_dir = self._scope_dir(scope)
+            if os.path.isdir(scope_dir):
+                for f in sorted(os.listdir(scope_dir)):
+                    name = self._branch_name_from_file(f)
+                    if not name:
+                        continue
+                    found = _find(name)
+                    if found is not None:
+                        return name, found
+            return "", None
+
+        return await asyncio.to_thread(_run)
+
     async def list(self, scope: str, branch: str = "") -> list[dict]:
         """列指定线(主线/分支)全部记录,按 created_at 升序,快照字段还原。"""
         def _run():

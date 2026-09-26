@@ -1043,8 +1043,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
         # 本轮 revise 暂存:{event_key: [修订前记录状态, ...]} — 本轮 LLM 是否调用过
         # life_sim_revise_narrative(列表非空即有);兼作 /undo 回滚修订的 pre-revision 数据
         self._pending_revise: dict[str, list] = {}
+        # 本轮 _generate 正在处理的 session 对象:{event_key: session}。
+        # 工具内 _load_sim 会读到磁盘上的旧版本(/redo 回滚尚未落盘时更明显),
+        # 这里保存内存中权威副本,供 _save_lore 等取基线时优先使用。
+        self._active_session: dict[str, dict] = {}
         # 最近一次 _clear_sim 清理掉的向量记忆条数(用于 /删除 /创建 提示)
         self._last_clear_mem_count = 0
+        # 最近一次 _clear_sim 清理掉的 RPG 存档统计(用于 /删除 提示)
+        self._last_clear_rpg: dict = {"deleted_chars": 0, "deleted_sessions": []}
         # Markdown → 图片渲染引擎(config 驱动,惰性加载样式)
         self._md_init()
 
@@ -1277,7 +1283,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
         return lock
 
     async def _load_sim(self, event: AstrMessageEvent):
-        return await self.sim_store.load(self._sim_session_key(event))
+        # _generate 进行中时返回内存里的权威 session:磁盘上的版本可能尚未把
+        # /redo 的回滚写回,工具(如 _save_lore / lore 读取)读到旧版本会
+        # 把回滚结果覆盖掉。非生成期间没有覆盖项,行为不变。
+        key = self._sim_session_key(event)
+        active = self._active_session.get(key)
+        if active is not None:
+            return active
+        return await self.sim_store.load(key)
 
     async def _save_sim(self, event: AstrMessageEvent, session: dict):
         await self.sim_store.save(self._sim_session_key(event), session)
@@ -1293,6 +1306,14 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
         await self.sim_store.delete(key)
         # 头像按 scope 分区,随会话一起清除(默认头像在根目录,不动)
         self.avatar_store.clear_scope(key)
+        # RPG 角色/会话存档随会话一起清除(否则 /创建 新人生后旧角色仍会漏出)
+        self._last_clear_rpg = {"deleted_chars": 0, "deleted_sessions": []}
+        try:
+            group_id = self._get_group_id(event)
+            sender_uid = str(event.get_sender_id() or "")
+            self._last_clear_rpg = self.rpg_store.purge_group(group_id, sender_uid)
+        except Exception as e:
+            logger.debug(f"life-sim: 清理 RPG 存档失败: {e}")
         # 宝可梦队伍/对战存档随会话清除
         try:
             if hasattr(self, "pokemon_purge"):
@@ -2619,6 +2640,27 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
         return [], f"\n\n<image_note>{note}</image_note>"
 
     async def _generate(
+        self,
+        event: AstrMessageEvent,
+        session: dict,
+        user_input: str,
+        mode: str,
+        imgs: list[Image] | None,
+    ) -> str:
+        """生成一轮叙事:包一层 _active_session 的生命周期管理。
+
+        在生成期间,`_load_sim` 返回内存中的权威 session(磁盘可能还没把
+        /redo 的回滚写回),工具读取 lore 等就不会拿到旧版本;无论成功失败
+        都在 finally 里清理,避免意外异常导致覆盖项残留。
+        """
+        event_key = self._sim_session_key(event)
+        self._active_session[event_key] = session
+        try:
+            return await self._generate_inner(event, session, user_input, mode, imgs)
+        finally:
+            self._active_session.pop(event_key, None)
+
+    async def _generate_inner(
         self,
         event: AstrMessageEvent,
         session: dict,
@@ -4003,6 +4045,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
             auto = True
             if not resolved_id:
                 return "❌ 当前 scope 暂无最近剧情 ID(从未记录过剧情),无法修订"
+        else:
+            # 显式 ID:记录可能写在支线文件里,跨线定位(否则在支线中
+            # 复制 <narrative_ref> 给过来的 ID 会永远"找不到记录")
+            branch, _found = await self.narrative_store.locate(scope, resolved_id)
 
         # 修订前先抓旧状态,暂存到 staging(供 /undo 回滚;快照本身不存全文,
         # 只有修订发生时才记录 pre-revision 状态,避免每轮重复数据)
@@ -4430,15 +4476,9 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
                 yield event.plain_result("❌ 当前没有进行中的转生模拟。")
                 return
 
-            group_id = self._get_group_id(event)
-            sender_uid = str(event.get_sender_id() or "")
-            try:
-                purge = self.rpg_store.purge_group(group_id, sender_uid)
-            except OSError as e:
-                logger.debug(f"life-sim: 清理 RPG 存档失败: {e}")
-                purge = {"deleted_chars": 0, "deleted_sessions": []}
-
+            # _clear_sim 会一并清理 RPG 角色/会话存档,统计写入 self._last_clear_rpg
             n_branches = await self._clear_sim(event)
+            purge = self._last_clear_rpg
             char_note = (
                 f",{purge['deleted_chars']} 个 RPG 存档"
                 if purge["deleted_chars"]
@@ -5132,26 +5172,45 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
             return
 
         scope = self._sim_session_key(event)
-        session = await self._load_sim(event)
-        branch = _narrative_branch(session)
-
-        if arg.lower() in ("all", "全部"):
-            n = await self.narrative_store.delete_scope(scope)
-            yield event.plain_result(f"🗑️ 已清空 scope=`{scope}` 全部剧情记录({n} 条)")
+        lock = self._get_sim_lock(scope)
+        if lock.locked():
+            yield event.plain_result(self._busy_message())
             return
+        async with lock:
+            session = await self._load_sim(event)
+            branch = _narrative_branch(session)
 
-        # 单条删除
-        target = arg.split()[0].strip()
-        if not target:
-            yield event.plain_result("❌ 请提供记录 ID")
-            return
-        ok = await self.narrative_store.delete(scope, target, branch=branch)
-        if ok:
-            yield event.plain_result(f"🗑️ 已删除剧情记录 `{target}`")
-        else:
-            yield event.plain_result(
-                f"❌ 找不到记录 `{target}`(可能 ID 输错,或不在当前 scope)"
-            )
+            if arg.lower() in ("all", "全部"):
+                n = await self.narrative_store.delete_scope(scope)
+                if session:
+                    # 清空后 last_narrative_id 已失效,不保留陈旧引用
+                    session["last_narrative_id"] = None
+                    await self._save_sim(event, session)
+                yield event.plain_result(
+                    f"🗑️ 已清空 scope=`{scope}` 全部剧情记录({n} 条)"
+                )
+                return
+
+            # 单条删除
+            target = arg.split()[0].strip()
+            if not target:
+                yield event.plain_result("❌ 请提供记录 ID")
+                return
+            ok = await self.narrative_store.delete(scope, target, branch=branch)
+            if ok:
+                # 删掉的正是最近一条时,回退到剩余记录里最新的一条,防止下一轮
+                # /do 注入已被删除的 <narrative_ref> 让 revise 工具失败
+                if session and session.get("last_narrative_id") == target:
+                    remaining = await self.narrative_store.list(scope, branch)
+                    session["last_narrative_id"] = (
+                        remaining[-1]["id"] if remaining else None
+                    )
+                    await self._save_sim(event, session)
+                yield event.plain_result(f"🗑️ 已删除剧情记录 `{target}`")
+            else:
+                yield event.plain_result(
+                    f"❌ 找不到记录 `{target}`(可能 ID 输错,或不在当前 scope)"
+                )
 
     # ════════════════════════════════════════════════════════════════
     # 剧情分支:保存 / 切换 / 列表 / 删除
@@ -5557,18 +5616,34 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
             if not target:
                 yield event.plain_result("❌ 用法:`/lore 删除 <角色名>`")
                 return
-            matched_keys = _match_lore_characters(char_lore, target)
-            if not matched_keys:
-                available = "、".join(n for n in char_lore if char_lore[n])
-                yield event.plain_result(
-                    f"❌ 未找到角色「{target}」。"
-                    + (f"现有角色:{available}" if available else "暂无角色设定")
-                    + "\n💡 /lore 查看总览 · /lore 删除 <角色名>"
-                )
+            # 写操作必须持有会话锁并重读 session:否则与 /do(先加载整份 session、
+            # 最后整体写回)并发时,本命令的删除会被旧副本覆盖而丢失。
+            lock = self._get_sim_lock(self._sim_session_key(event))
+            if lock.locked():
+                yield event.plain_result(self._busy_message())
                 return
-            removed = {mn: len(char_lore.pop(mn) or []) for mn in matched_keys}
-            session["character_lore"] = char_lore
-            await self._save_sim(event, session)
+            async with lock:
+                session = await self._load_sim(event)
+                if not session:
+                    yield event.plain_result(
+                        "❌ 当前没有进行中的转生模拟,请先使用 /创建 <世界观> 开始。"
+                    )
+                    return
+                char_lore = self._normalize_character_lore(
+                    session.get("character_lore")
+                )
+                matched_keys = _match_lore_characters(char_lore, target)
+                if not matched_keys:
+                    available = "、".join(n for n in char_lore if char_lore[n])
+                    yield event.plain_result(
+                        f"❌ 未找到角色「{target}」。"
+                        + (f"现有角色:{available}" if available else "暂无角色设定")
+                        + "\n💡 /lore 查看总览 · /lore 删除 <角色名>"
+                    )
+                    return
+                removed = {mn: len(char_lore.pop(mn) or []) for mn in matched_keys}
+                session["character_lore"] = char_lore
+                await self._save_sim(event, session)
             total = sum(removed.values())
             lines = [f"🗑️ 已删除 {len(matched_keys)} 个角色 key、共 {total} 条设定:"]
             for mn in matched_keys:
