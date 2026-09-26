@@ -458,6 +458,36 @@ def test_pokemon_learnset_display():
         asyncio.run(run())
 
 
+def test_pokemon_catch_only_wild():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _FakePlugin(tmp)
+        ev = _Event()
+
+        async def run():
+            await p.poke_add_pokemon(ev, "皮卡丘", level=25, moves="thundershock,quickattack")
+            await p.poke_bag(ev, item="精灵球", count=5)
+            # 单只对手 + trainer=true -> 训练家战,不可捕获/逃跑
+            start = await p.poke_battle_start(ev, "小拉达|10", trainer=True)
+            assert "训练家对战" in start
+            out = await p.poke_battle_turn(ev, "catch 精灵球")
+            assert "野生对战" in out
+            out = await p.poke_battle_turn(ev, "run")
+            assert "逃走" in out
+            # 单只对手 + wild=false 也视为训练家战
+            start = await p.poke_battle_start(ev, "小拉达|10", wild=False)
+            assert "训练家对战" in start
+            # 多只自动训练家战
+            start = await p.poke_battle_start(ev, "小拉达|10;波波|10")
+            assert "训练家对战" in start
+            # 默认(野生)可捕获
+            start = await p.poke_battle_start(ev, "绿毛虫|5")
+            assert "野生对战" in start
+            out = await p.poke_battle_turn(ev, "catch 精灵球")
+            assert "投出了" in out or "成功捕获" in out
+
+        asyncio.run(run())
+
+
 if __name__ == "__main__":
     test_dex_lookup_and_types()
     test_dex_stats_and_learnset()
@@ -471,4 +501,5 @@ if __name__ == "__main__":
     test_pokemon_move_replace()
     test_pokemon_battle_pp_rules()
     test_pokemon_learnset_display()
+    test_pokemon_catch_only_wild()
     print("all pokesim tests passed")

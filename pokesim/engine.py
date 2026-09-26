@@ -482,7 +482,7 @@ class Battle:
         return " ".join(bits)
 
     def summary(self) -> str:
-        lines = [f"【第 {self.turn} 回合】" + ("(野生战)" if self.wild else "")]
+        lines = [f"【第 {self.turn} 回合】" + ("(野生战)" if self.wild else "(训练家战)")]
         for label, side in (("我方", self.player), ("对方", self.enemy)):
             mon = side.mon
             if mon is None:

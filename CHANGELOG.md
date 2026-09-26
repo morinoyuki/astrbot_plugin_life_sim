@@ -15,6 +15,7 @@
   - **亲密度与性别**:新增亲密度(战斗/训练/升级提升)与性别(按图鉴比例自动分配,可指定),已接入进化判定与展示。
   - **升级学招与替换**:升级想学新招但招式已满时,工具会列出当前 4 个招式及序号并提示询问玩家;`poke_learn_move` 的 `replace` 支持序号(1-4)**或招式名**,并修正了模式 P 提示词里参数名写错(`forgot` → `replace`)。
   - **战斗出招规则与状态展示**:只能使用已学会的招式;单招 PP 耗尽拒绝并提示换招,全部耗尽强制「挣扎」(无属性、1/4 最大 HP 反作用);战斗状态显示可用招式(含 PP)与我方队伍序号。
+  - **野生 vs 训练家**:`poke_battle_start` 新增 `trainer=true`;未标记训练家时,单只对手会默认当作野生战(可捕获)。现在训练家战(含单只)不可投球、不可逃跑。
   - **捕获与背包**:`poke_bag` 管理道具(精灵球/伤药/状态/复活/PP/战斗强化/进化石/树果等 60+ 种),野生战用 `poke_battle_turn` 的 `"catch 高级球"` 投球捕获(捕获率公式 + 精灵球条件加成 + 状态修正,捕获成功自动入队/进电脑);`poke_use_item` 战斗外使用,`"item 伤药"` 战斗中使用,`"run"` 逃跑。
   - **多玩家 / PvP**:队伍改为**按玩家区分**(群聊 = 群号+用户 id),每位玩家一支独立队伍;`poke_trainer` 设训练家名、`poke_trainers` 列出同群训练家、`poke_battle_pvp opponent="<uid>"` 与真人真实队伍对战,双方 HP/PP/异常写回各自存档。
   - **23 个 `poke_*` 工具**:`poke_dex_species/move/ability/item`、`poke_type_matchup`、`poke_learnset`、`poke_team`、`poke_add_pokemon`、`poke_remove_pokemon`、`poke_learn_move`、`poke_edit_pokemon`、`poke_evolve`、`poke_heal_party`、`poke_trainer`、`poke_trainers`、`poke_train`、`poke_bag`、`poke_use_item`、`poke_battle_start/pvp/status/turn/end`。

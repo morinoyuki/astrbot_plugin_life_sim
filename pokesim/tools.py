@@ -1354,6 +1354,7 @@ class PokemonMixin:
         weather: str = "",
         terrain: str = "",
         wild: bool = True,
+        trainer: bool = False,
     ) -> str:
         """开始一场宝可梦对战(单打)。对手以分号分隔多只组成训练家队伍。
 
@@ -1365,7 +1366,8 @@ class PokemonMixin:
             enemy_item(string): Optional. 对手道具(仅单只时生效)。
             weather(string): Optional. 开场天气: sun/rain/sand/snow 或 晴天/下雨/沙暴/下雪。
             terrain(string): Optional. 开场场地: electric/grassy/misty/psychic。
-            wild(bool): Optional. 是否野生战(可投球捕获/可逃跑)。多只对手时自动视为训练家战;默认 true。
+            wild(bool): Optional. 是否野生战。只有野生战才能投球捕获/逃跑,默认 true。
+            trainer(bool): Optional. 是否为训练家战(道馆/联盟/NPC/对手)。为 true 时强制不可捕获、不可逃跑;多只对手时自动视为训练家战。与训练家对战务必设为 true。
         """
         data = self._poke_load(event)
         party = self._party_of(data)
@@ -1408,7 +1410,7 @@ class PokemonMixin:
             weather=weather,
             terrain=terrain,
             seed=int(data.get("updated_at", 0) or 0) % 100000 + len(entries),
-            wild=bool(wild) and len(enemy_party) == 1,
+            wild=bool(wild) and not trainer and len(enemy_party) == 1,
             bag=data.get("bag") or {},
         )
         lines = battle.start()
