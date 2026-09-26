@@ -268,3 +268,103 @@ def test_delete_history_clears_stale_last_id():
         import shutil
 
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ── 6. read_json 对非对象 JSON 返回 None ──────────────────────────
+
+
+def test_read_json_rejects_non_dict():
+    from lsim_pkg.storage_base import read_json, write_json_atomic
+
+    tmp = tempfile.mkdtemp(prefix="json_guard_")
+    try:
+        p = os.path.join(tmp, "bad.json")
+        with open(p, "w", encoding="utf-8") as f:
+            f.write("[1, 2, 3]")
+        assert read_json(p) is None
+        with open(p, "w", encoding="utf-8") as f:
+            f.write('"just a string"')
+        assert read_json(p) is None
+        # 正常 dict 仍可往返
+        write_json_atomic(p, {"a": 1})
+        assert read_json(p) == {"a": 1}
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ── 7. write_json_atomic 并发写同一路径不互相截断 ─────────────────
+
+
+def test_write_json_atomic_concurrent():
+    import json
+    import threading
+
+    from lsim_pkg.storage_base import write_json_atomic
+
+    tmp = tempfile.mkdtemp(prefix="json_atomic_")
+    try:
+        p = os.path.join(tmp, "same.json")
+        payloads = [{"who": i, "blob": "x" * 5000} for i in range(8)]
+
+        def _w(d):
+            for _ in range(5):
+                write_json_atomic(p, d)
+
+        threads = [threading.Thread(target=_w, args=(d,)) for d in payloads]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        # 最终文件必须是某个完整 payload(不是交错/截断的 JSON)
+        with open(p, encoding="utf-8") as f:
+            got = json.load(f)
+        assert got in payloads
+        # 不能留下 .tmp 残渣
+        assert not [f for f in os.listdir(tmp) if f.endswith(".tmp")]
+    finally:
+        import shutil
+
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# ── 8. 残缺存档也能渲染状态卡 ─────────────────────────────────────
+
+
+def test_format_status_tolerates_partial_save():
+    from lsim_pkg.rpg_tools import _format_status
+
+    out = _format_status({"name": "残缺", "level": 3})
+    assert "残缺" in out
+    assert "Lv.3" in out
+
+
+# ── 9. 货币不接受负数 / 非整数 ────────────────────────────────────
+
+
+class _CurPlugin:
+    def __init__(self):
+        self.saved = None
+
+    def _require_char(self, event, target):
+        return "u1", {"name": "K", "currency": 100}, None
+
+    def _persist(self, uid, char):
+        self.saved = dict(char)
+
+
+def test_currency_rejects_negative():
+    p = _CurPlugin()
+    ev = _Event()
+
+    async def _go():
+        out = await LifeSimPlugin.rpg_manage_currency(p, ev, "K", -100, "add")
+        assert "必须 ≥ 0" in out
+        assert p.saved is None  # 未被写入
+        out = await LifeSimPlugin.rpg_manage_currency(p, ev, "K", "abc", "set")
+        assert "必须是整数" in out
+        out = await LifeSimPlugin.rpg_manage_currency(p, ev, "K", 30, "add")
+        assert "130" in out and p.saved["currency"] == 130
+
+    _run(_go())

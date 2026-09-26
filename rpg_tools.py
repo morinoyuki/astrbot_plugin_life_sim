@@ -481,25 +481,41 @@ def _fmt_stat_line(stat: str, char: dict) -> str | None:
 
 
 def _format_status(char: dict) -> str:
-    """角色的富文本状态卡(LLM 直接展示给用户)。"""
+    """角色的富文本状态卡(LLM 直接展示给用户)。
+
+    全部用 .get 取值:旧版/部分损坏的存档缺少字段时也能渲染,
+    而不是 KeyError 把 /状态 整个搞崩。
+    """
     preset = {**DEFAULT_WORLD_RULES, **char.get("world_rules", {})}
     stats = preset.get("stats", [])
-    exp_max = exp_needed(char["level"], preset)
+    level = int(char.get("level", 1) or 1)
+    hp = int(char.get("hp", 0) or 0)
+    max_hp = int(char.get("max_hp", 1) or 1)
+    exp = int(char.get("exp", 0) or 0)
+    exp_max = exp_needed(level, preset)
     session_info = f" | 会话: {char['session_id']}" if char.get("session_id") else ""
 
-    combat_line = f"⚔ ATK: {char['atk']}  🛡 DEF: {char['def']}  💨 SPD: {char['spd']}"
+    combat_line = (
+        f"⚔ ATK: {char.get('atk', 0)}  🛡 DEF: {char.get('def', 0)}  "
+        f"💨 SPD: {char.get('spd', 0)}"
+    )
     if char.get("game_system") == "dnd5e":
         combat_line = (
-            f"⚔ 攻击加值: {char['atk']:+d}  🛡 AC: {char['def']}  "
-            f"💨 移速: {char['spd']}尺"
+            f"⚔ 攻击加值: {int(char.get('atk', 0) or 0):+d}  "
+            f"🛡 AC: {char.get('def', 10)}  💨 移速: {char.get('spd', 30)}尺"
         )
 
     lines = [
-        f"━━ {char['name']} ━━",
-        f"职业: {char.get('class', '无')} | Lv.{char['level']} | 世界: {char['world']}{session_info}",
+        f"━━ {char.get('name', '?')} ━━",
+        (
+            "职业: "
+            f"{char.get('class', '无')} | Lv.{level} | "
+            f"世界: {char.get('world', 'default')}"
+            f"{session_info}"
+        ),
         "",
-        f"HP  {_bar(char['hp'], char['max_hp'])} {char['hp']}/{char['max_hp']}",
-        f"EXP {_bar(char['exp'], exp_max)} {char['exp']}/{exp_max}",
+        f"HP  {_bar(hp, max_hp)} {hp}/{max_hp}",
+        f"EXP {_bar(exp, exp_max)} {exp}/{exp_max}",
         "",
         combat_line,
         f"💰 货币: {char.get('currency', 0)}",
@@ -1740,6 +1756,14 @@ class RPGMixin:
         uid, char, err = self._require_char(event, target)
         if err:
             return err
+        # amount 文档写的是"always positive",但 LLM 可能传负数/非整数 → 显式校验,
+        # 否则 add -100 会把余额扣成负的,set -100 同理
+        try:
+            amount = int(amount)
+        except (TypeError, ValueError):
+            return f"❌ amount 必须是整数,收到 {amount!r}"
+        if amount < 0:
+            return f"❌ amount 必须 ≥ 0(spend 也传正数),收到 {amount}"
         old = char.get("currency", 0)
         if action == "add":
             char["currency"] = old + amount
@@ -1959,7 +1983,11 @@ class RPGMixin:
                 if not fname.endswith(".json"):
                     continue
                 fpath = os.path.join(sess_dir, fname)
-                if os.path.getmtime(fpath) >= cutoff:
+                try:
+                    mtime = os.path.getmtime(fpath)
+                except OSError:
+                    continue  # 并发删除/权限问题,跳过
+                if mtime >= cutoff:
                     continue
                 session_id = fname[:-5]
                 session = store.load_session(session_id)
@@ -1982,7 +2010,11 @@ class RPGMixin:
                 if not fname.endswith(".json"):
                     continue
                 fpath = os.path.join(chars_dir, fname)
-                if os.path.getmtime(fpath) < cutoff:
+                try:
+                    mtime = os.path.getmtime(fpath)
+                except OSError:
+                    continue
+                if mtime < cutoff:
                     if safe_remove(fpath):
                         deleted_saves.append(fname[:-5])
                 else:
