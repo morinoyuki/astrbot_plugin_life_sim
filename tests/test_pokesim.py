@@ -831,6 +831,69 @@ def test_engine_bugfixes():
     assert b._rng(6).random() != b._rng(6).random()
 
 
+def test_battle_action_and_limits():
+    """审计回归:太晶招式解析 / 4 招上限 / 背包 0 / PP 同步 / 战斗护栏 / 倒地编辑。"""
+    from lsim_pkg.pokesim.engine import battle_from_dict
+
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _FakePlugin(tmp)
+        ev = _Event()
+
+        async def run():
+            await p.poke_add_pokemon(ev, "皮卡丘", level=20, moves="thunderbolt,quickattack,growl,tailwhip")
+            await p.poke_add_pokemon(
+                ev, "杰尼龟", level=10,
+                moves="tackle,watergun,tailwhip,withdraw,bite,protect",
+            )
+            data = p._poke_load(ev)
+            assert len(data["party"][1]["moves"]) == 4  # 超过 4 招被截断
+
+            await p.poke_battle_start(ev, "小拉达|10", wild=True)
+            battle = battle_from_dict(p._poke_load(ev)["battle"])
+            act = p._parse_battle_action("tera move 十万伏特", battle, "player")
+            assert act == {"type": "move", "move": "thunderbolt", "tera": True}
+            assert "count 不能为 0" in await p.poke_bag(ev, "伤药", 0)
+            assert "对战中不能调整队伍" in await p.poke_add_pokemon(ev, "小拉达", level=5)
+            assert "对战中不能调整队伍" in await p.poke_remove_pokemon(ev, "2")
+            await p.poke_battle_end(ev)
+
+            # 替换招式时旧招式的 PP 应一并移除
+            await p.poke_learn_move(ev, "杰尼龟", "bite", replace="tackle")
+            m = p._poke_load(ev)["party"][1]
+            assert "tackle" not in m["pp"] and "tackle" not in m["moves"]
+
+            # 对倒地宝可梦改等级:不应“诈尸”,经验应同步到该等级
+            data = p._poke_load(ev)
+            data["party"][0]["cur_hp"] = 0
+            data["party"][0]["fainted"] = True
+            p._poke_save(ev, data)
+            await p.poke_edit_pokemon(ev, "1", level=30)
+            data = p._poke_load(ev)
+            assert data["party"][0]["fainted"] is True
+            assert data["party"][0]["cur_hp"] == 0
+            assert data["party"][0]["exp"] == get_dex().exp_for_level(
+                get_dex().growth_of(data["party"][0]["species"]), 30
+            )
+
+            # 无效道具不消耗
+            await p.poke_heal_party(ev)
+            await p.poke_bag(ev, "伤药", 3)
+            before = p._poke_load(ev)["bag"].get("potion")
+            await p.poke_use_item(ev, "1", "伤药")
+            assert p._poke_load(ev)["bag"].get("potion") == before
+
+        asyncio.run(run())
+
+
+def test_rpg_exp_curve_terminates():
+    """exp_scale<1 时升级循环必须终止(曾经的死循环)。"""
+    from lsim_pkg.rpg_tools import exp_needed
+
+    assert exp_needed(10, {"exp_base": 100, "exp_scale": 0.5}) >= 1
+    assert exp_needed(50, {"exp_base": 100, "exp_scale": 0}) >= 1
+    assert exp_needed(1, {"exp_base": 0, "exp_scale": 1.5}) >= 1
+
+
 if __name__ == "__main__":
     test_dex_lookup_and_types()
     test_dex_stats_and_learnset()
@@ -854,4 +917,6 @@ if __name__ == "__main__":
     test_pokemon_sprites()
     test_tool_arg_coercion()
     test_engine_bugfixes()
+    test_battle_action_and_limits()
+    test_rpg_exp_curve_terminates()
     print("all pokesim tests passed")

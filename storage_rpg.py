@@ -67,8 +67,8 @@ class RpgStore:
 
     def load_char(self, uid: str) -> dict | None:
         char = read_json(self._char_path(uid))
-        if char is None:
-            return None
+        if not isinstance(char, dict):
+            return None  # 文件损坏/类型异常时视为无存档,避免后续索引崩溃
         migrated = False
         for key, default in _OLD_FIELD_MIGRATIONS:
             if key not in char:

@@ -224,7 +224,22 @@ def initialize_dnd5e_character(
 
 
 def exp_needed(level: int, preset: dict) -> int:
-    return int(preset["exp_base"] * (preset["exp_scale"] ** (level - 1)))
+    """升到下一级所需经验。始终 ≥ 1,避免 exp_scale<1 时降为 0 导致死循环。"""
+    try:
+        base = max(1, int(preset.get("exp_base") or 100))
+    except (TypeError, ValueError):
+        base = 100
+    try:
+        scale = float(preset.get("exp_scale") or 1.5)
+    except (TypeError, ValueError):
+        scale = 1.5
+    if scale <= 0:
+        scale = 1.0
+    try:
+        cost = int(base * (scale ** (max(1, int(level)) - 1)))
+    except (OverflowError, ValueError):
+        cost = base
+    return max(1, cost)
 
 
 def parse_points_per_level(val) -> int | list[int]:
@@ -274,7 +289,7 @@ def fmt_ppl(ppl) -> str:
 def apply_levelups(char: dict, preset: dict) -> list[int]:
     """消耗 exp,顺次触发升级,返回新达成的等级列表。原 dict 被原地修改。"""
     level_ups = []
-    while char["exp"] >= exp_needed(char["level"], preset):
+    while char["level"] < 9999 and char["exp"] >= exp_needed(char["level"], preset):
         cost = exp_needed(char["level"], preset)
         char["exp"] -= cost
         char["level"] += 1
@@ -1332,6 +1347,9 @@ class RPGMixin:
             )
             # respec:把所有本应通过升级获得的属性点全部退还为未分配点。
             # 用 = 而非 += 是关键,避免旧的未分配点叠加导致重复计数。
+            # 同时清空 alloc_* 已分配记录,否则会“既退还又保留”导致点数翻倍。
+            for k in [k for k in list(char) if str(k).startswith("alloc_")]:
+                char.pop(k, None)
             char["unspent_points"] = int((char["level"] - 1) * avg_points(attr_pts_raw))
             for attr in old_cb.get("custom", {}):
                 char.pop(attr, None)
@@ -1757,13 +1775,26 @@ class RPGMixin:
         uid, char, err = self._require_char(event, target)
         if err:
             return err
-        normalized_attribute = attribute.strip().upper()
-        if normalized_attribute.startswith("BASE_"):
+        normalized_attribute = attribute.strip()
+        low = normalized_attribute.lower()
+        if low.startswith("base_"):
             normalized_attribute = normalized_attribute[5:]
-        elif normalized_attribute.startswith("ALLOC_"):
+        elif low.startswith("alloc_"):
             normalized_attribute = normalized_attribute[6:]
-        # 始终用规范化后的 key 读写 — 避免 LLM 传 "base_STR" 时绕过 DND 保护
-        attr_key = normalized_attribute
+        # 内置键均为小写(hp/atk/exp/currency…);自定义/世界属性保持原样,
+        # 若角色已有同名键(大小写不敏感)则复用,避免写到错误的新键上。
+        _builtins = {
+            "hp", "max_hp", "atk", "def", "spa", "spd", "spe", "exp",
+            "currency", "kills", "level", "unspent_points",
+        }
+        low = normalized_attribute.lower()
+        if low in _builtins:
+            attr_key = low
+        else:
+            existing = next(
+                (k for k in char if str(k).lower() == low), None
+            )
+            attr_key = existing or normalized_attribute.upper()
         if char.get("game_system") == "dnd5e" and attr_key in DND5E_ABILITIES:
             return "❌ DND 5E 六维属性不能直接修改,请使用 rpg_allocate_point 分配已获得的 ASI。"
         old_val = char.get(attr_key, 0)

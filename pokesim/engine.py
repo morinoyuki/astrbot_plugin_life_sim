@@ -2219,6 +2219,8 @@ def create_pokemon(
             r = dex.resolve_move(m)
             if r and r[0] not in move_keys:
                 move_keys.append(r[0])
+            if len(move_keys) >= 4:
+                break
     else:
         move_keys = dex.default_moveset(key, level)
     if not move_keys:

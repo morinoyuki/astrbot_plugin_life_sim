@@ -554,8 +554,8 @@ class Dex:
             fixed = (ce.get("gender") or "").upper()[:1]
             if fixed in ("M", "F") and gender and gender != fixed:
                 met = False
-            if kind in ("levelFriendship", "levelMove", "levelHold", "levelExtra"):
-                met = met and self._daytime_ok(reason, daytime)
+            # 昼夜限定:对所有进化方式都适用(无条件时为 no-op)
+            met = met and self._daytime_ok(reason, daytime)
             met = met and self._stat_ok(reason, stats)
             low = reason.lower()
             if "female" in low and gender and gender != "F":
@@ -610,11 +610,13 @@ class Dex:
         )
         return [o for o in opts if o["met"] and o["kind"] in kinds]
 
-    def use_item_evolutions(self, species_key: str, item: str | None) -> list[dict]:
-        """使用道具可触发的进化。"""
+    def use_item_evolutions(
+        self, species_key: str, item: str | None, gender: str = ""
+    ) -> list[dict]:
+        """使用道具可触发的进化(带性别限制)。"""
         return [
             o
-            for o in self.evolution_options(species_key, item=item)
+            for o in self.evolution_options(species_key, item=item, gender=gender)
             if o["met"] and o["kind"] == "useItem"
         ]
 

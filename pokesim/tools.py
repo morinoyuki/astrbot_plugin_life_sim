@@ -12,7 +12,7 @@ from __future__ import annotations
 import random
 import re
 
-from .dex import STAT_ORDER, get_dex
+from .dex import STAT_ORDER, _norm, get_dex
 from .encounter import (
     detect_environment,
     roll_encounter,
@@ -235,11 +235,24 @@ class PokemonMixin:
 
     @staticmethod
     def _parse_moves(raw: str) -> list[str]:
+        """解析招式/属性列表:支持多种分隔符,去重并限制为 4 个(宝可梦最多 4 招)。"""
         if not raw:
             return []
         for sep in ("、", "，", ",", "/", "|"):
             raw = raw.replace(sep, ",")
-        return [m.strip() for m in raw.split(",") if m.strip()]
+        out: list[str] = []
+        seen: set[str] = set()
+        for m in (x.strip() for x in raw.split(",")):
+            if not m:
+                continue
+            key = _norm(m)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(m)
+            if len(out) >= 4:
+                break
+        return out
 
     # ──────────────────────────── 图鉴工具 ────────────────────────────
 
@@ -577,6 +590,8 @@ class PokemonMixin:
         """
         dex = get_dex()
         data = self._poke_load(event)
+        if self._battle_active(data):
+            return "⚠️ 对战中不能调整队伍,请先用 poke_battle_end 结束对战(战斗中回复请用 item 道具名)。"
         party = self._party_of(data)
         if len(party) >= MAX_PARTY:
             return "❌ 队伍已满(6 只)。先 poke_remove_pokemon 或存入电脑。"
@@ -608,6 +623,8 @@ class PokemonMixin:
             target(string): 队伍序号(1 起)或名称,如 "2" / "皮卡丘"。
         """
         data = self._poke_load(event)
+        if self._battle_active(data):
+            return "⚠️ 对战中不能调整队伍,请先用 poke_battle_end 结束对战(战斗中回复请用 item 道具名)。"
         found = self._find_member(data, target)
         if not found:
             return f"❌ 队伍里找不到「{target}」。"
@@ -628,6 +645,8 @@ class PokemonMixin:
         """
         dex = get_dex()
         data = self._poke_load(event)
+        if self._battle_active(data):
+            return "⚠️ 对战中不能调整队伍,请先用 poke_battle_end 结束对战(战斗中回复请用 item 道具名)。"
         found = self._find_member(data, target)
         if not found:
             return f"❌ 队伍里找不到「{target}」。"
@@ -666,7 +685,7 @@ class PokemonMixin:
                 )
             forgotten = mon.moves[ri]
             mon.moves[ri] = move_key
-            mon.pp.pop(move_key, None)
+            mon.pp.pop(forgotten, None)
             mon.pp[move_key] = int((dex.moves.get(move_key) or {}).get("pp", 10))
             result = (
                 f"✅ {mon.display} 忘记了「{(dex.moves.get(forgotten) or {}).get('zh', forgotten)}」,"
@@ -705,6 +724,8 @@ class PokemonMixin:
         """
         dex = get_dex()
         data = self._poke_load(event)
+        if self._battle_active(data):
+            return "⚠️ 对战中不能调整队伍,请先用 poke_battle_end 结束对战(战斗中回复请用 item 道具名)。"
         found = self._find_member(data, target)
         if not found:
             return f"❌ 队伍里找不到「{target}」。"
@@ -717,7 +738,11 @@ class PokemonMixin:
                 mon.species, mon.level, mon.ivs, mon.evs, mon.nature
             )
             mon.max_hp = mon.stats["hp"]
-            mon.cur_hp = min(mon.cur_hp, mon.max_hp) or mon.max_hp
+            mon.exp = dex.exp_for_level(dex.growth_of(mon.species), mon.level)
+            if mon.fainted:
+                mon.cur_hp = 0  # 倒下的保持倒下,不因病改等级而“诈尸”
+            else:
+                mon.cur_hp = min(max(1, mon.cur_hp), mon.max_hp)
             changes.append(f"等级→{mon.level}")
         if nature:
             nk = dex.resolve_nature(nature)
@@ -781,6 +806,8 @@ class PokemonMixin:
         """
         dex = get_dex()
         data = self._poke_load(event)
+        if self._battle_active(data):
+            return "⚠️ 对战中不能调整队伍,请先用 poke_battle_end 结束对战(战斗中回复请用 item 道具名)。"
         found = self._find_member(data, target)
         if not found:
             return f"❌ 队伍里找不到「{target}」。"
@@ -929,6 +956,8 @@ class PokemonMixin:
         Args: 无。
         """
         data = self._poke_load(event)
+        if self._battle_active(data):
+            return "⚠️ 对战中不能调整队伍,请先用 poke_battle_end 结束对战(战斗中回复请用 item 道具名)。"
         party = self._party_of(data)
         if not party:
             return "⚠️ 队伍是空的。"
@@ -999,6 +1028,8 @@ class PokemonMixin:
         """
         dex = get_dex()
         data = self._poke_load(event)
+        if self._battle_active(data):
+            return "⚠️ 对战中不能调整队伍,请先用 poke_battle_end 结束对战(战斗中回复请用 item 道具名)。"
         found = self._find_member(data, target)
         if not found:
             return f"❌ 队伍里找不到「{target}」。"
@@ -1261,7 +1292,7 @@ class PokemonMixin:
         if r is None:
             return f"❌ 背包里没有收录「{item}」这种道具。"
         key, entry = r
-        n = int(count or 1)
+        n = int(count)
         if n == 0:
             return "❌ count 不能为 0。"
         if n > 0:
@@ -1307,7 +1338,7 @@ class PokemonMixin:
 
         # ── 使用道具进化(进化石 / 苹果 / 铠甲等)──
         if eff.get("evolve_stone") or eff.get("evolve_item"):
-            opts = dex.use_item_evolutions(mon.species, key)
+            opts = dex.use_item_evolutions(mon.species, key, gender=mon.gender)
             if not opts:
                 return f"⚠️ {mon.display} 对 {entry['zh']} 没有反应。"
             msgs += self._do_evolve(mon, opts[0]["target"])
@@ -1318,8 +1349,12 @@ class PokemonMixin:
             mon.level = min(100, mon.level + int(eff["level_up"]))
             mon.stats = dex.compute_stats(mon.species, mon.level, mon.ivs, mon.evs, mon.nature)
             mon.max_hp = mon.stats["hp"]
+            mon.exp = dex.exp_for_level(dex.growth_of(mon.species), mon.level)
             mon.full_heal()
             msgs.append(f"{mon.display} 升到了 Lv{mon.level}!")
+        # ── PP 提升剂(未实装)──
+        elif eff.get("pp_up"):
+            return f"⚠️ 暂不支持使用 {entry['zh']}(PP 上限提升尚未实装)。"
         # ── 特性胶囊 / 膏药 ──
         elif eff.get("ability_switch") or eff.get("ability_patch"):
             slots = dex.species.get(mon.species, {}).get("abilities") or {}
@@ -1340,13 +1375,19 @@ class PokemonMixin:
         else:
             if mon.fainted and not (eff.get("revive") or eff.get("revive_full")):
                 return f"⚠️ {mon.display} 已失去战斗能力,需要用复活类道具。"
+            before = (mon.cur_hp, mon.status, dict(mon.pp), mon.level)
             battle = Battle(
                 player=Side(name="player", party=[mon]),
                 enemy=Side(name="enemy", party=[]),
             )
             battle._apply_item_effect(mon, eff)
-            msgs.append(f"{mon.display} 使用了 {entry['zh']}。")
-            msgs.extend(battle.log)
+            after = (mon.cur_hp, mon.status, dict(mon.pp), mon.level)
+            if before == after:
+                consumed = False
+                msgs.append(f"{mon.display} 使用了 {entry['zh']},但似乎没有效果……")
+            else:
+                msgs.append(f"{mon.display} 使用了 {entry['zh']}。")
+                msgs.extend(battle.log)
 
         if not msgs:
             return f"⚠️ 无法对 {mon.display} 使用 {entry['zh']}。"
@@ -1358,6 +1399,36 @@ class PokemonMixin:
                 del bag[key]
         self._poke_save(event, data)
         return "\n".join(msgs)
+
+    @staticmethod
+    def _mon_sig(d: dict) -> tuple:
+        return (
+            d.get("species"),
+            d.get("nickname") or "",
+            d.get("level"),
+            d.get("nature") or "",
+        )
+
+    def _sync_battle_party(self, data: dict, battle) -> None:
+        """把对战中的 HP/PP/异常等同步回队伍存档(按成员匹配,保留增删)。"""
+        party = self._party_of(data)
+        snap = {self._mon_sig(m.to_dict()): m.to_dict() for m in battle.player.party}
+        used: set = set()
+        for p in party:
+            sig = self._mon_sig(p)
+            if sig in snap and sig not in used:
+                used.add(sig)
+                p.update(snap[sig])
+        # 队伍里找不到的(极端情况)按顺序补齐,避免状态丢失
+        missing = [d for s, d in snap.items() if s not in used]
+        for d in missing:
+            if len(party) < MAX_PARTY:
+                party.append(d)
+
+    @staticmethod
+    def _battle_active(data: dict) -> bool:
+        b = data.get("battle")
+        return bool(b) and not (b or {}).get("finished")
 
     # ──────────────────────────── 对战工具 ────────────────────────────
 
@@ -1690,7 +1761,7 @@ class PokemonMixin:
                 _ir = resolve_item(parts[3])
                 ent_item = _ir[0] if _ir else ""
             ent_ab = parts[4] if len(parts) > 4 else ""
-            if not mv and i == 0:
+            if not mv:
                 mv = self._parse_moves(enemy_moves)
             single = len(entries) == 1
             try:
@@ -1777,8 +1848,9 @@ class PokemonMixin:
             bd["pvp_scope"] = pvp_scope
             bd["pvp_name"] = b.get("pvp_name")
         data["battle"] = bd
-        # 同步我方队伍状态(HP/PP/异常)与背包
-        data["party"] = [m.to_dict() for m in battle.player.party]
+        # 同步我方队伍状态(HP/PP/异常/能力)——按成员匹配就地更新,
+        # 不用 battle 快照整体覆盖,以免抹掉战斗期间对队伍的其他修改
+        self._sync_battle_party(data, battle)
         data["bag"] = dict(battle.bag)
         if pvp_scope:
             self._sync_pvp(pvp_scope, battle)
@@ -1870,13 +1942,15 @@ class PokemonMixin:
         if low.startswith("tera ") or s.startswith("太晶"):
             tera = True
             s = s.split(" ", 1)[1] if " " in s else s[2:]
-        if s.lower().startswith(("switch", "换人", "替换")):
+            low = s.lower()
+        if low.startswith(("switch", "换人", "替换")):
             rest = s.split(" ", 1)[1] if " " in s else ""
             rest = rest.strip()
             if rest.isdigit():
                 idx = int(rest) - 1
             else:
-                data = {"party": [m.to_dict() for m in battle.player.party]}
+                target_side = battle.enemy if side == "enemy" else battle.player
+                data = {"party": [m.to_dict() for m in target_side.party]}
                 found = self._find_member(data, rest)
                 if not found:
                     return f"❌ 找不到要换上场的宝可梦「{rest}」。"
