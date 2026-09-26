@@ -205,14 +205,14 @@ class PokemonMixin:
         if evs:
             lines.append(f"   努力值: {evs}")
         mv = []
-        for m in mon.moves:
+        for i, m in enumerate(mon.moves, 1):
             info = dex.moves.get(m) or {}
             mv.append(
-                f"{info.get('zh') or info.get('name') or m}"
+                f"{i}.{info.get('zh') or info.get('name') or m}"
                 f"({info.get('type') and dex.type_label(info['type'])}·{info.get('basePower') or '—'}"
                 f"·PP{mon.pp.get(m, info.get('pp', 0))}/{info.get('pp', 0)})"
             )
-        lines.append("   招式: " + "、".join(mv))
+        lines.append("   招式: " + " ".join(mv))
         if entry.get("evos") and not entry.get("battleOnly"):
             evo_names = "、".join(
                 dex.species.get(x, {}).get("zh", x) for x in entry["evos"]
@@ -570,7 +570,7 @@ class PokemonMixin:
         Args:
             target(string): 队伍序号(1 起)或名称。
             move(string): 要学习的招式名(中/英/标识)。
-            replace(string): Optional. 要遗忘的第几个招式(1-4);留空且已满 4 个时会失败。
+            replace(string): Optional. 要遗忘的招式:可写序号(1-4)或招式名;留空且已满 4 个时会失败。
         """
         dex = get_dex()
         data = self._poke_load(event)
@@ -593,17 +593,23 @@ class PokemonMixin:
         if move_key in mon.moves:
             return f"⚠️ {mon.display} 已经会「{mr[1].get('zh')}」了。"
         if len(mon.moves) >= 4:
-            if not replace or not str(replace).strip().isdigit():
-                known_list = "、".join(
-                    (dex.moves.get(m) or {}).get("zh", m) for m in mon.moves
+            ri = -1
+            rq = str(replace or "").strip()
+            if rq.isdigit():
+                ri = int(rq) - 1
+            elif rq:
+                rr = dex.resolve_move(rq)
+                if rr and rr[0] in mon.moves:
+                    ri = mon.moves.index(rr[0])
+            if ri < 0 or ri >= len(mon.moves):
+                known_list = " ".join(
+                    f"{i}.{(dex.moves.get(m) or {}).get('zh', m)}"
+                    for i, m in enumerate(mon.moves, 1)
                 )
                 return (
                     f"⚠️ {mon.display} 已会 4 个招式({known_list})。"
-                    f"请用 replace 指定要遗忘的招式序号(1-4)。"
+                    f"请用 replace 指定要遗忘的招式(序号 1-4 或招式名)。"
                 )
-            ri = int(replace) - 1
-            if ri < 0 or ri >= len(mon.moves):
-                return "❌ replace 序号无效(应为 1-4)。"
             forgotten = mon.moves[ri]
             mon.moves[ri] = move_key
             mon.pp.pop(move_key, None)
@@ -1017,8 +1023,13 @@ class PokemonMixin:
                     mon.pp[mv] = int((dex.moves.get(mv) or {}).get("pp", 10) or 10)
                     msgs.append(f"   {mon.display} 学会了「{label}」!")
                 else:
+                    cur = " ".join(
+                        f"{i}.{(dex.moves.get(m) or {}).get('zh', m)}"
+                        for i, m in enumerate(mon.moves, 1)
+                    )
                     msgs.append(
-                        f"   {mon.display} 想学「{label}」,但招式已满(用 poke_learn_move 替换)。"
+                        f"   {mon.display} 想学「{label}」,但招式已满:{cur}。"
+                        f"请先询问玩家要遗忘哪个,再调 poke_learn_move(replace=序号或招式名)。"
                     )
             evos = dex.level_evolutions(
                 mon.species,

@@ -380,6 +380,38 @@ def test_pokemon_evolution():
     _evo_tool_scenario()
 
 
+def _move_replace_scenario():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _FakePlugin(tmp)
+        ev = _Event()
+
+        async def run():
+            await p.poke_add_pokemon(ev, "皮卡丘", level=5, moves="thundershock,growl,tailwhip")
+            r = await p.poke_train(ev, "1", sessions=30)
+            # 满 4 招时提示应带序号与招式名
+            full = [ln for ln in r.splitlines() if "招式已满" in ln]
+            assert full, r
+            assert "1." in full[0] and "replace" in full[0]
+            # 队伍招式带序号
+            team = await p.poke_team(ev)
+            assert "招式: 1." in team
+            # 按招式名遗忘
+            out = await p.poke_learn_move(ev, "1", move="十万伏特", replace="摇尾巴")
+            assert "忘记了" in out and "十万伏特" in out
+            # 按序号遗忘
+            out = await p.poke_learn_move(ev, "1", move="电光一闪", replace="1")
+            assert "学会了「电光一闪」" in out
+            # 非法 replace 应拒绝
+            out = await p.poke_learn_move(ev, "1", move="打雷", replace="不存在的招")
+            assert "replace" in out and "序号" in out
+
+        asyncio.run(run())
+
+
+def test_pokemon_move_replace():
+    _move_replace_scenario()
+
+
 if __name__ == "__main__":
     test_dex_lookup_and_types()
     test_dex_stats_and_learnset()
@@ -390,4 +422,5 @@ if __name__ == "__main__":
     test_pokemon_items_and_catch()
     test_pokemon_train_and_pvp()
     test_pokemon_evolution()
+    test_pokemon_move_replace()
     print("all pokesim tests passed")
