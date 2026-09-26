@@ -441,6 +441,23 @@ def test_pokemon_battle_pp_rules():
         asyncio.run(run())
 
 
+def test_pokemon_learnset_display():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _FakePlugin(tmp)
+        ev = _Event()
+
+        async def run():
+            out = await p.poke_learnset(ev, "皮卡丘")
+            assert "升级 Lv" in out and "─ 升级招式 ─" in out
+            assert "十万伏特" in out
+            lv30 = await p.poke_learnset(ev, "皮卡丘", level=30)
+            assert "打雷" not in lv30.split("─ 升级招式 ─")[1].split("─")[0]  # Lv44 尚未学会
+            only_lv = await p.poke_learnset(ev, "皮卡丘", include_tm=False)
+            assert "学习器·教学 0" in only_lv
+
+        asyncio.run(run())
+
+
 if __name__ == "__main__":
     test_dex_lookup_and_types()
     test_dex_stats_and_learnset()
@@ -453,4 +470,5 @@ if __name__ == "__main__":
     test_pokemon_evolution()
     test_pokemon_move_replace()
     test_pokemon_battle_pp_rules()
+    test_pokemon_learnset_display()
     print("all pokesim tests passed")

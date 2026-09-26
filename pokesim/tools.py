@@ -438,13 +438,49 @@ class PokemonMixin:
         )
         if not items:
             return f"「{dex.species[key]['zh']}」没有记录到可学招式。"
-        lines = [f"【{dex.species[key]['zh']} 可学招式】(共 {len(items)} 个)"]
-        for it in items:
-            m = dex.moves.get(it["move"]) or {}
-            label = m.get("zh") or m.get("name") or it["move"]
-            lines.append(f"- {label} [{','.join(it['methods'])}]")
+        code_zh = {
+            "L": "升级",
+            "M": "学习器",
+            "T": "教学",
+            "E": "蛋招",
+            "S": "活动",
+            "V": "虚拟主机",
+        }
+
+        def _fmt(methods: list) -> str:
+            out = []
+            for code in methods:
+                s = str(code)
+                if s.startswith("L") and s[1:].isdigit():
+                    out.append(f"升级 Lv{s[1:]}")
+                else:
+                    out.append(code_zh.get(s[:1], s))
+            return " / ".join(out)
+
+        lv_items = [it for it in items if any(str(c).startswith("L") for c in it["methods"])]
+        other = [it for it in items if not any(str(c).startswith("L") for c in it["methods"])]
+        header = (
+            f"【{dex.species[key]['zh']} 可学招式】(共 {len(items)} 个:"
+            f"升级 {len(lv_items)} / 学习器·教学 {len(other)})"
+        )
+        lines = [
+            header,
+            "升级 = 等级提升自然学会;学习器 = 招式学习器/秘传机;教学 = 招式教学",
+        ]
+        if lv_items:
+            lines.append("─ 升级招式 ─")
+            for it in lv_items:
+                m = dex.moves.get(it["move"]) or {}
+                label = m.get("zh") or m.get("name") or it["move"]
+                lines.append(f"- {label} ({_fmt(it['methods'])})")
+        if other:
+            lines.append("─ 学习器 / 教学 / 其他 ─")
+            for it in other:
+                m = dex.moves.get(it["move"]) or {}
+                label = m.get("zh") or m.get("name") or it["move"]
+                lines.append(f"- {label} ({_fmt(it['methods'])})")
         if len(lines) > 90:
-            lines = lines[:90] + [f"…(其余 {len(items) - 89} 个已省略)"]
+            lines = lines[:90] + [f"…(其余 {len(lines) - 90} 行已省略,可用 level 参数过滤)"]
         return "\n".join(lines)
 
     # ──────────────────────────── 队伍工具 ────────────────────────────
