@@ -22,7 +22,7 @@ _pkg = importlib.util.module_from_spec(_spec)
 sys.modules["lsim_pkg"] = _pkg
 _spec.loader.exec_module(_pkg)
 
-from lsim_pkg.storage_branch import BranchStore, _encode_name, _decode_name
+from lsim_pkg.storage_branch import BranchStore, _decode_name, _encode_name
 from lsim_pkg.storage_narrative import NarrativeStore
 from lsim_pkg.storage_sim import SimStore
 
@@ -97,7 +97,8 @@ async def _test_clear_and_migration(tmp):
     loaded = await p._load_sim(ev)
     leg = loaded.pop("branches", None)
     assert isinstance(leg, dict)
-    await p.branch_store.save(scope, list(leg)[0], leg[list(leg)[0]])
+    name0 = next(iter(leg))
+    await p.branch_store.save(scope, name0, leg[name0])
     await p._save_sim(ev, loaded)
     assert set(await p.branch_store.list(scope)) == {"旧1"}
     assert "branches" not in await p._load_sim(ev)

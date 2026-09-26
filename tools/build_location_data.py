@@ -126,7 +126,7 @@ def fetch_csv(name: str) -> list[dict]:
         os.makedirs(CACHE_DIR, exist_ok=True)
         url = POKEAPI_CSV + name
         print(f"  ↓ {name}")
-        with urllib.request.urlopen(url, timeout=90) as resp:  # noqa: S310
+        with urllib.request.urlopen(url, timeout=90) as resp:
             data = resp.read()
         with open(path, "wb") as fh:
             fh.write(data)
@@ -139,9 +139,9 @@ def _http_json(url: str, tries: int = 4) -> dict:
     for attempt in range(tries):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=60) as resp:  # noqa: S310
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 return json.loads(resp.read().decode("utf-8"))
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last = exc
             time.sleep(1.5 * (attempt + 1))
     print(f"    ! 请求失败: {last}")
@@ -250,7 +250,7 @@ def norm_zh(zh: str) -> str:
 
 
 def fallback_zh(loc_key: str, name: str) -> str:
-    m = re.search(r"route[-_ ]?(\d+)", loc_key, re.I) or re.search(r"Route (\d+)", name)
+    m = re.search(r"route[-_ ]?(\d+)", loc_key, re.IGNORECASE) or re.search(r"Route (\d+)", name)
     if m:
         return f"{int(m.group(1))}号道路"
     return ""
@@ -433,7 +433,7 @@ def main():
     for (reg, loc_key, vgname), pools in agg.items():
         loc_id = next((lid for lid, l in locs.items() if l["identifier"] == loc_key), None)
         candidates: list[str] = []
-        if loc_key in poke52 and poke52[loc_key]:
+        if poke52.get(loc_key):
             candidates.append(poke52[loc_key])
         if bulba.get(loc_key):
             candidates.append(bulba[loc_key])

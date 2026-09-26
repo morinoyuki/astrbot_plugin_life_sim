@@ -23,9 +23,9 @@ _spec.loader.exec_module(_pkg)
 
 from lsim_pkg.main import (
     LifeSimPlugin,
-    _strip_meta_tags,
-    _restore_images_from_content,
     _content_to_text,
+    _restore_images_from_content,
+    _strip_meta_tags,
 )
 from lsim_pkg.storage_narrative import NarrativeStore
 from lsim_pkg.storage_sim import SimStore
@@ -93,10 +93,10 @@ class _FakePlugin:
 
 def _make_session(scope):
     """两轮历史:turn1 与 turn2(第二轮带 system_reminder / narrative_ref 标签)。"""
-    r1 = {"id": "n_11111111", "scope": scope, "narrative": "第一轮剧情",
+    _r1 = {"id": "n_11111111", "scope": scope, "narrative": "第一轮剧情",
           "user_action": "输入1", "created_at": "2026-01-01T00:00:01+0800",
           "revised_at": "2026-01-01T00:00:01+0800", "revised_count": 0}
-    r2 = {"id": "n_22222222", "scope": scope, "narrative": "第二轮剧情(有问题)",
+    _r2 = {"id": "n_22222222", "scope": scope, "narrative": "第二轮剧情(有问题)",
           "user_action": "输入2", "created_at": "2026-01-01T00:00:02+0800",
           "revised_at": "2026-01-01T00:00:02+0800", "revised_count": 0}
     user2 = (
@@ -167,18 +167,15 @@ async def test_redo_flow():
         # 预置 narrative 历史
         await p.narrative_store.append(scope, {"narrative": "第一轮剧情"})
         # 手动写入两轮记录(用固定 id 覆盖)
-        from lsim_pkg.storage_base import write_json_atomic
-        from lsim_pkg.storage_narrative import _gen_id
         d = os.path.join(tmp, "narrative_history", scope)
         os.makedirs(d, exist_ok=True)
         import json as _json
-        r1 = session["narrative_snapshots"][0]
         # 重新构造真实记录文件
-        with open(os.path.join(d, "n_11111111.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(d, "n_11111111.json"), "w", encoding="utf-8") as f:  # noqa: ASYNC230
             _json.dump({"id": "n_11111111", "scope": scope, "narrative": "第一轮剧情",
                         "created_at": "2026-01-01T00:00:01+0800",
                         "revised_at": "2026-01-01T00:00:01+0800", "revised_count": 0}, f, ensure_ascii=False)
-        with open(os.path.join(d, "n_22222222.json"), "w", encoding="utf-8") as f:
+        with open(os.path.join(d, "n_22222222.json"), "w", encoding="utf-8") as f:  # noqa: ASYNC230
             _json.dump({"id": "n_22222222", "scope": scope, "narrative": "第二轮剧情",
                         "created_at": "2026-01-01T00:00:02+0800",
                         "revised_at": "2026-01-01T00:00:02+0800", "revised_count": 0}, f, ensure_ascii=False)

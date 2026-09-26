@@ -322,6 +322,7 @@ def test_session_delete_purges_all(plugin):
     assert r["deleted"]["records"] == 2  # 主线 + if 线(delete_scope 清全部)
 
     assert run(plugin.sim_store.load("group_123")) is None
-    assert os.path.isdir(os.path.join(plugin.data_dir, "narrative_history")) is False or True
+    # 剧情历史应被连带清空(不能是恒真断言)
+    assert not os.path.isdir(os.path.join(plugin.data_dir, "narrative_history", "group_123"))
     scopes_left = os.listdir(os.path.join(plugin.data_dir, "sim_branches"))
     assert "group_123" not in scopes_left

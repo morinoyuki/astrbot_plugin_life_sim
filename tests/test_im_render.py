@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """im_render 渲染引擎测试。
 
 运行(在插件根目录):
@@ -6,7 +5,8 @@
 """
 import os
 import sys
-import io
+
+import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -14,10 +14,9 @@ if ROOT not in sys.path:
 
 from PIL import Image as PILImage
 
+from im_render import markdown as md
 from im_render import render_narrative
 from im_render.engine import ChatRenderer, TooManyPages
-from im_render import markdown as md
-
 
 SAMPLE = """她的目光扫过柜台，落在那个熟悉的身影上。
 
@@ -100,16 +99,23 @@ print("hello")
 
 
 def test_too_many_pages():
-    r = ChatRenderer(width=400, max_pages=2)
-
-    # 构造大量内容
-    long_text = "\n".join(f'<d name="阿龙">第{i}条消息,这是一段比较长的内容</d>' for i in range(50))
+    # 超限:必须抛 TooManyPages(不能靠 try/except 空过)
+    r = ChatRenderer(width=480, max_pages=1, page_max_height=200)
+    long_text = "\n".join(
+        f'<d name="阿龙">第{i}条消息,这是一段比较长的内容让大家看看分页是否生效</d>'
+        for i in range(60)
+    )
     blocks = md.parse_blocks(long_text)
-    try:
+    with pytest.raises(TooManyPages):
         r.render(blocks, title="分页")
-        # 可能不分页
-    except TooManyPages:
-        pass
+
+    # 正常:不超限时应返回至少 1 页且不超过上限
+    r2 = ChatRenderer(width=1024, max_pages=6)
+    short_text = '\n'.join(
+        f'<d name="阿龙">第{i}条消息</d>' for i in range(3)
+    )
+    imgs = r2.render(md.parse_blocks(short_text), title="分页")
+    assert 1 <= len(imgs) <= 6
 
 
 def test_empty_text():
@@ -125,8 +131,8 @@ def test_no_dialogue_text():
 
 def test_heading_uses_title_font():
     from im_render import markdown as md
-    from im_render.engine import ChatRenderer
     from im_render import style as st
+    from im_render.engine import ChatRenderer
 
     st.search_fonts()
     if not st._title_font_path:
@@ -179,6 +185,7 @@ def test_dialogue_and_capsule_tags():
     assert [b.type for b in blocks] == ["dialogue", "capsule", "dialogue"]
     d0, cap, d1 = blocks
     assert d0.speaker == "阿龙" and d0.protagonist is False and d0.avatar is None
+    assert cap.type == "capsule" and any("巡逻中" in s.text for s in cap.spans)
     assert d1.speaker == "凌霜" and d1.protagonist is True
 
     # 未闭合 / 缺 name 的残缺标签 → 不当对白,且标签文本不会漏进段落

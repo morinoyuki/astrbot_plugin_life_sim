@@ -21,7 +21,7 @@ _pkg = importlib.util.module_from_spec(_spec)
 sys.modules["lsim_pkg"] = _pkg
 _spec.loader.exec_module(_pkg)
 
-from lsim_pkg.main import LifeSimPlugin, _narrative_branch
+from lsim_pkg.main import LifeSimPlugin
 from lsim_pkg.storage_narrative import NarrativeStore
 from lsim_pkg.storage_sim import SimStore
 
@@ -105,7 +105,6 @@ async def run_scenario(name, total_turns, real_turns, undo_n, expect_deleted):
         assert stats is not None, f"[{name}] 没有可撤销的轮次?"
         assert stats["user_n"] == min(undo_n, real_turns), stats["user_n"]
         after = await p.narrative_store.list(scope, branch)
-        deleted = before_count = None
         narr_stats = stats["narr_stats"] or {}
         deleted = narr_stats.get("deleted", 0)
         print(f"[{name}] total={total_turns} real={real_turns} undo={undo_n} "
@@ -114,6 +113,7 @@ async def run_scenario(name, total_turns, real_turns, undo_n, expect_deleted):
             f"[{name}] BUG: /undo {undo_n} 应删除 {expect_deleted} 条剧情记录,"
             f"实际 {deleted} 条"
         )
+        assert len(after) == len(before) - deleted, (len(before), deleted, len(after))
         # 剧情记录与消息截断的一致性:剩余记录数 = 剩余真实轮数
         remain_msgs = sum(1 for m in session["messages"] if m.get("role") == "user")
         assert len(after) == max(0, real_turns - undo_n), (

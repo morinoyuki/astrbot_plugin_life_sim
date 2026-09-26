@@ -22,9 +22,9 @@ _pkg = importlib.util.module_from_spec(_spec)
 sys.modules["lsim_pkgc"] = _pkg
 _spec.loader.exec_module(_pkg)
 
-from lsim_pkgc.storage_narrative import (  # noqa: E402
-    NarrativeStore,
+from lsim_pkgc.storage_narrative import (
     HISTORY_FILE,
+    NarrativeStore,
 )
 
 LORE = {
@@ -60,7 +60,7 @@ async def test_append_dedup_and_single_file():
         # 单文件:目录下只有 history.json,内含版本表
         files = glob.glob(os.path.join(tmp, "narrative_history", scope, "*.json"))
         assert files == [os.path.join(tmp, "narrative_history", scope, HISTORY_FILE)], files
-        hist = json.load(open(files[0], encoding="utf-8"))
+        hist = json.load(open(files[0], encoding="utf-8"))  # noqa: ASYNC230, SIM115
         v = hist["versions"]
         assert len(v["world_setting"]) == 1
         assert len(v["character_lore"]) == 1
@@ -82,7 +82,7 @@ async def test_legacy_migration():
         d = os.path.join(tmp, "narrative_history", scope)
         os.makedirs(d, exist_ok=True)
         for i in range(3):
-            with open(os.path.join(d, f"n_old{i}.json"), "w", encoding="utf-8") as f:
+            with open(os.path.join(d, f"n_old{i}.json"), "w", encoding="utf-8") as f:  # noqa: ASYNC230
                 json.dump({"id": f"n_old{i}", "scope": scope, "narrative": f"旧{i}", **LORE}, f, ensure_ascii=False)
         records = await s.list(scope)  # 触发迁移
         assert len(records) == 3
@@ -152,6 +152,7 @@ async def test_overwrite_all_branch():
         # 分支复制:用 list 结果重建另一 scope → 独立历史
         scope2 = "group_g2"
         res2 = await s.overwrite_all(scope2, await s.list(scope))
+        assert res2["written"] == 1
         r2 = await s.list(scope2)
         assert len(r2) == 1 and r2[0]["narrative"] == target["narrative"]
         print("overwrite_all (branch copy) OK")

@@ -370,7 +370,9 @@ async def test_multi_key_match():
         assert a == {"汐见花音", "花音"}, (mention, a)
 
     # 读取工具端到端:传 "花音" 返回两个 key 的完整 lore
-    import tempfile as _tf, shutil as _sh
+    import shutil as _sh
+    import tempfile as _tf
+
     from lsim_pkg.storage_sim import SimStore as _SS
 
     tmp = _tf.mkdtemp(prefix="lore_multi_")

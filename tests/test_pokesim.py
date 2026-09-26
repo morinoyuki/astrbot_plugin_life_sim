@@ -131,13 +131,21 @@ def test_engine_tera_and_switch():
 def test_engine_serialization():
     p = create_pokemon("喷火龙", 60, moves=["flamethrower"])
     e = create_pokemon("妙蛙花", 60, moves=["solarbeam"])
-    b = start_battle([p], [e], seed=9)
+    b = start_battle([p], [e], seed=9, weather="rain",
+                     bag={"potion": 3, "ultra-ball": 2})
     b.start()
     b.step({"type": "move", "move": "flamethrower"})
     d = battle_to_dict(b)
     b2 = battle_from_dict(d)
+    # 完整往返相等(含 PP / 异常 / 能力等级 / 天气 / 场地 / 背包 / 陷阱 / 标记位)
+    assert battle_to_dict(b2) == d
     assert b2.turn == b.turn
     assert b2.player.mon.cur_hp == b.player.mon.cur_hp
+    assert b2.player.mon.pp == b.player.mon.pp
+    assert b2.player.mon.status == b.player.mon.status
+    assert b2.player.mon.stages == b.player.mon.stages
+    assert b2.weather == b.weather == "rain"
+    assert b2.bag == {"potion": 3, "ultra-ball": 2}
     assert b2.enemy.mon.species == "venusaur"
 
 
@@ -299,9 +307,16 @@ def _train_pvp_scenario():
                 r = await p.poke_battle_turn(a, "move thundershock")
                 if "战斗结束" in r:
                     break
-            # 对手队伍被写回(战斗后 HP 不是满的)
+            # 对手队伍被写回(战斗后必定至少有一方掉血/倒下)
             bteam = await p.poke_team(b)
             assert "小火龙" in bteam
+            db = p._poke_load(b)
+            da = p._poke_load(a)
+            damaged = lambda party: any(
+                m.get("cur_hp", 1) < m.get("max_hp", 1) or m.get("fainted")
+                for m in party
+            )
+            assert damaged(db["party"]) or damaged(da["party"])
 
         asyncio.run(run())
 
@@ -351,11 +366,62 @@ def test_evolution_methods():
     # 能力值分支
     assert "hitmonlee" in met("tyrogue", level=20, stats={"atk": 50, "def": 40})
     assert "hitmonchan" in met("tyrogue", level=20, stats={"atk": 40, "def": 50})
+    # 进化石带性别限制(奇鲁莉安:♂+觉醒之石→艾路雷朵)
+    assert "gallade" in {
+        o["target"] for o in d.use_item_evolutions("kirlia", "dawn-stone", gender="M")
+    }
+    assert not d.use_item_evolutions("kirlia", "dawn-stone", gender="F")
     assert "hitmontop" in met("tyrogue", level=20, stats={"atk": 45, "def": 45})
     # 悬空引用已清零
     for k, v in d.species.items():
         for e in v.get("evos") or []:
             assert e in d.species, f"{k} -> {e} missing"
+
+
+def test_catch_rate_and_ball_bonus():
+    """捕获率 / 精灵球加成 / 摇晃判定:大师球必中,普通球对高难目标会失败。"""
+    from lsim_pkg.pokesim.engine import battle_from_dict, start_battle
+    from lsim_pkg.pokesim.items import BAG_ITEMS
+
+    def mk(s):
+        return create_pokemon(s, 50)
+
+    b = start_battle(
+        [mk("pikachu")], [mk("mewtwo")], seed=7, wild=True,
+        bag={"poke-ball": 5, "ultra-ball": 5, "master-ball": 1, "net-ball": 5},
+    )
+    assert b._catch_rate(b.player.mon) == 190
+    assert b._catch_rate(b.enemy.mon) == 3
+    pb, ub, nb = BAG_ITEMS["poke-ball"], BAG_ITEMS["ultra-ball"], BAG_ITEMS["net-ball"]
+    assert b._ball_bonus(ub, b.player.mon) > b._ball_bonus(pb, b.player.mon)
+    assert b._ball_bonus(nb, mk("magikarp")) > b._ball_bonus(pb, mk("magikarp"))
+    # 普通球对满血超梦应失败(确定性)
+    b2 = start_battle([mk("pikachu")], [mk("mewtwo")], seed=0, wild=True,
+                      bag={"poke-ball": 5})
+    b2._execute_catch(b2.player, b2.enemy, {"type": "catch", "item": "poke-ball"})
+    assert b2.captured is None and b2.bag.get("poke-ball") == 4
+    # 大师球必中
+    b3 = start_battle([mk("pikachu")], [mk("mewtwo")], wild=True,
+                      bag={"master-ball": 1})
+    b3._execute_catch(b3.player, b3.enemy, {"type": "catch", "item": "master-ball"})
+    assert b3.captured is not None
+    # 捕获结果可序列化
+    assert battle_from_dict(b3.to_dict()).captured is not None
+
+
+def test_ev_caps():
+    """努力值单项 ≤252、总 ≤510。"""
+
+    class _P(PokemonMixin):
+        pass
+
+    inst = _P.__new__(_P)
+    mon = create_pokemon("pikachu", 50)
+    assert "努力值" in "".join(inst._gain_evs(mon, {"spe": 9999}))
+    assert mon.evs["spe"] == 252
+    inst._gain_evs(mon, {"hp": 9999, "atk": 9999})
+    assert mon.evs["hp"] == 252
+    assert sum(mon.evs.values()) <= 510
 
 
 def _evo_tool_scenario():
@@ -919,4 +985,6 @@ if __name__ == "__main__":
     test_engine_bugfixes()
     test_battle_action_and_limits()
     test_rpg_exp_curve_terminates()
+    test_catch_rate_and_ball_bonus()
+    test_ev_caps()
     print("all pokesim tests passed")
