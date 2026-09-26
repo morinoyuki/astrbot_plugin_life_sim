@@ -2,9 +2,10 @@
 - 模式 A: 纯叙事(默认)
 - 模式 B: 游戏世界 RPG(HP/等级/装备/经验) — 来自 rpg_tools.RPGMixin
 - 模式 C: DND 跑团(RPG + D20 骰子) — 来自 dice.DiceMixin
-- 模式 P: 宝可梦世界(Gen9 数据 + 培养/对战/太晶化) — 来自 pokesim.tools.PokemonMixin
+- 模式 P: 宝可梦世界(Gen9 数据 + 真实地点分布 + 培养/对战/太晶化) — 来自 pokesim.tools.PokemonMixin
 - 独立上下文: 叙事历史 KV 存储 + 显式 contexts
-- 4 个指令: /创建 /do /进度 /删除
+- 指令: /帮助 /创建 /do /进度 /队伍 /dump /删除 /undo /redo /历史 /上传历史 /删除历史 /分支 /lore /头像 /删除头像
+  (完整说明见 prompts.HELP_TEXT)
 """
 
 import asyncio
@@ -4251,6 +4252,11 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
                 return
             text = await self.poke_team(event)
             yield event.plain_result(text)
+
+    @filter.command("帮助", alias={"help", "help_text", "说明"})
+    async def cmd_help(self, event: AstrMessageEvent):
+        """/帮助 - 查看模式说明、指令列表与宝可梦模式玩法"""
+        yield event.plain_result(HELP_TEXT)
 
     @filter.command("dump")
     async def cmd_dump(self, event: AstrMessageEvent):
