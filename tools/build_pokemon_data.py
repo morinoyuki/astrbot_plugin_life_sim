@@ -29,6 +29,17 @@ POKEAPI_CSV = "https://raw.githubusercontent.com/PokeAPI/pokeapi/master/data/v2/
 POKE_ENV_WHEEL_URL = "https://files.pythonhosted.org/packages/source/p/poke-env/"
 
 ZH_HANS = "12"
+EN = "9"
+
+
+def clean_flavor(text: str | None) -> str:
+    """把 PokeAPI 图鉴说明里的换行/换页/软连字符清成单行。"""
+    if not text:
+        return ""
+    out = str(text)
+    for ch in ("\n", "\r", "\f", "\v", "\u00ad", "\u000c"):
+        out = out.replace(ch, " ")
+    return " ".join(out.split())
 
 TYPE_ZH = {
     "Normal": "一般",
@@ -242,6 +253,21 @@ def build() -> None:
         key = pstat.get(r.get("stat_id", ""))
         if sid and key:
             ev_by_species.setdefault(sid, {})[key] = eff
+    # 图鉴说明(介绍文字):优先简体中文,回退英文,各取最新版本
+    flavor_zh: dict[str, tuple[int, str]] = {}
+    flavor_en: dict[str, tuple[int, str]] = {}
+    for r in fetch_csv("pokemon_species_flavor_text.csv"):
+        sid = r.get("species_id")
+        text = clean_flavor(r.get("flavor_text"))
+        if not sid or not text:
+            continue
+        vid = int(r.get("version_id") or 0)
+        lang = r.get("language_id")
+        if lang == ZH_HANS and (sid not in flavor_zh or vid > flavor_zh[sid][0]):
+            flavor_zh[sid] = (vid, text)
+        elif lang == EN and (sid not in flavor_en or vid > flavor_en[sid][0]):
+            flavor_en[sid] = (vid, text)
+
     # 蛋群
     egg_group_name = {r["id"]: r["identifier"] for r in fetch_csv("egg_groups.csv")}
     egg_by_species: dict[str, list[str]] = {}
@@ -299,6 +325,12 @@ def build() -> None:
         eggs = egg_by_species.get(str(num))
         if eggs:
             entry["eggGroups"] = eggs
+        fz = flavor_zh.get(str(num))
+        if fz:
+            entry["flavor"] = fz[1]
+        fe = flavor_en.get(str(num))
+        if fe:
+            entry["flavorEn"] = fe[1]
         for f in (
             "heightm",
             "weightkg",

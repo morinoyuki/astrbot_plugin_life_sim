@@ -47,16 +47,21 @@ EGG_ZH = {
     "water1": "水中1",
     "bug": "虫",
     "flying": "飞行",
+    "ground": "陆上",
     "field": "陆上",
     "fairy": "妖精",
+    "plant": "植物",
     "grass": "植物",
+    "humanshape": "人形",
     "human-like": "人形",
     "water3": "水中3",
     "mineral": "矿物",
+    "indeterminate": "不定形",
     "amorphous": "不定形",
     "water2": "水中2",
     "ditto": "百变怪",
     "dragon": "龙",
+    "no-eggs": "未发现",
     "undiscovered": "未发现",
 }
 
@@ -239,7 +244,7 @@ class PokemonMixin:
     # ──────────────────────────── 图鉴工具 ────────────────────────────
 
     async def poke_dex_species(self, event, name: str) -> str:
-        """查询宝可梦图鉴:属性、种族值、特性、进化、身高体重。
+        """查询宝可梦图鉴:图鉴说明、属性、种族值、特性、进化、身高体重。
 
         Args:
             name(string): 宝可梦名称,支持中文/英文/标识,如 "皮卡丘" / "Pikachu" / "pikachu" / "喷火龙（Mega-X）"。
@@ -279,7 +284,8 @@ class PokemonMixin:
         elif gr == 8:
             lines.append("性别: 仅雌性")
         elif 0 <= gr <= 8:
-            lines.append(f"性别: 雄性 {87.5 - gr * 12.5:g}% / 雌性 {gr * 12.5:g}%")
+            female = gr * 12.5
+            lines.append(f"性别: 雄性 {100 - female:g}% / 雌性 {female:g}%")
         eg = e.get("eggGroups") or []
         if eg:
             lines.append(
@@ -326,6 +332,10 @@ class PokemonMixin:
             lines.append(f"固定太晶属性: {dex.type_label(e['requiredTeraType'])}")
         if e.get("requiredItem"):
             lines.append(f"需要道具: {e['requiredItem']} (key={key})")
+        if e.get("flavor"):
+            lines.append(f"图鉴说明: {e['flavor']}")
+        if e.get("flavorEn"):
+            lines.append(f"图鉴说明(EN): {e['flavorEn']}")
         return "\n".join(lines)
 
     async def poke_dex_move(self, event, name: str) -> str:
@@ -1445,6 +1455,10 @@ class PokemonMixin:
                 + f" · 稀有度:{enc['rarity']})"
             )
         out = await self.poke_battle_start(event, enemy=f"{enc['zh']}|{lvl}", wild=True)
+        entry = dex.species.get(enc["species"]) or {}
+        flav = entry.get("flavor") or entry.get("flavorEn") or ""
+        if flav:
+            head += f"\n📖 {flav}"
         return head + "\n\n" + out
 
     async def poke_dex_location(

@@ -47,7 +47,8 @@ def build_id_map() -> dict[str, str]:
         if r["id"] == r["species_id"]:
             default_by_species_id[r["species_id"]] = r["id"]
 
-    species = json.load(open(SPECIES, encoding="utf-8"))
+    with open(SPECIES, encoding="utf-8") as fh:
+        species = json.load(fh)
     out: dict[str, str] = {}
     for key, entry in species.items():
         pid = direct.get(norm(key))
@@ -70,7 +71,7 @@ def fetch(pid: str, dest: str) -> tuple[str, int]:
     for attempt in range(3):
         try:
             req = urllib.request.Request(BASE + f"{pid}.png", headers={"User-Agent": UA})
-            with urllib.request.urlopen(req, timeout=30) as resp:  # noqa: S310
+            with urllib.request.urlopen(req, timeout=30) as resp:
                 data = resp.read()
             if not data:
                 return "empty", 0
@@ -80,7 +81,7 @@ def fetch(pid: str, dest: str) -> tuple[str, int]:
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
                 return "404", 0
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
     return "fail", 0
 
@@ -88,7 +89,8 @@ def fetch(pid: str, dest: str) -> tuple[str, int]:
 def main():
     os.makedirs(OUT_DIR, exist_ok=True)
     idmap = build_id_map()
-    species = json.load(open(SPECIES, encoding="utf-8"))
+    with open(SPECIES, encoding="utf-8") as fh:
+        species = json.load(fh)
     print(f"物种 {len(species)},可映射 {len(idmap)}")
 
     stats = {"ok": 0, "skip": 0, "404": 0, "fail": 0, "empty": 0, "bytes": 0}
@@ -102,7 +104,7 @@ def main():
             key = futures[fut]
             try:
                 kind, size = fut.result()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 kind, size = "fail", 0
             stats[kind] = stats.get(kind, 0) + 1
             stats["bytes"] += size

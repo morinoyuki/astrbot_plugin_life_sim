@@ -65,6 +65,17 @@ def test_dex_lookup_and_types():
     assert dex.type_multiplier("Electric", ["Water", "Flying"]) == 4.0
     assert dex.type_multiplier("Ground", ["Flying"]) == 0.0
     assert dex.type_multiplier("Normal", ["Ghost"]) == 0.0
+    # 图鉴说明文字:中文优先,英文兼有
+    assert entry.get("flavor")
+    assert entry.get("flavorEn")
+    assert "尾巴" in entry["flavor"] or "电" in entry["flavor"]
+    covered = sum(1 for v in dex.species.values() if v.get("flavor"))
+    assert covered > 900
+    assert all(v.get("flavorEn") for v in dex.species.values())
+    # 性别比例(雌性 = genderRate/8)与蛋群翻译
+    assert entry["genderRate"] == 4  # 皮卡丘 50/50
+    assert dex.species["bulbasaur"]["genderRate"] == 1  # 妙蛙种子 87.5/12.5
+    assert dex.species["pikachu"]["eggGroups"] == ["ground", "fairy"]
 
 
 def test_dex_stats_and_learnset():
@@ -157,6 +168,9 @@ def _scenario():
 
             # 图鉴工具
             dex_out = await p.poke_dex_species(ev, "皮卡丘")
+            assert "图鉴说明" in dex_out
+            assert "雄性 50% / 雌性 50%" in dex_out
+            assert "蛋群: 陆上/妖精" in dex_out
             assert "电" in dex_out
             mv = await p.poke_dex_move(ev, "十万伏特")
             assert "90" in mv
