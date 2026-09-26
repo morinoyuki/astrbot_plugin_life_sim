@@ -1141,6 +1141,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
             if s.strip()
         ]
         avatars = self._chat_card_avatars(event)
+        if self._cfg("chat_card_pokemon_sprite", True):
+            try:
+                from .pokesim.sprites import pokemon_avatars_for_text
+
+                avatars = pokemon_avatars_for_text(text, avatars)
+            except Exception as e:
+                logger.debug(f"life-sim: 宝可梦头像注入失败: {e}")
 
         def _is_self(speaker: str) -> bool:
             return speaker in self_names

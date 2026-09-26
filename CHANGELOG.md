@@ -20,6 +20,7 @@
   - **NPC 队伍生成**:新增 `pokesim/trainer.py` 与 `poke_trainer_battle`。未指定队伍时按玩家队首等级 + 训练家级别(短裤小子 1-2 只 → 冠军 5-6 只)+ 属性主题自动生成,等级/物种强度随剧情缩放;可用 `region`/`gen` 限定区域,`location` 让队伍物种来自该地真实分布(不足时从地区池打折补位),`ace` 指定王牌;玩家/剧情已确定时用 `members=...` 指定。`poke_battle_start` 的对手语法扩展为 `名称|等级|招式|道具|特性`。
   - **测试配置**:新增 `pytest.ini`(`asyncio_mode=auto`),修复缺失配置导致的 18 个异步测试假失败;同步 20 条 Web API 断言与 redo 测试桩(`_cfg`)。全量测试 97 passed。
   - **文档与帮助**:新增 `/帮助`(`help`/`说明` 别名)命令;重写 `HELP_TEXT`(四模式说明 + 完整指令 + 模式 P 玩法);README 补充 `poke_*` 工具一览(26 个)、「LLM 如何获知地点信息」、数据构建与测试说明。
+  - **宝可梦缩略图头像**:新增 `pokesim/static/sprites/`(1379 张 96×96 缩略图,~1.5 MB,仅 `zygardemega` 缺失)、`pokesim/sprites.py` 与 `tools/build_pokemon_sprites.py`。聊天卡片渲染时,说话人若能解析为宝可梦(中/英名/形态),**默认**自动使用其缩略图当头像;用户用 `/头像` 设置的专属头像优先。新增配置 `chat_card_pokemon_sprite`(默认 true)。
   - **野生 vs 训练家**:`poke_battle_start` 新增 `trainer=true`;未标记训练家时,单只对手会默认当作野生战(可捕获)。现在训练家战(含单只)不可投球、不可逃跑。
   - **捕获与背包**:`poke_bag` 管理道具(精灵球/伤药/状态/复活/PP/战斗强化/进化石/树果等 60+ 种),野生战用 `poke_battle_turn` 的 `"catch 高级球"` 投球捕获(捕获率公式 + 精灵球条件加成 + 状态修正,捕获成功自动入队/进电脑);`poke_use_item` 战斗外使用,`"item 伤药"` 战斗中使用,`"run"` 逃跑。
   - **多玩家 / PvP**:队伍改为**按玩家区分**(群聊 = 群号+用户 id),每位玩家一支独立队伍;`poke_trainer` 设训练家名、`poke_trainers` 列出同群训练家、`poke_battle_pvp opponent="<uid>"` 与真人真实队伍对战,双方 HP/PP/异常写回各自存档。

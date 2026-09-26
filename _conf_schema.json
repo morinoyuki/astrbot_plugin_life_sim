@@ -157,6 +157,11 @@
     "hint": "显示在聊天气泡顶部的标题,类似群聊名称。留空则不显示标题栏。",
     "default": ""
   },
+  "chat_card_pokemon_sprite": {
+    "type": "bool",
+    "default": true,
+    "description": "宝可梦缩略图当头像(说话人名是宝可梦时自动用其像素图;用户设置的专属头像优先)"
+  },
   "chat_card_self_names": {
     "description": "兜底判定「主角」的称呼(逗号分隔,靠右蓝色气泡)",
     "type": "string",

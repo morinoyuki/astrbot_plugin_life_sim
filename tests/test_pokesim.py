@@ -677,6 +677,36 @@ def test_pokemon_location_tools():
         asyncio.run(run())
 
 
+def test_pokemon_sprites():
+    from lsim_pkg.pokesim.sprites import (
+        available_count,
+        pokemon_avatars_for_text,
+        speaker_names,
+        sprite_for_name,
+        sprite_path,
+    )
+
+    assert available_count() > 1000
+    p = sprite_path("pikachu")
+    assert p and os.path.exists(p)
+    with open(p, "rb") as fh:
+        assert fh.read(8) == b"\x89PNG\r\n\x1a\n"
+    # 中/英/别号都能命中
+    assert sprite_for_name("皮卡丘")
+    assert sprite_for_name("Pikachu")
+    assert sprite_for_name("皮卡丘(小智的)")
+    # 形态回退到本体(直接映射缺失时)
+    assert sprite_for_name("坚盾剑怪")
+    # 非宝可梦不误配
+    assert sprite_for_name("小刚") == ""
+    assert sprite_for_name("") == ""
+    text = '<d name="皮卡丘">皮卡皮卡</d>\n<d name="小智">去吧!</d>\n<d name="皮卡丘">皮卡</d>'
+    assert speaker_names(text) == ["皮卡丘", "小智"]
+    av = pokemon_avatars_for_text(text, {"小智": "/tmp/x.png"})
+    assert av["小智"] == "/tmp/x.png"  # 用户头像优先
+    assert av["皮卡丘"].endswith("pikachu.png")
+
+
 if __name__ == "__main__":
     test_dex_lookup_and_types()
     test_dex_stats_and_learnset()
@@ -697,4 +727,5 @@ if __name__ == "__main__":
     test_pokemon_trainer_battle()
     test_location_module()
     test_pokemon_location_tools()
+    test_pokemon_sprites()
     print("all pokesim tests passed")

@@ -55,6 +55,8 @@
 > 会以即时通讯聊天气泡的样式渲染成图片(类似《蔚蓝档案》桃信),支持 `light` / `dark`
 > 主题、自定宽度 / 字号、自动分页。开启后 `角色名:对白` 会被识别为一条消息,其余文本
 > 渲染为居中旁白。用 `/头像` 为角色指定头像后,聊天卡片会自动使用。
+> 💡 **宝可梦缩略图头像**:对白说话人若是宝可梦(如 `皮卡丘`),会**默认**自动使用其官方像素图
+> 作为头像(内置 1379 张 96×96 缩略图,仅 1.5 MB,运行时不联网)。用户用 `/头像` 设置的专属头像优先。
 
 **支持群聊和私聊**(私聊可能无 prefix,插件通过 `text.find(cmd)` 自适应)。
 
@@ -255,6 +257,7 @@ WebUI → 插件管理 → 转生模拟器 → 配置,共 39 项:
 | ---------------------- | --------------- | ------------------------------------------- |
 | `chat_card_theme`      | `light`         | 卡片主题(light / dark)                     |
 | `chat_card_title`      | `""`            | 卡片标题(留空不显示标题栏)                 |
+| `chat_card_pokemon_sprite` | `true`       | 说话人名是宝可梦时,自动用其缩略图当头像(用户专属头像优先) |
 | `chat_card_self_names` | `我,自己,你,玩家` | 兕底判定「主角」的称呼(逗号分隔,右侧蓝色气泡) |
 | `chat_card_width`      | `1024`          | 卡片宽度(px)                              |
 | `chat_card_font_size`  | `34`            | 正文字号(px)                              |
@@ -332,6 +335,9 @@ astrbot_plugin_life_sim/
 │                         #     · 由 tools/build_pokemon_data.py 从 Pokémon Showdown + PokeAPI 生成
 │                         #   - static/locations.json 真实地点野外分布(620 处/2 万+ 条)
 │                         #     · 由 tools/build_location_data.py 从 PokeAPI encounters + Bulbapedia/52poke 生成
+│                         #   - static/sprites/<key>.png 宝可梦缩略图 1379 张(96×96,头像用,~1.5 MB)
+│                         #     · 由 tools/build_pokemon_sprites.py 从 PokeAPI/sprites 生成
+│                         #   - sprites.py 缩略图取名(说话人名 → 头像)
 │                         #   - dex.py    图鉴查询 / 属性相克 / 数值计算 / 招式学习
 │                         #   - engine.py 单打对战引擎(太晶化 / 状态 / 能力等级 / 特性 / 道具)
 │                         #   - items.py  对战常用道具表 + 背包道具表
@@ -460,9 +466,10 @@ LLM 调用时通过 `contexts=[...]` 显式传入,完全不走主对话的 `conv
 source .venv/bin/activate
 python tools/build_pokemon_data.py      # 物种/招式/特性/学习表/性格
 python tools/build_location_data.py     # 620 处地点野外分布(+中文地名)
+python tools/build_pokemon_sprites.py   # 1379 张宝可梦缩略图(头像用,~1.5 MB)
 ```
 
-- 数据源：Pokémon Showdown(gen9 机制,经 `poke-env` wheel)、PokeAPI 批量 CSV(本地化与遭遇表)、Bulbapedia `langlinks` / 52poke(中文地名)
+- 数据源：Pokémon Showdown(gen9 机制,经 `poke-env` wheel)、PokeAPI 批量 CSV(本地化与遭遇表)、PokeAPI/sprites 仓库(缩略图)、Bulbapedia `langlinks` / 52poke(中文地名)
 - 网络请求会缓存到 `.pokemon_cache/`(已 gitignore),重复构建不重下
 - 注意:Bulbapedia 匿名请求每次**上限 20 个标题**(超出静默丢弃);脚本已带限流重试与磁盘缓存
 
