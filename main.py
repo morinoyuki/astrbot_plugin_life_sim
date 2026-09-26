@@ -1684,7 +1684,13 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
         """回滚消息到前 keep_messages 条,并同步修剪 turn 快照(供 WebUI 撤销轮次)。"""
         body = await self._web_body()
         key = str(body.get("key") or "").strip()
-        keep = int(body.get("keep_messages", -1))
+        _raw_keep = body.get("keep_messages", -1)
+        if _raw_keep is None:
+            _raw_keep = -1
+        try:
+            keep = int(_raw_keep)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"keep_messages 需要整数: {_raw_keep!r}") from e
         if not key:
             raise ValueError("缺少 key")
         lock = self._get_sim_lock(key)

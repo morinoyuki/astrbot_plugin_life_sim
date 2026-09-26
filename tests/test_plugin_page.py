@@ -242,6 +242,16 @@ def test_truncate_out_of_range(plugin):
     assert r["status"] == "error"
 
 
+def test_truncate_bad_keep(plugin):
+    """keep_messages 传 null / 非数字应返回错误而不是抛 TypeError 变 500。"""
+    for bad in (None, "abc", [], {}):
+        m._web_request = FakeWebRequest(
+            body={"key": "group_123", "keep_messages": bad}
+        )
+        r = as_json(run(plugin._web_messages_truncate()))
+        assert r["status"] == "error", bad
+
+
 # ── 剧情历史 ────────────────────────────────────────────────────
 
 def test_narrative_list_and_detail(plugin):

@@ -49,6 +49,14 @@ def test_parse_blocks():
     # 主角标记 me 属性
     p = md.parse_blocks('<d name="凌霜" me>我一直都记得。</d>')[0]
     assert getattr(p, "protagonist", False) is True
+    # name / av 属性值里的 me 不应被误判为主角标记(含尾随空格与全角)
+    for tpl in (
+        '<d name="me">你好。</d>',
+        '<d name="me ">你好。</d>',
+        '<d name="阿龙" av="me">你好。</d>',
+    ):
+        d = md.parse_blocks(tpl)[0]
+        assert getattr(d, "protagonist", False) is False, tpl
     return blocks
 
 

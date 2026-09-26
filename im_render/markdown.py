@@ -282,7 +282,9 @@ def _parse_dialogue_tag(line: str) -> Dialogue | None:
     if not name_m or not name_m.group(1).strip() or not content:
         return None
     av_m = _ATTR_AV_RE.search(attrs)
-    protagonist = bool(_ATTR_ME_RE.search(attrs))
+    # 先抹掉带引号的属性值,避免 name="me" / av="me" 被误判为主角标记
+    attrs_wo_values = re.sub(r'"[^"]*"', '""', attrs)
+    protagonist = bool(_ATTR_ME_RE.search(attrs_wo_values))
     return Dialogue(
         name_m.group(1).strip(),
         _strip_quotes(content),
