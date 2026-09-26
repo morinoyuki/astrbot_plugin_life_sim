@@ -923,9 +923,10 @@ def test_battle_action_and_limits():
             assert "对战中不能调整队伍" in await p.poke_remove_pokemon(ev, "2")
             await p.poke_battle_end(ev)
 
-            # 替换招式时旧招式的 PP 应一并移除
-            await p.poke_learn_move(ev, "杰尼龟", "bite", replace="tackle")
+            # 替换招式时旧招式的 PP 应一并移除(用招式机招以避开等级限制)
+            await p.poke_learn_move(ev, "杰尼龟", "surf", replace="tackle")
             m = p._poke_load(ev)["party"][1]
+            assert "surf" in m["moves"]
             assert "tackle" not in m["pp"] and "tackle" not in m["moves"]
 
             # 对倒地宝可梦改等级:不应“诈尸”,经验应同步到该等级
@@ -947,6 +948,50 @@ def test_battle_action_and_limits():
             before = p._poke_load(ev)["bag"].get("potion")
             await p.poke_use_item(ev, "1", "伤药")
             assert p._poke_load(ev)["bag"].get("potion") == before
+
+        asyncio.run(run())
+
+
+def test_learn_move_level_and_switch_limits():
+    """回归:只能靠升级学的招式需够等级;TM/教学不限等级;换人越界/重复清楚报错;
+    地点名支持全角数字。"""
+    from lsim_pkg.pokesim.engine import battle_from_dict
+
+    dex = get_dex()
+    assert dex.find_location("２０１号道路") == dex.find_location("201号道路")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _FakePlugin(tmp)
+        ev = _Event()
+
+        async def run():
+            await p.poke_add_pokemon(ev, "水箭龟", level=5, moves="撞击")
+            # wavecrash 是水箭龟的升级招(Lv36),Lv5 不能学
+            out = await p.poke_learn_move(ev, "1", "wavecrash")
+            assert "需要在 Lv" in out, out
+            # 地震是招式机,任意等级可学
+            assert "学会了" in await p.poke_learn_move(ev, "1", "地震")
+
+            await p.poke_add_pokemon(ev, "皮卡丘", level=20, moves="thunderbolt,quickattack,growl,tailwhip")
+            await p.poke_battle_start(ev, "小拉达|10", wild=True)
+            battle = battle_from_dict(p._poke_load(ev)["battle"])
+            # 换人序号越界 / 已在场上
+            assert "越界" in p._parse_battle_action("switch 9", battle, "player")
+            assert "已经在场上" in p._parse_battle_action("switch 1", battle, "player")
+            # 敌方按名字换人应查敌方队伍(而不是我方)
+            act = p._parse_battle_action("switch 2", battle, "player")
+            assert act == {"type": "switch", "index": 1}
+            await p.poke_battle_end(ev)
+
+            # 倒地成员不可作为换人目标
+            data = p._poke_load(ev)
+            data["party"][1]["cur_hp"] = 0
+            data["party"][1]["fainted"] = True
+            p._poke_save(ev, data)
+            await p.poke_battle_start(ev, "小拉达|10", wild=True)
+            battle = battle_from_dict(p._poke_load(ev)["battle"])
+            assert "失去战斗能力" in p._parse_battle_action("switch 2", battle, "player")
+            await p.poke_battle_end(ev)
 
         asyncio.run(run())
 
@@ -984,6 +1029,7 @@ if __name__ == "__main__":
     test_tool_arg_coercion()
     test_engine_bugfixes()
     test_battle_action_and_limits()
+    test_learn_move_level_and_switch_limits()
     test_rpg_exp_curve_terminates()
     test_catch_rate_and_ball_bonus()
     test_ev_caps()

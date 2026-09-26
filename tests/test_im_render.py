@@ -57,7 +57,8 @@ def test_parse_blocks():
     ):
         d = md.parse_blocks(tpl)[0]
         assert getattr(d, "protagonist", False) is False, tpl
-    return blocks
+    # 所有块都带 speaker 字段(普通叙述为 None)
+    assert blocks
 
 
 def test_render_light():

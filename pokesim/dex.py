@@ -19,6 +19,7 @@ import difflib
 import json
 import os
 import re
+import unicodedata
 from functools import cache, lru_cache
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -32,7 +33,9 @@ _SEP = set(" -_.·'’:\u3000()（）[]【】")
 def _norm(text: str) -> str:
     if text is None:
         return ""
-    return "".join(ch for ch in str(text).strip().lower() if ch not in _SEP)
+    # 全角→半角(数字/拉丁字母),让 "２０１号道路" 也能命中 "201号道路"
+    s = unicodedata.normalize("NFKC", str(text).strip().lower())
+    return "".join(ch for ch in s if ch not in _SEP)
 
 
 # 遭遇方法分组(用于按环境筛选地点分布)

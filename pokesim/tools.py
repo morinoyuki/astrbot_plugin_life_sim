@@ -656,8 +656,8 @@ class PokemonMixin:
             return f"❌ 未找到招式「{move}」。"
         move_key = mr[0]
         known = dex.learnset(p.get("species", ""))
-        if move_key not in known:
-            # 允许教学/学习器补学存在但不强制,给出提示
+        codes = known.get(move_key)
+        if codes is None:
             return (
                 f"❌ {p.get('species')} 无法学会「{mr[1].get('zh')}」"
                 f"(不在其可学招式表内)。"
@@ -665,6 +665,17 @@ class PokemonMixin:
         mon = Pokemon.from_dict(p)
         if move_key in mon.moves:
             return f"⚠️ {mon.display} 已经会「{mr[1].get('zh')}」了。"
+        # 只靠升级才能学的招式必须够等级;招式机/教学/遗传/活动(非 L 开头)
+        # 任意等级可学(与游戏一致),避免 Lv5 就学会 Lv56 的升级招。
+        _parts = [c for c in codes.split(",") if c]
+        _lv_need = min(
+            (int(c[1:] or 0) for c in _parts if c.startswith("L")), default=0
+        )
+        if not any(not c.startswith("L") for c in _parts) and _lv_need > mon.level:
+            return (
+                f"⚠️ {mon.display} 需要在 Lv{_lv_need} 才能学会「{mr[1].get('zh')}」"
+                f"(当前 Lv{mon.level})。"
+            )
         if len(mon.moves) >= 4:
             ri = -1
             rq = str(replace or "").strip()
@@ -1445,12 +1456,12 @@ class PokemonMixin:
     ) -> str:
         """根据地点抽取一只野生宝可梦并直接开战(推荐用它代替自编对手)。
 
-        若地点能匹配到真实地区(如 "常磐森林"/"Eterna Forest"/"真新镇"),
+        若地点能匹配到真实地区(如 "常青森林"/"Eterna Forest"/"真新镇"),
         则按该地真野外分布(物种/等级/出现率/遭遇方式)抽取;
         否则回退到按生态属性加权抽取。传说/幻兽等默认不出现。
 
         Args:
-            area(string): Optional. 地点或生态关键词,如 "常磐森林"、"201号道路"、"水面"、"夜晚的洞窟"、"废弃发电厂"。
+            area(string): Optional. 地点或生态关键词,如 "常青森林"、"201号道路"、"水面"、"夜晚的洞窟"、"废弃发电厂"。
             region(string): Optional. 地区:关都/城都/丰缘/神奥/合众/卡洛斯/阿罗拉/伽勒尔/帕底亚。
             level(int): Optional. 野生等级;0(默认)按该地点真实等级范围(无地点匹配时按玩家队首 ±3)。
             gen(int): Optional. 限定世代 1-9(无地点匹配时生效)。
@@ -1543,7 +1554,7 @@ class PokemonMixin:
         """查询地点野外分布:某地会出现哪些宝可梦、等级与出现率。
 
         Args:
-            name(string): Optional. 地点名(中/英/标识,如 "常磐森林"/"Eterna Forest"/"eterna-forest");留空则列出该地区的地点。
+            name(string): Optional. 地点名(中/英/标识,如 "常青森林"/"Eterna Forest"/"eterna-forest");留空则列出该地区的地点。
             region(string): Optional. 地区:关都/城都/丰缘/神奥/合众/卡洛斯/阿罗拉/伽勒尔/帕底亚。
             version_group(string): Optional. 作品版本(如 "platinum");默认取该地点最新版本。
             include_special(bool): Optional. 是否包含定点/赠予等特殊遭遇,默认 false。
@@ -1946,10 +1957,20 @@ class PokemonMixin:
         if low.startswith(("switch", "换人", "替换")):
             rest = s.split(" ", 1)[1] if " " in s else ""
             rest = rest.strip()
+            target_side = battle.enemy if side == "enemy" else battle.player
             if rest.isdigit():
                 idx = int(rest) - 1
+                if not 0 <= idx < len(target_side.party):
+                    return (
+                        f"❌ 换人序号 {rest} 越界"
+                        f"({('敌方' if side == 'enemy' else '我方')}队伍共 "
+                        f"{len(target_side.party)} 只)。"
+                    )
+                if idx == target_side.active:
+                    return f"❌ 序号 {rest} 已经在场上。"
+                if target_side.party[idx].fainted:
+                    return f"❌ 序号 {rest} 已失去战斗能力,无法上场。"
             else:
-                target_side = battle.enemy if side == "enemy" else battle.player
                 data = {"party": [m.to_dict() for m in target_side.party]}
                 found = self._find_member(data, rest)
                 if not found:
