@@ -13,7 +13,12 @@ import random
 import re
 
 from .dex import STAT_ORDER, get_dex
-from .encounter import roll_encounter, roll_level
+from .encounter import (
+    detect_environment,
+    roll_encounter,
+    roll_level,
+    roll_location_encounter,
+)
 from .engine import (
     STATUS_ZH,
     Battle,
@@ -1354,18 +1359,23 @@ class PokemonMixin:
         level: int = 0,
         gen: int = 0,
         allow_rare: bool = False,
+        version_group: str = "",
+        environment: str = "",
     ) -> str:
-        """根据地点生态抽取一只野生宝可梦并直接开战(推荐用它代替自编对手)。
+        """根据地点抽取一只野生宝可梦并直接开战(推荐用它代替自编对手)。
 
-        物种由本地图鉴按 出现率/进化阶段/种族值/生态属性 加权抽取,
-        不需要在上下文里列举宝可梦。传说/幻兽默认不出现。
+        若地点能匹配到真实地区(如 "常磐森林"/"Eterna Forest"/"真新镇"),
+        则按该地真野外分布(物种/等级/出现率/遭遇方式)抽取;
+        否则回退到按生态属性加权抽取。传说/幻兽等默认不出现。
 
         Args:
-            area(string): Optional. 地点/生态关键词,如 "草地"、"森林"、"洞窟"、"水面"、"沙漠"、"雪山"、"城市"、"夜晚的森林"、"废弃发电厂"。
-            region(string): Optional. 地区,限定全国图鉴范围:关都/城都/丰缘/神奥/合众/卡洛斯/阿罗拉/伽勒尔/帕底亚。
-            level(int): Optional. 野生等级;0(默认)按玩家队首等级 ±3 浮动。
-            gen(int): Optional. 限定世代 1-9(与 region 二选一即可)。
-            allow_rare(bool): Optional. 是否允许极稀有/传说/幻兽出现(概率极低),默认 false。
+            area(string): Optional. 地点或生态关键词,如 "常磐森林"、"201号道路"、"水面"、"夜晚的洞窟"、"废弃发电厂"。
+            region(string): Optional. 地区:关都/城都/丰缘/神奥/合众/卡洛斯/阿罗拉/伽勒尔/帕底亚。
+            level(int): Optional. 野生等级;0(默认)按该地点真实等级范围(无地点匹配时按玩家队首 ±3)。
+            gen(int): Optional. 限定世代 1-9(无地点匹配时生效)。
+            allow_rare(bool): Optional. 是否允许传说/幻兽出现,默认 false。
+            version_group(string): Optional. 指定作品版本(如 "platinum"、"black-2"、"ultra-sun");默认取该地点最新版本。
+            environment(string): Optional. 遭遇环境:land/water/fish/all;默认从 area 文本推断。
         """
         dex = get_dex()
         data = self._poke_load(event)
@@ -1373,26 +1383,151 @@ class PokemonMixin:
         if not party:
             return "❌ 队伍是空的,无法进行野生遭遇。先 poke_add_pokemon。"
         rng = random.Random()
-        enc = roll_encounter(
-            dex,
-            area=area or "",
-            region=region or "",
-            gen=int(gen or 0),
-            allow_rare=bool(allow_rare),
-            rng=rng,
-        )
+        loc_key = dex.find_location(area, region) if area else ""
+        enc = None
+        note = ""
+        if loc_key:
+            area_zh = (dex.locations.get(loc_key) or {}).get("zh") or loc_key
+            env0 = environment or detect_environment(area)
+            for env in list(dict.fromkeys([env0, "land", "water", "fish", "all"])):
+                enc = roll_location_encounter(
+                    dex,
+                    loc_key,
+                    version_group=version_group,
+                    environment=env,
+                    level=int(level or 0),
+                    include_special=bool(allow_rare),
+                    rng=rng,
+                )
+                if enc:
+                    break
+            if enc is None:  # 该地仅有点定/赠予类遭遇
+                enc = roll_location_encounter(
+                    dex,
+                    loc_key,
+                    version_group=version_group,
+                    environment="all",
+                    level=int(level or 0),
+                    include_special=True,
+                    rng=rng,
+                )
+                if enc:
+                    note = "(定点/特殊遭遇)"
+        if enc is None:
+            enc = roll_encounter(
+                dex,
+                area=area or "",
+                region=region or "",
+                gen=int(gen or 0),
+                allow_rare=bool(allow_rare),
+                rng=rng,
+            )
+            area_zh = ""
         if enc is None:
             return (
                 f"❌ 在「{area or '此地'}」没有找到合适的野生宝可梦"
-                "(可换个生态关键词,如 草地/森林/洞窟/水面/沙漠/雪山/城市/夜晚)。"
+                "(可换地点或生态关键词,或查 poke_dex_location 看该地分布)。"
             )
-        lvl = roll_level(dex, party, level=int(level or 0), rng=rng)
-        types = " / ".join(dex.type_label(t) for t in enc["types"])
-        head = (
-            f"🌿 野生的 {enc['zh']} 出现了!(Lv{lvl} · {types} · 稀有度:{enc['rarity']})"
-        )
+        if loc_key:
+            lvl = int(enc["level"])
+            labels = "、".join(dex.location_methods.get(m, m) for m in enc["methods"][:2])
+            head = (
+                f"🌿 野生的 {enc['zh']} 出现了!(Lv{lvl} · "
+                + " / ".join(dex.type_label(t) for t in enc["types"])
+                + f" · 稀有度:{enc['rarity']})\n"
+                f"📍 {area_zh} · {labels}{note} · 该地等级 {enc['min']}-{enc['max']}"
+            )
+        else:
+            lvl = roll_level(dex, party, level=int(level or 0), rng=rng)
+            head = (
+                f"🌿 野生的 {enc['zh']} 出现了!(Lv{lvl} · "
+                + " / ".join(dex.type_label(t) for t in enc["types"])
+                + f" · 稀有度:{enc['rarity']})"
+            )
         out = await self.poke_battle_start(event, enemy=f"{enc['zh']}|{lvl}", wild=True)
         return head + "\n\n" + out
+
+    async def poke_dex_location(
+        self,
+        event,
+        name: str = "",
+        region: str = "",
+        version_group: str = "",
+        include_special: bool = False,
+    ) -> str:
+        """查询地点野外分布:某地会出现哪些宝可梦、等级与出现率。
+
+        Args:
+            name(string): Optional. 地点名(中/英/标识,如 "常磐森林"/"Eterna Forest"/"eterna-forest");留空则列出该地区的地点。
+            region(string): Optional. 地区:关都/城都/丰缘/神奥/合众/卡洛斯/阿罗拉/伽勒尔/帕底亚。
+            version_group(string): Optional. 作品版本(如 "platinum");默认取该地点最新版本。
+            include_special(bool): Optional. 是否包含定点/赠予等特殊遭遇,默认 false。
+        """
+        dex = get_dex()
+        region = dex.resolve_region(region) or region
+        if not name:
+            if not region:
+                rows = [
+                    f"- {v.get('zh', k)}({k}): {sum(1 for x in dex.locations.values() if x.get('region') == k)} 处"
+                    for k, v in dex.location_regions.items()
+                    if k
+                ]
+                return (
+                    "📍 可用地区(传 region=… 查看地点,或直接传 name=地点):\n"
+                    + "\n".join(rows)
+                )
+            keys = dex.list_locations(region)
+            if not keys:
+                return f"❌ 未收录地区「{region}」的地点(可用:关都/城都/丰缘/神奥/合众/卡洛斯/阿罗拉/伽勒尔/帕底亚)。"
+            zh = dex.location_regions.get(region, {}).get("zh", region)
+            lines = [f"📍 {zh} 共 {len(keys)} 处地点:"]
+            lines += [f"- {dex.locations[k].get('zh') or k}" for k in keys]
+            if len(lines) > 100:
+                lines = lines[:100] + [f"…(其余 {len(keys) - 99} 处已省略)"]
+            return "\n".join(lines)
+
+        key = dex.find_location(name, region)
+        if not key:
+            return f"❌ 未收录地点「{name}」。(可先用 poke_dex_location(region=…) 看地点列表)"
+        v = dex.locations[key]
+        vg = version_group or dex.location_default_vg(key)
+        label = (dex.version_groups.get(vg) or {}).get("label", vg)
+        pools = dex.location_pools(key, vg, include_special=include_special)
+        if not pools:
+            return f"⚠️ {v.get('zh', key)} 在当前版本({label})没有自然野外分布。"
+        by_method: dict[str, list[dict]] = {}
+        for p in pools:
+            by_method.setdefault(p["method"], []).append(p)
+        lines = [
+            f"📍 {v.get('zh') or key}({v.get('name', key)})"
+            f" · 地区:{dex.location_regions.get(v.get('region', ''), {}).get('zh', v.get('region'))}"
+            f" · 版本:{label}"
+            + (" · 别名:" + "、".join(v.get("aliases") or []) if v.get("aliases") else "")
+        ]
+        order = [
+            "walk",
+            "grass-spots",
+            "dark-grass",
+            "cave-spots",
+            "surf",
+            "old-rod",
+            "good-rod",
+            "super-rod",
+            "rock-smash",
+            "overworld",
+        ]
+        keys_sorted = sorted(by_method, key=lambda m: (order.index(m) if m in order else 99, m))
+        for m in keys_sorted:
+            rows = sorted(by_method[m], key=lambda x: -x["chance"])
+            mlabel = dex.location_methods.get(m, m)
+            parts = []
+            for p in rows[:16]:
+                sp = dex.species.get(p["species"]) or {}
+                nm = sp.get("zh") or sp.get("name") or p["species"]
+                parts.append(f"{nm} Lv{p['min']}-{p['max']}({p['chance']}%)")
+            more = f" …+{len(rows) - 16}" if len(rows) > 16 else ""
+            lines.append(f"─ {mlabel} ─\n  " + "、".join(parts) + more)
+        return "\n".join(lines)
 
     async def poke_trainer_battle(
         self,

@@ -866,10 +866,11 @@ SYSTEM_PROMPT_P = (
 
 ### 三、对战(核心)
 - **所有对战必须走引擎**,禁止自己掷伤害:
-  1) **野生遭遇不要自己编物种**——调 `poke_wild_encounter(area="草地")`(可加
-     `region="关都"` / `level=` / `gen=`)。物种由本地图鉴按生态加权抽取,
-     你不需要也不应该列举宝可梦;抽到什么就写什么。传说/幻兽默认不出现
-     (剧情需要才用 `allow_rare=true`)。
+  1) **野生遭遇不要自己编物种**——调 `poke_wild_encounter(area="常青森林")`(可加
+     `region="关都"` / `version_group="red-blue"` / `level=`)。地点能匹配到真实地区时,
+     按该地**真实野外分布**(物种/等级/出现率/遭遇方式)抽取;否则按生态加权回退。
+     想看某地分布先用 `poke_dex_location(name="常青森林")`,列地点用 `poke_dex_location(region="关都")`。
+     你不需要也不应该列举宝可梦;抽到什么就写什么。传说/幻兽默认不出现(`allow_rare=true` 例外)。
   2) **与 NPC/训练家/道馆/联盟/宿敌对战**默认调 `poke_trainer_battle`:
      - 例:`poke_trainer_battle(trainer="岩石道馆馆主小刚")`、`poke_trainer_battle(trainer="冠军", difficulty="hard")`
      - 它会按玩家当前队首等级 + 训练家级别自动生成贴合剧情的队伍(短裤小子弱、冠军强);

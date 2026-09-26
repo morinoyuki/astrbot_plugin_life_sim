@@ -35,6 +35,76 @@ def _norm(text: str) -> str:
     return "".join(ch for ch in str(text).strip().lower() if ch not in _SEP)
 
 
+# 遭遇方法分组(用于按环境筛选地点分布)
+LAND_METHODS = {
+    "walk",
+    "grass-spots",
+    "dark-grass",
+    "cave-spots",
+    "bridge-spots",
+    "rough-terrain",
+    "yellow-flowers",
+    "purple-flowers",
+    "red-flowers",
+    "honey-tree",
+    "berry-trees",
+    "hidden-grotto",
+    "rustling-bush-ambush",
+    "trash-can-ambush",
+    "ceiling-ambush",
+    "ground-ambush",
+    "horde",
+    "sos",
+    "sos-from-bubbling-spot",
+    "overworld",
+    "overworld-dirt",
+}
+WATER_METHODS = {
+    "surf",
+    "surf-spots",
+    "seaweed",
+    "bubbling-spots",
+    "overworld-water",
+}
+FISH_METHODS = {
+    "old-rod",
+    "good-rod",
+    "super-rod",
+    "super-rod-spots",
+    "feebas-tile-fishing",
+}
+ROCK_METHODS = {"rock-smash", "headbutt", "headbutt-low", "headbutt-normal", "headbutt-high"}
+# 定点/赠予/群战外的特殊形式,默认不作为野生随机遭遇
+SPECIAL_METHODS = {
+    "static",
+    "gift",
+    "gift-egg",
+    "npc-trade",
+    "snag",
+    "snag-rematch",
+    "dynamax-adventure",
+    "max-raid",
+    "island-scan",
+    "pokeflute",
+    "devon-scope",
+    "squirt-bottle",
+    "wailmer-pail",
+    "pokespot",
+    "roaming-grass",
+    "roaming-water",
+    "wanderer",
+    "wanderer-water",
+    "chase-water",
+    "overworld-flying",
+    "overworld-special",
+    "overworld-flying-special",
+    "overworld-water-special",
+    "pokemon-ranger",
+}
+LAND_GROUP = LAND_METHODS
+WATER_GROUP = WATER_METHODS | FISH_METHODS
+
+
 @cache
 def _load(name: str) -> dict:
     path = os.path.join(DATA_DIR, f"{name}.json")
@@ -91,6 +161,21 @@ class Dex:
             for alias in (key, a.get("name"), a.get("zh")):
                 if alias:
                     self._ability_idx.setdefault(_norm(alias), key)
+
+        try:
+            locs = _load("locations")
+        except (OSError, ValueError):
+            locs = {}
+        self.locations: dict[str, dict] = locs.get("locations", {})
+        self.location_regions: dict[str, dict] = locs.get("regions", {})
+        self.version_groups: dict[str, dict] = locs.get("versionGroups", {})
+        self.location_methods: dict[str, str] = locs.get("methods", {})
+        self._location_idx: dict[str, str] = {}
+        for key, v in self.locations.items():
+            aliases = [key, v.get("name"), v.get("zh"), *(v.get("aliases") or [])]
+            for alias in aliases:
+                if alias:
+                    self._location_idx.setdefault(_norm(alias), key)
 
     # ─────────────── 通用解析 ───────────────
 
@@ -605,6 +690,101 @@ class Dex:
         if trainer:
             exp = exp * 3 // 2
         return max(1, exp)
+
+    # ─────────────── 地点 / 野外分布 ───────────────
+
+    def _loc_in_region(self, key: str, region: str) -> bool:
+        return not region or (self.locations.get(key) or {}).get("region") == region
+
+    def resolve_region(self, query: str) -> str:
+        """地区名/中文名/标识 → 地区 key(如 关都 → kanto)。"""
+        if not query:
+            return ""
+        raw = _norm(query)
+        if raw in self.location_regions:
+            return raw
+        for k, v in self.location_regions.items():
+            if raw in (_norm(k), _norm(v.get("name", "")), _norm(v.get("zh", ""))):
+                return k
+        for k, v in self.location_regions.items():
+            zh = _norm(v.get("zh", ""))
+            if raw and zh and (raw in zh or zh in raw):
+                return k
+        return ""
+
+    def resolve_location(self, query: str, region: str = "") -> tuple[str, dict] | None:
+        if query is None:
+            return None
+        raw = str(query).strip()
+        if not raw:
+            return None
+        region = self.resolve_region(region) or region
+        if raw in self.locations and self._loc_in_region(raw, region):
+            return raw, self.locations[raw]
+        key = self._location_idx.get(_norm(raw))
+        if key and self._loc_in_region(key, region):
+            return key, self.locations[key]
+        norm = _norm(raw)
+        cands: list[str] = []
+        for k, v in self.locations.items():
+            if region and v.get("region") != region:
+                continue
+            names = [_norm(k), _norm(v.get("name", "")), _norm(v.get("zh", ""))]
+            names += [_norm(a) for a in (v.get("aliases") or [])]
+            if any(norm and n and (norm in n or n in norm) for n in names):
+                cands.append(k)
+        if not cands and region:
+            return self.resolve_location(raw, "")
+        if not cands:
+            return None
+        for k in cands:
+            v = self.locations[k]
+            if norm in (_norm(v.get("zh", "")), _norm(v.get("name", ""))):
+                return k, v
+        return cands[0], self.locations[cands[0]]
+
+    def find_location(self, query: str, region: str = "") -> str:
+        r = self.resolve_location(query, region)
+        return r[0] if r else ""
+
+    def location_default_vg(self, key: str) -> str:
+        pools = (self.locations.get(key) or {}).get("pools") or {}
+        if not pools:
+            return ""
+        return max(pools, key=lambda g: int((self.version_groups.get(g) or {}).get("order", 0)))
+
+    def location_pools(
+        self,
+        key: str,
+        version_group: str = "",
+        methods: set[str] | None = None,
+        include_special: bool = False,
+    ) -> list[dict]:
+        """返回地点遭遇条目 [{species,min,max,method,chance}]。
+
+        methods 显式指定时只保留这些方法;否则默认排除 SPECIAL_METHODS。
+        """
+        v = self.locations.get(key) or {}
+        pools = v.get("pools") or {}
+        vg = version_group or self.location_default_vg(key)
+        rows = pools.get(vg)
+        if rows is None:
+            rows = [r for rr in pools.values() for r in rr]
+        out: list[dict] = []
+        for skey, lo, hi, method, chance in rows or []:
+            if methods is not None:
+                if method not in methods:
+                    continue
+            elif not include_special and method in SPECIAL_METHODS:
+                continue
+            out.append(
+                {"species": skey, "min": int(lo), "max": int(hi), "method": method, "chance": int(chance)}
+            )
+        return out
+
+    def list_locations(self, region: str = "") -> list[str]:
+        keys = [k for k, v in self.locations.items() if not region or v.get("region") == region]
+        return sorted(keys, key=lambda k: (self.locations[k].get("region", ""), k))
 
 
 def _sort_methods(codes: set[str]) -> list[str]:

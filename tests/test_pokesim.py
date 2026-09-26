@@ -597,6 +597,57 @@ def test_pokemon_trainer_battle():
         asyncio.run(run())
 
 
+def test_location_module():
+    import random
+
+    from lsim_pkg.pokesim.encounter import roll_location_encounter
+
+    dex = get_dex()
+    assert dex.find_location("常青森林") == "viridian-forest"
+    assert dex.find_location("Viridian Forest") == "viridian-forest"
+    assert dex.find_location("常青森林", "关都") == "viridian-forest"
+    assert dex.find_location("常青森林", "kanto") == "viridian-forest"
+    assert dex.resolve_region("关都") == "kanto"
+    assert dex.resolve_region("伽勒尔") == "galar"
+    assert dex.find_location("不存在的地方XYZ") == ""
+    # 默认排除定点/赠予类
+    pools = dex.location_pools("viridian-forest", "red-blue")
+    assert pools and all(p["method"] != "static" for p in pools)
+    assert any(p["species"] == "pikachu" for p in pools)
+    # 定点/赠予可按需包含
+    special = dex.location_pools("sinnoh-route-201", "platinum", include_special=True)
+    assert any(p["method"] in ("gift", "static") for p in special)
+    # 真实分布抽取
+    enc = roll_location_encounter(
+        dex, "viridian-forest", version_group="red-blue", rng=random.Random(1)
+    )
+    assert enc and enc["location"] == "viridian-forest"
+    assert 3 <= enc["level"] <= 9
+    keys = {p["species"] for p in dex.location_pools("viridian-forest", "red-blue")}
+    assert enc["species"] in keys
+    # 最低限度覆盖
+    assert len(dex.locations) > 500
+    assert sum(1 for v in dex.locations.values() if v["zh"]) > 400
+
+
+def test_pokemon_location_tools():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _FakePlugin(tmp)
+        ev = _Event()
+
+        async def run():
+            out = await p.poke_dex_location(ev, region="关都")
+            assert "关都" in out and "地点" in out
+            out = await p.poke_dex_location(ev, name="常青森林", version_group="red-blue")
+            assert "常青森林" in out and "皮卡丘" in out and "%" in out
+            assert "未知" not in out
+            await p.poke_add_pokemon(ev, "皮卡丘", level=20, moves="thundershock,quickattack")
+            out = await p.poke_wild_encounter(ev, area="常青森林", region="关都", version_group="red-blue")
+            assert "野生的" in out and "该地等级" in out and "野生战" in out
+
+        asyncio.run(run())
+
+
 if __name__ == "__main__":
     test_dex_lookup_and_types()
     test_dex_stats_and_learnset()
@@ -615,4 +666,6 @@ if __name__ == "__main__":
     test_pokemon_wild_encounter()
     test_trainer_team_generation()
     test_pokemon_trainer_battle()
+    test_location_module()
+    test_pokemon_location_tools()
     print("all pokesim tests passed")

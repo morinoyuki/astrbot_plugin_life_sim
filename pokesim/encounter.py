@@ -219,6 +219,96 @@ def _pool(
     return pool
 
 
+def _rarity(entry: dict) -> str:
+    rate = int(entry.get("captureRate", 45) or 45)
+    if entry.get("isLegendary"):
+        return "传说"
+    if entry.get("isMythical"):
+        return "幻之"
+    if rate <= 25:
+        return "极稀有"
+    if rate <= 75:
+        return "稀有"
+    if rate <= 150:
+        return "较少见"
+    return "常见"
+
+
+_WATER_KEYS = ("水面", "海", "河", "湖", "池", "潜", "游泳", "水边", "汀")
+_FISH_KEYS = ("钓", "钓鱼", "渔")
+
+
+def detect_environment(area: str) -> str:
+    """从地点文本判断遭遇环境:land / water / fish / all。"""
+    a = str(area or "")
+    if any(k in a for k in _FISH_KEYS):
+        return "fish"
+    if any(k in a for k in _WATER_KEYS):
+        return "water"
+    return "land"
+
+
+def roll_location_encounter(
+    dex,
+    loc_key: str,
+    *,
+    version_group: str = "",
+    environment: str = "",
+    level: int = 0,
+    include_special: bool = False,
+    rng: random.Random | None = None,
+) -> dict | None:
+    """从真实地点分布里抽取一只野生宝可梦。"""
+    from .dex import FISH_METHODS, LAND_METHODS, WATER_GROUP
+
+    r = rng or random.Random()
+    env = environment or "land"
+    methods = {
+        "water": WATER_GROUP,
+        "fish": FISH_METHODS,
+        "land": LAND_METHODS,
+    }.get(env)
+    pools = dex.location_pools(
+        loc_key, version_group, methods=methods, include_special=include_special
+    )
+    if not pools:
+        return None
+    merged: dict[str, dict] = {}
+    for p in pools:
+        e = merged.setdefault(
+            p["species"],
+            {
+                "species": p["species"],
+                "min": p["min"],
+                "max": p["max"],
+                "chance": 0,
+                "methods": set(),
+            },
+        )
+        e["min"] = min(e["min"], p["min"])
+        e["max"] = max(e["max"], p["max"])
+        e["chance"] = max(e["chance"], p["chance"])
+        e["methods"].add(p["method"])
+    items = list(merged.values())
+    weights = [max(1, int(i["chance"])) for i in items]
+    pick = r.choices(items, weights=weights, k=1)[0]
+    entry = dex.species.get(pick["species"]) or {}
+    lo, hi = int(pick["min"]), int(pick["max"])
+    lvl = int(level) if level and level > 0 else r.randint(lo, max(lo, hi))
+    return {
+        "species": pick["species"],
+        "name": entry.get("name", pick["species"]),
+        "zh": entry.get("zh") or entry.get("name", pick["species"]),
+        "types": list(entry.get("types") or []),
+        "level": lvl,
+        "min": lo,
+        "max": hi,
+        "methods": sorted(pick["methods"]),
+        "rarity": _rarity(entry),
+        "location": loc_key,
+    }
+
+
 def roll_encounter(
     dex,
     *,
@@ -242,25 +332,12 @@ def roll_encounter(
     weights = [w for _, w in pool]
     key = r.choices(keys, weights=weights, k=1)[0]
     entry = dex.species[key]
-    rate = int(entry.get("captureRate", 45) or 45)
-    if entry.get("isLegendary"):
-        rarity = "传说"
-    elif entry.get("isMythical"):
-        rarity = "幻之"
-    elif rate <= 25:
-        rarity = "极稀有"
-    elif rate <= 75:
-        rarity = "稀有"
-    elif rate <= 150:
-        rarity = "较少见"
-    else:
-        rarity = "常见"
     return {
         "species": key,
         "name": entry.get("name", key),
         "zh": entry.get("zh") or entry.get("name", key),
         "types": list(entry.get("types") or []),
-        "rarity": rarity,
+        "rarity": _rarity(entry),
         "level": int(level or 0),
     }
 
@@ -285,10 +362,12 @@ __all__ = [
     "GENS",
     "REGIONS",
     "biome_types",
+    "detect_environment",
     "in_scope",
     "is_night",
     "is_wild_candidate",
     "regional_tag",
     "roll_encounter",
     "roll_level",
+    "roll_location_encounter",
 ]
