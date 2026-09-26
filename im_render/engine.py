@@ -222,7 +222,8 @@ class ChatRenderer:
                     best_key, best_v = kn, v
             if best_v is not None:
                 return best_v
-        return None
+        # 5. 回退到全局默认头像(avatars[""])
+        return av.get("") or None
 
     # ── 块 → 行 ──────────────────────────────────────────────
     def _layout_block(self, blk: md.Block) -> None:

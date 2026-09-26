@@ -6,6 +6,7 @@ VerticalStack 负责把多行垂直拼接到画布;每行内部可以自由布�
 
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
 
 from PIL import Image, ImageDraw, ImageFont
@@ -38,6 +39,49 @@ def _hex(c):
 def _rgba(c, a=255):
     r, g, b = _hex(c)
     return (r, g, b, a)
+
+
+# ── 图片行安全限制 ──────────────────────────────────────────────
+# markdown 里的 ![](url) 由模型输出,可能被提示注入利用来读取任意本地文件
+# (外泄)或请求内网地址(SSRF)。因此:本地路径必须落在白名单目录内,
+# 远程/内联数据限制大小。
+_ALLOWED_IMAGE_ROOTS: list[str] = []
+_MAX_IMAGE_BYTES = 8 * 1024 * 1024
+
+
+def register_image_root(path: str) -> None:
+    """注册允许被 `![](...)` 读取的本地目录(插件数据/临时目录)。"""
+    if not path:
+        return
+    try:
+        rp = os.path.realpath(path)
+    except OSError:
+        return
+    if rp and rp not in _ALLOWED_IMAGE_ROOTS:
+        _ALLOWED_IMAGE_ROOTS.append(rp)
+
+
+def _allowed_image_roots() -> list[str]:
+    roots = list(_ALLOWED_IMAGE_ROOTS)
+    try:
+        roots.append(os.path.realpath(os.getcwd()))
+    except OSError:
+        pass
+    return roots
+
+
+def _local_image_allowed(path: str) -> bool:
+    try:
+        rp = os.path.realpath(path)
+    except OSError:
+        return False
+    for root in _allowed_image_roots():
+        try:
+            if os.path.commonpath([rp, root]) == root:
+                return True
+        except ValueError:
+            continue
+    return False
 
 
 def _iter_runs(
@@ -590,14 +634,18 @@ class ImageRow(Row):
                 import base64
 
                 b64 = url.split(",", 1)[1]
-                data = base64.b64decode(b64)
+                if len(b64) <= _MAX_IMAGE_BYTES * 2:
+                    data = base64.b64decode(b64)
             elif url.startswith(("http://", "https://")):
                 req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
                 with urllib.request.urlopen(req, timeout=5) as resp:
-                    data = resp.read()
-            elif os.path.isfile(url):
-                with open(url, "rb") as f:
-                    data = f.read()
+                    data = resp.read(_MAX_IMAGE_BYTES + 1)
+                    if len(data) > _MAX_IMAGE_BYTES:
+                        data = None
+            elif os.path.isfile(url) and _local_image_allowed(url):
+                if os.path.getsize(url) <= _MAX_IMAGE_BYTES:
+                    with open(url, "rb") as f:
+                        data = f.read(_MAX_IMAGE_BYTES + 1)
         except Exception:
             data = None
 

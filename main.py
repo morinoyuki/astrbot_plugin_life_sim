@@ -1916,17 +1916,10 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
             removed = await self.memory_store.delete_entries_by_id(scope, list(idset))
             return {"ok": True, "removed": removed}
 
-        entries = await self.memory_store.recent(scope, 100000)
         if mode == "keyword" and keyword:
-            kw = keyword.lower()
-            remaining = [
-                e
-                for e in entries
-                if kw not in str(e.get("content") or "").lower()
-            ]
-            removed = len(entries) - len(remaining)
-            if removed:
-                await self.memory_store.replace_entries(scope, remaining)
+            # 用原始条目删除(保留其余条目的嵌入向量);recent() 会去掉 vector,
+            # 若把它回写 replace_entries 会让所有保留条目丢失嵌入。
+            removed = await self.memory_store.delete_entries_by_keyword(scope, keyword)
             return {"ok": True, "removed": removed}
 
         # all:清空该 scope
@@ -2182,7 +2175,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
         if use_llm:
             try:
                 summary_text = await self._llm_summarize(head, event=event)
-            except (ValueError, KeyError, TimeoutError, OSError, ConnectionError) as e:
+            except Exception as e:
                 logger.warning(f"life-sim: LLM 压缩失败,回退规则摘要: {e}")
         if not summary_text:
             summary_text = self._build_history_summary(head, len(messages))
@@ -4186,7 +4179,7 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
                 try:
                     mode = await self._llm_detect_mode(setting, event=event)
                     logger.info(f"life-sim: LLM 模式识别={mode}")
-                except (ValueError, KeyError, TimeoutError, OSError) as e:
+                except Exception as e:
                     logger.warning(f"life-sim: LLM 模式识别失败,回退关键词: {e}")
                     mode = _keyword_detect_mode(setting)
             else:
@@ -4868,6 +4861,16 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
         imgs = _restore_images_from_content(content)
 
         scope = self._sim_session_key(event)
+        # 回滚会永久修改剧情历史/向量记忆(但 session 不落盘);
+        # 先备份,生成失败时恢复,避免“半回滚”丢数据。
+        branch = _narrative_branch(session)
+        pre_narr = await self.narrative_store.list(scope, branch)
+        pre_mem = None
+        if self._cfg("memory_enable", True):
+            try:
+                pre_mem = await self.memory_store.raw_entries(scope)
+            except Exception as e:
+                logger.debug(f"life-sim: /redo 备份记忆失败(跳过): {e}")
         stats = await self._apply_rollback(session, scope, 1)
         if stats is None:
             yield event.plain_result("❌ 没有可重试的轮次")
@@ -4881,9 +4884,29 @@ class LifeSimPlugin(DiceMixin, RPGMixin, PokemonMixin, MdToImageMixin, Star):
             + ("(含图片)" if imgs else "")
             + "..."
         )
-        result = await self._generate(event, session, user_input, mode, imgs)
+        try:
+            result = await self._generate(event, session, user_input, mode, imgs)
+        except Exception:
+            await self._restore_redo_backup(scope, branch, pre_narr, pre_mem)
+            raise
+        if isinstance(result, str) and result.lstrip().startswith("❌"):
+            await self._restore_redo_backup(scope, branch, pre_narr, pre_mem)
         async for _ in self._yield_narrative_result(event, result):
             yield _
+
+    async def _restore_redo_backup(
+        self, scope: str, branch: str, pre_narr: list, pre_mem: list | None
+    ) -> None:
+        """把 /redo 回滚时删除的剧情历史与向量记忆恢复回去(生成失败时用)。"""
+        try:
+            await self.narrative_store.overwrite_all(scope, pre_narr, branch)
+        except Exception as e:
+            logger.warning(f"life-sim: /redo 恢复剧情历史失败: {e}")
+        if pre_mem is not None:
+            try:
+                await self.memory_store.replace_entries(scope, pre_mem)
+            except Exception as e:
+                logger.warning(f"life-sim: /redo 恢复向量记忆失败: {e}")
 
     # ════════════════════════════════════════════════════════════════
     # 剧情历史:列表 / 上传 / 删除

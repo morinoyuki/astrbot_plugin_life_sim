@@ -391,6 +391,15 @@ class MemoryStore:
         loop = asyncio.get_event_loop()
         return await loop.run_in_executor(None, self._trim_sync, scope, max_entries)
 
+    async def raw_entries(self, scope: str) -> list[dict]:
+        """返回全部原始条目(含 ``vector``),供回滚前备份用。"""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, self._raw_entries_sync, scope)
+
+    def _raw_entries_sync(self, scope: str) -> list[dict]:
+        with self._lock:
+            return [dict(e) for e in self._load_unlocked(scope)]
+
     async def replace_entries(self, scope: str, entries: list) -> None:
         """用给定条目列表整体覆盖该 scope 的记忆库(后台管理用)。
 
@@ -416,6 +425,28 @@ class MemoryStore:
             entries = self._load_unlocked(scope)
             before = len(entries)
             entries = [e for e in entries if str(e.get("id")) not in idset]
+            removed = before - len(entries)
+            if removed:
+                self._persist_unlocked(scope, entries)
+            return removed
+
+    async def delete_entries_by_keyword(self, scope: str, keyword: str) -> int:
+        """按内容关键字删除记忆(保留其余条目的向量),返回删除条数。"""
+        kw = str(keyword or "").strip().lower()
+        if not kw:
+            return 0
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None, self._delete_by_keyword_sync, scope, kw
+        )
+
+    def _delete_by_keyword_sync(self, scope: str, kw: str) -> int:
+        with self._lock:
+            entries = self._load_unlocked(scope)
+            before = len(entries)
+            entries = [
+                e for e in entries if kw not in str(e.get("content") or "").lower()
+            ]
             removed = before - len(entries)
             if removed:
                 self._persist_unlocked(scope, entries)

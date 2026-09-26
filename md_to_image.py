@@ -66,6 +66,15 @@ class MdToImageMixin:
         """初始化渲染引擎(样式惰性加载,首次渲染时读取模板目录)。"""
         self._md_style = None
         self._md_style_path = (self._cfg("output_image_style_path", "") or "").strip()
+        # 允许聊天卡片读取插件数据目录下的本地图片(阻止提示注入读任意文件)
+        try:
+            from .im_render.rows import register_image_root
+
+            register_image_root(getattr(self, "data_dir", ""))
+            if self._md_style_path:
+                register_image_root(self._md_style_path)
+        except Exception as e:
+            logger.debug(f"life-sim: 注册图片目录失败: {e}")
 
     async def _md_load_style(self) -> None:
         """惰性加载模板目录样式(LoadMarkdownStyles,含 setting.json + elements.json)。"""

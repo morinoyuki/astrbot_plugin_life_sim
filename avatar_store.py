@@ -110,7 +110,7 @@ class AvatarStore:
             if not os.path.isdir(d):
                 continue
             for p in os.listdir(d):
-                if not p.startswith(target) or p in seen:
+                if os.path.splitext(p)[0] != target or p in seen:
                     continue
                 full = os.path.join(d, p)
                 if os.path.isfile(full) and any(
