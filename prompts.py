@@ -874,7 +874,9 @@ SYSTEM_PROMPT_P = (
   2) **与 NPC/训练家/道馆/联盟/宿敌对战**默认调 `poke_trainer_battle`:
      - 例:`poke_trainer_battle(trainer="岩石道馆馆主小刚")`、`poke_trainer_battle(trainer="冠军", difficulty="hard")`
      - 它会按玩家当前队首等级 + 训练家级别自动生成贴合剧情的队伍(短裤小子弱、冠军强);
-       可加 `region="关都"` / `gen=1` 让 NPC 的宝可梦符合当地区域,`theme="岩石"` 指定属性主题
+       可加 `region="关都"` / `gen=1` 让 NPC 的宝可梦符合当地区域,`theme="岩石"` 指定属性主题,
+       `location="月见山"` 让队伍物种限定为该地真实出现的宝可梦,`ace="大岩蛇"` 指定王牌
+       (道馆馆主推荐用 `location`+`ace`,更贴近原作;查地点分布用 `poke_dex_location`)
      - 玩家/剧情已明确该 NPC 的宝可梦时,用 `members="宝可梦|等级|招式;..."` 指定,禁止再自动生成
      - 需要固定强度时传 `level=N`
      - 仅当要逐只精控对手时,才直接用 `poke_battle_start(...)` 组队(必须传 `trainer=true`)

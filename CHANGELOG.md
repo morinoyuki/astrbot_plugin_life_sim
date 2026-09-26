@@ -17,7 +17,7 @@
   - **战斗出招规则与状态展示**:只能使用已学会的招式;单招 PP 耗尽拒绝并提示换招,全部耗尽强制「挣扎」(无属性、1/4 最大 HP 反作用);战斗状态显示可用招式(含 PP)与我方队伍序号。
   - **野生遭遇生成**:新增 `pokesim/encounter.py` 与 `poke_wild_encounter`。按地点生态(草地/森林/洞窟/水面/沙漠/雪山/城市/夜晚…) + 地区/世代 + 出现率/进化阶段/种族值加权抽取野生宝可梦并自动开战。传说/幻兽/究极异兽/悖谬种默认排除。解决了“LLM 无法掌握上千种宝可梦、容易乱编对手”的问题。
   - **真实地点野外分布**:新增 `pokesim/static/locations.json`(620 处地点/2 万+ 条分布)与 `tools/build_location_data.py`。数据源 PokeAPI `encounters.csv`(覆盖红蓝→朱紫+DLC、传说阿尔宙斯)+ Bulbapedia/52poke 中文地名。`poke_wild_encounter` 现在优先按地点**真实分布**(物种/等级区间/出现率/遭遇方式)抽取,支持 `version_group=` 指定作品;新增 `poke_dex_location` 查询某地分布 / 列出地区地点。
-  - **NPC 队伍生成**:新增 `pokesim/trainer.py` 与 `poke_trainer_battle`。未指定队伍时按玩家队首等级 + 训练家级别(短裤小子 1-2 只 → 冠军 5-6 只)+ 属性主题自动生成,等级/物种强度随剧情缩放;玩家/剧情已确定时用 `members=...` 指定。`poke_battle_start` 的对手语法扩展为 `名称|等级|招式|道具|特性`。
+  - **NPC 队伍生成**:新增 `pokesim/trainer.py` 与 `poke_trainer_battle`。未指定队伍时按玩家队首等级 + 训练家级别(短裤小子 1-2 只 → 冠军 5-6 只)+ 属性主题自动生成,等级/物种强度随剧情缩放;可用 `region`/`gen` 限定区域,`location` 让队伍物种来自该地真实分布(不足时从地区池打折补位),`ace` 指定王牌;玩家/剧情已确定时用 `members=...` 指定。`poke_battle_start` 的对手语法扩展为 `名称|等级|招式|道具|特性`。
   - **测试配置**:新增 `pytest.ini`(`asyncio_mode=auto`),修复缺失配置导致的 18 个异步测试假失败;同步 20 条 Web API 断言与 redo 测试桩(`_cfg`)。全量测试 95 passed。
   - **野生 vs 训练家**:`poke_battle_start` 新增 `trainer=true`;未标记训练家时,单只对手会默认当作野生战(可捕获)。现在训练家战(含单只)不可投球、不可逃跑。
   - **捕获与背包**:`poke_bag` 管理道具(精灵球/伤药/状态/复活/PP/战斗强化/进化石/树果等 60+ 种),野生战用 `poke_battle_turn` 的 `"catch 高级球"` 投球捕获(捕获率公式 + 精灵球条件加成 + 状态修正,捕获成功自动入队/进电脑);`poke_use_item` 战斗外使用,`"item 伤药"` 战斗中使用,`"run"` 逃跑。

@@ -575,6 +575,30 @@ def test_trainer_team_generation():
         for m in g["team"]:
             e = dex.species[m["species"]]
             assert not e.get("isLegendary") and not e.get("isMythical")
+    # 地点分布:队伍物种来自该地出现过的宝可梦
+    pool = {p["species"] for p in dex.location_pools("viridian-forest", include_special=True)}
+    g = generate_team(
+        dex,
+        party=[{"level": 20}],
+        trainer="捕虫少年",
+        location="viridian-forest",
+        size=2,
+        rng=random.Random(7),
+    )
+    assert g["size"] == 2
+    assert all(m["species"] in pool for m in g["team"])
+    # 指定王牌
+    g = generate_team(
+        dex,
+        party=[{"level": 25}],
+        trainer="岩石道馆馆主",
+        location="mt-moon",
+        ace="大岩蛇",
+        rng=random.Random(4),
+    )
+    assert g["team"][-1]["species"] == "onix"
+    assert g["team"][-1]["is_ace"]
+    assert sum(1 for m in g["team"] if m["is_ace"]) == 1
 
 
 def test_pokemon_trainer_battle():
@@ -590,6 +614,11 @@ def test_pokemon_trainer_battle():
             await p.poke_heal_party(ev)
             out = await p.poke_trainer_battle(ev, trainer="岩石道馆馆主小刚")
             assert "主题:岩石" in out and "基准 Lv13" in out
+            await p.poke_heal_party(ev)
+            out = await p.poke_trainer_battle(
+                ev, trainer="捕虫少年", location="常青森林", region="关都"
+            )
+            assert "地点:常青森林" in out
             await p.poke_heal_party(ev)
             out = await p.poke_trainer_battle(ev, trainer="宿敌", members="杰尼龟|13|水枪;小火龙|13")
             assert "剧情指定" in out and "杰尼龟" in out

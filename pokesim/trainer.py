@@ -141,6 +141,8 @@ def generate_team(
     level: int = 0,
     size: int = 0,
     difficulty: str = "",
+    location: str = "",
+    ace: str = "",
     region: str = "",
     gen: int = 0,
     allow_rare: bool = False,
@@ -170,38 +172,70 @@ def generate_team(
     target = 300 + 3.2 * lvl + power * 40
     target = max(280.0, min(620.0, target))
 
-    keys: list[str] = []
-    weights: list[float] = []
-    for key, entry in dex.species.items():
-        if not is_wild_candidate(entry):
-            continue
-        if not in_scope(entry, region, gen):
-            continue
-        et = set(entry.get("types") or [])
-        if types and not (et & types):
-            continue
-        if not _eligible_at_level(entry, lvl):
-            continue
-        rare = bool(entry.get("isLegendary") or entry.get("isMythical"))
-        tags = set(entry.get("tags") or [])
-        if (rare or tags & {"Ultra Beast", "Paradox"}) and not allow_rare:
-            continue
-        w = 1.0 / (1.0 + abs(_bst(entry) - target) / 45.0)
-        w *= _stage_mult(power, _stage(entry))
-        if rare:
-            w *= 0.02
-        if w > 0:
-            keys.append(key)
-            weights.append(w)
+    # 地点真实分布:限定队伍物种来自该地出现的宝可梦
+    loc_weights: dict[str, float] = {}
+    if location:
+        for p in dex.location_pools(location, include_special=True):
+            loc_weights[p["species"]] = max(loc_weights.get(p["species"], 0), float(p["chance"]))
+
+    def build(use_location: bool) -> tuple[list[str], list[float]]:
+        ks: list[str] = []
+        ws: list[float] = []
+        for key, entry in dex.species.items():
+            if not is_wild_candidate(entry):
+                continue
+            if use_location and key not in loc_weights:
+                continue
+            if not in_scope(entry, region, gen):
+                continue
+            et = set(entry.get("types") or [])
+            if types and not (et & types):
+                continue
+            if not _eligible_at_level(entry, lvl):
+                continue
+            rare = bool(entry.get("isLegendary") or entry.get("isMythical"))
+            tags = set(entry.get("tags") or [])
+            if (rare or tags & {"Ultra Beast", "Paradox"}) and not allow_rare:
+                continue
+            w = 1.0 / (1.0 + abs(_bst(entry) - target) / 45.0)
+            w *= _stage_mult(power, _stage(entry))
+            if use_location:
+                w *= 0.4 + loc_weights.get(key, 0.0) / 100.0
+            if rare:
+                w *= 0.02
+            if w > 0:
+                ks.append(key)
+                ws.append(w)
+        return ks, ws
+
+    keys, weights = build(bool(loc_weights))
+    if loc_weights and len(keys) < n:
+        # 本地物种不足以凑满队伍时,从地区/主题池少量补位(权重打折)
+        extra_k, extra_w = build(False)
+        seen = set(keys)
+        for k, w in zip(extra_k, extra_w, strict=True):
+            if k not in seen:
+                keys.append(k)
+                weights.append(w * 0.15)
+                seen.add(k)
+    if not keys and loc_weights:
+        keys, weights = build(False)
     if not keys:
         return {"team": [], "level": lvl, "size": 0, "power": power, "theme": sorted(types)}
 
     picked = _sample_distinct(keys, weights, n, r)
+    # 指定王牌(如道馆馆主的代表宝可梦)
+    ace_key = ""
+    if ace:
+        ar = dex.resolve_species(ace)
+        if ar and is_wild_candidate(ar[1]):
+            ace_key = ar[0]
+            picked = [k for k in picked if k != ace_key][: max(0, n - 1)]
     picked.sort(key=lambda k: _bst(dex.species[k]))
     team: list[dict] = []
     for i, k in enumerate(picked):
         entry = dex.species[k]
-        is_ace = i == len(picked) - 1
+        is_ace = (i == len(picked) - 1) and not ace_key
         mon_lvl = lvl + (2 if is_ace and power >= 0.85 else 1 if is_ace else 0)
         item = ""
         if r.random() < item_p + (0.15 if is_ace else 0):
@@ -213,6 +247,17 @@ def generate_team(
                 "level": max(2, min(100, mon_lvl)),
                 "item": item,
                 "is_ace": is_ace,
+            }
+        )
+    if ace_key and all(m["species"] != ace_key for m in team):
+        entry = dex.species[ace_key]
+        team.append(
+            {
+                "species": ace_key,
+                "zh": entry.get("zh") or entry.get("name") or ace_key,
+                "level": max(2, min(100, lvl + 1)),
+                "item": "",
+                "is_ace": True,
             }
         )
     return {

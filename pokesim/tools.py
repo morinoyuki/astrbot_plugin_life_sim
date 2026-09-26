@@ -1535,6 +1535,8 @@ class PokemonMixin:
         trainer: str = "",
         members: str = "",
         theme: str = "",
+        location: str = "",
+        ace: str = "",
         level: int = 0,
         size: int = 0,
         difficulty: str = "",
@@ -1554,6 +1556,8 @@ class PokemonMixin:
             trainer(string): Optional. 训练家称呼,如 "岩石道馆馆主小刚"、"精英训练家"、"冠军"、"宿敌小茂"。影响队伍规模/强度/属性主题。
             members(string): Optional. 明确指定该 NPC 的宝可梦(同 poke_battle_start 的 enemy 语法:"名称|等级|招式|道具" 分号分隔)。一旦指定则不再自动生成。
             theme(string): Optional. 属性主题(如 "岩石"、"水/冰");不填时尝试从 trainer 名称解析(如"岩石道馆")。
+            location(string): Optional. 地点(如 "常青森林"/"岩山隧道");给出时队伍物种限定为该地真实出现过的宝可梦,更贴近原作。
+            ace(string): Optional. 指定王牌宝可梦(如 "大岩蛇"),放在最后一只。
             level(int): Optional. 强制 NPC 等级(剧情需要固定强度时用);0 表示按玩家队首等级自动缩放。
             size(int): Optional. 强制队伍规模 1-6;0 表示按训练家级别决定。
             difficulty(string): Optional. 难度修正:easy/normal/hard 或 简单/普通/困难。
@@ -1578,6 +1582,7 @@ class PokemonMixin:
             )
             return f"🎽 {trainer or '训练家'} 的队伍(剧情指定):\n" + out
 
+        loc_key = dex.find_location(location, region) if location else ""
         gen = generate_team(
             dex,
             party=party,
@@ -1586,6 +1591,8 @@ class PokemonMixin:
             level=int(level or 0),
             size=int(size or 0),
             difficulty=difficulty,
+            location=loc_key,
+            ace=ace,
             region=region,
             gen=int(gen or 0),
             allow_rare=bool(allow_rare),
@@ -1606,9 +1613,13 @@ class PokemonMixin:
             terrain=terrain,
         )
         theme_txt = " / ".join(dex.type_label(t) for t in gen["theme"]) if gen["theme"] else "均衡"
+        loc_txt = ""
+        if loc_key:
+            loc_name = (dex.locations.get(loc_key) or {}).get("zh") or loc_key
+            loc_txt = f" · 地点:{loc_name}"
         header = (
             f"🎽 {trainer or '训练家'} 派出了 {len(team)} 只宝可梦!"
-            f"(主题:{theme_txt} · 基准 Lv{gen['level']})"
+            f"(主题:{theme_txt}{loc_txt} · 基准 Lv{gen['level']})"
         )
         lines = [header]
         for i, m in enumerate(team, 1):
