@@ -176,8 +176,13 @@ class Pokemon:
         """能力等级变化,返回日志(可为空)。"""
         if delta == 0:
             return ""
-        if delta < 0 and self.has_ability("clear-body", "white-smoke", "full-metal-body"):
-            return f"{self.display} 的{get_dex().stat_label(stat)}不会下降({self.ability_name})!"
+        if delta < 0:
+            item_eff = (ITEMS.get(self.item) or {}).get("effect") or {}
+            if item_eff.get("no_stat_drop"):
+                label = get_dex().stat_label(stat)
+                return f"{self.display} 的{label}不会下降({item_label(self.item)})!"
+            if self.has_ability("clear-body", "white-smoke", "full-metal-body"):
+                return f"{self.display} 的{get_dex().stat_label(stat)}不会下降({self.ability_name})!"
         old = self.stage(stat)
         new = max(-6, min(6, old + delta))
         self.stages[stat] = new
@@ -312,9 +317,7 @@ class Pokemon:
         # 能力等级
         base *= _stage_mult(self.stage(stat))
 
-        # 异常状态
-        if stat == "atk" and self.status == "brn" and not self.has_ability("guts"):
-            base *= 0.5
+        # 异常状态(灼伤只影响物理招式伤害,不降攻击数值;混乱自伤在此单独结算)
         if stat == "spe" and self.status == "par":
             base *= 0.5
 
@@ -418,6 +421,8 @@ class Battle:
     captured: dict | None = None
     run_attempts: int = 0
     escaped: bool = False
+    # 每回合重置的随机数调用计数(避免同 salt 的随机数完全相关)
+    _rng_calls: int = 0
 
     # ── 序列化 ──
     def to_dict(self) -> dict:
@@ -547,11 +552,20 @@ class Battle:
 
     # ── RNG ──
     def _rng(self, salt: int = 0) -> random.Random:
-        return random.Random((self.seed or 0) * 100000 + self.turn * 97 + salt)
+        # 同一回合内每次调用都不同:seed/turn/salt/调用序号 共同决定,
+        # 避免双方命中/会心/追加判定拿到相同随机数(完全相关)。
+        self._rng_calls += 1
+        return random.Random(
+            (self.seed or 0) * 1000003
+            + self.turn * 9176
+            + salt * 131
+            + self._rng_calls
+        )
 
     # ── 入口 ──
     def start(self) -> list[str]:
         self.log = []
+        self._rng_calls = 0
         self._send_out(self.player, self.player.active, initial=True)
         self._send_out(self.enemy, self.enemy.active, initial=True)
         self._check_faints()
@@ -566,7 +580,11 @@ class Battle:
         if self.finished:
             return ["战斗已经结束。"]
         self.log = []
+        # 等换人时只接受换人命令;无效行动不消耗回合(也不推进随机数流)
+        if self.awaiting_switch and player_action.get("type") != "switch":
+            return ['⚠️ 必须先换人:{"type": "switch", "index": <序号>}']
         self.turn += 1
+        self._rng_calls = 0
         self.player_damaged = False
         self.enemy_damaged = False
 
@@ -579,15 +597,11 @@ class Battle:
                 mon.volatiles.pop("endure", None)
 
         if self.awaiting_switch:
-            if player_action.get("type") == "switch":
-                self._do_switch(self.player, int(player_action.get("index", 0)))
-                self.awaiting_switch = False
-            else:
-                return ["⚠️ 必须先换人:{\"type\": \"switch\", \"index\": <序号>}"]
+            self._do_switch(self.player, int(player_action.get("index", 0)))
+            self.awaiting_switch = False
             enemy_action = "auto"
             self._tick_end_of_turn()
-            if self._check_faints():
-                return list(self.log)
+            self._check_faints()
             return list(self.log)
 
         if enemy_action == "auto":
@@ -690,6 +704,9 @@ class Battle:
             return
         if index == side.active:
             return
+        if side.party[index].fainted:
+            self.log.append(f"{side.party[index].display} 已倒下,无法上场。")
+            return
         old = side.mon
         if old and not old.fainted:
             self._on_switch_out(side, old)
@@ -776,7 +793,11 @@ class Battle:
             self.log.append(f"撒菱扎伤了 {mon.display}!({dmg})")
         if "toxicspikes" in hz and grounded and not mon.status:
             layers = min(2, int(hz.get("toxicspikes", 1)))
-            if "Poison" in mon.types or mon.has_ability("immunity"):
+            if (
+                "Poison" in mon.types
+                or "Steel" in mon.types
+                or mon.has_ability("immunity")
+            ):
                 pass
             else:
                 mon.status = "tox" if layers >= 2 else "psn"
@@ -946,9 +967,9 @@ class Battle:
         if target is None:
             return
         self.log.append(f"{self._who(side)} 使用了 {entry['zh']}!")
-        self._apply_item_effect(target, entry.get("effect") or {})
+        self._apply_item_effect(target, entry.get("effect") or {}, action.get("move") or "")
 
-    def _apply_item_effect(self, mon: Pokemon, eff: dict) -> None:
+    def _apply_item_effect(self, mon: Pokemon, eff: dict, move_key: str = "") -> None:
         if mon.fainted:
             if eff.get("revive_full") or eff.get("revive"):
                 self._revive(mon, 1.0 if eff.get("revive_full") else float(eff.get("revive", 0.5)))
@@ -971,16 +992,30 @@ class Battle:
             mon.status = ""
             mon.status_turns = 0
             self.log.append(f"{mon.display} 的{old}被治愈了!")
-        if eff.get("pp_restore_all"):
-            for mv in mon.moves:
-                mon.pp[mv] = int((get_dex().moves.get(mv) or {}).get("pp", 10) or 10)
-            self.log.append(f"{mon.display} 的全部招式 PP 完全回复了!")
-        elif eff.get("pp_restore"):
-            amount = int(eff["pp_restore"])
-            for mv in mon.moves:
+        if eff.get("pp_restore_all") or eff.get("pp_restore"):
+            full = bool(eff.get("pp_restore_all"))
+            pp_all = bool(eff.get("pp_all"))
+            targets = list(mon.moves)
+            if not pp_all:
+                # 单招回复:优先指定招式,否则第一个 PP 未满的招式
+                if move_key and move_key in mon.moves:
+                    targets = [move_key]
+                else:
+                    targets = [
+                        m
+                        for m in mon.moves
+                        if int(mon.pp.get(m, 0))
+                        < int((get_dex().moves.get(m) or {}).get("pp", 10) or 10)
+                    ][:1] or mon.moves[:1]
+            amount = 0 if full else int(eff.get("pp_restore") or 0)
+            for mv in targets:
                 mx = int((get_dex().moves.get(mv) or {}).get("pp", 10) or 10)
-                mon.pp[mv] = min(mx, int(mon.pp.get(mv, mx)) + amount)
-            self.log.append(f"{mon.display} 回复了招式的 PP。")
+                mon.pp[mv] = mx if full else min(mx, int(mon.pp.get(mv, mx)) + amount)
+            self.log.append(
+                f"{mon.display} 的全部招式 PP 完全回复了!"
+                if pp_all and full
+                else f"{mon.display} 回复了招式的 PP。"
+            )
         for stat, stages in (eff.get("stat_boost") or {}).items():
             msg = mon.boost(stat, int(stages))
             if msg:
@@ -1372,29 +1407,35 @@ class Battle:
         power: float, mtype: str, eff: float, crit: bool,
     ) -> int:
         category = entry.get("category", "Physical")
-        # 攻击 / 防御方能力
+        # 太晶爆发:太晶化后按攻/特攻较高者决定物理/特殊
+        if move_key == "terablast" and mon.terastallized:
+            category = (
+                "Physical"
+                if mon.battle_stat("atk", self) >= mon.battle_stat("spa", self)
+                else "Special"
+            )
+        # 攻击 / 防御方能力(先确定数值来源,会心只作用于该数值)
         if move_key in ("bodypress",):
-            atk_stat = mon.battle_stat("def", self)
+            atk_name, atk_owner = "def", mon
         elif move_key == "foulplay":
-            atk_stat = foe.battle_stat("atk", self)
+            atk_name, atk_owner = "atk", foe
         elif category == "Physical":
-            atk_stat = mon.battle_stat("atk", self)
+            atk_name, atk_owner = "atk", mon
         else:
-            atk_stat = mon.battle_stat("spa", self)
+            atk_name, atk_owner = "spa", mon
 
         if move_key in ("psyshock", "psystrike", "secretsword") or category == "Physical":
-            def_stat = foe.battle_stat("def", self)
+            def_name = "def"
         else:
-            def_stat = foe.battle_stat("spd", self)
+            def_name = "spd"
 
-        # 会心时忽略不利能力等级
+        # 会心时忽略不利能力等级(作用于同一数值,不改变来源)
         if crit:
-            if category == "Physical":
-                atk_stat = _crit_offense(mon, "atk", self)
-                def_stat = _crit_defense(foe, "def", self)
-            else:
-                atk_stat = _crit_offense(mon, "spa", self)
-                def_stat = _crit_defense(foe, "spd", self)
+            atk_stat = _crit_offense(atk_owner, atk_name, self)
+            def_stat = _crit_defense(foe, def_name, self)
+        else:
+            atk_stat = atk_owner.battle_stat(atk_name, self)
+            def_stat = foe.battle_stat(def_name, self)
 
         level = mon.level
         base = math.floor(
@@ -1485,6 +1526,8 @@ class Battle:
                 power *= 2
         elif move_key in ("avalanche", "revenge") and (self.player_damaged if self.player.mon is mon else self.enemy_damaged) or move_key in ("payback", "assurance") and (self.player_damaged if self.player.mon is mon else self.enemy_damaged) or move_key == "weatherball" and self.weather or move_key == "terrainpulse" and self.terrain or move_key == "risingvoltage" and self.terrain == "electricterrain":
             power *= 2
+        elif move_key == "terablast" and mon.terastallized:
+            power = 100
         elif move_key == "expandingforce" and self.terrain == "psychicterrain" or move_key == "mistyexplosion" and self.terrain == "mistyterrain":
             power *= 1.5
         # 技术高手类由 _attacker_mods 处理
@@ -1551,7 +1594,10 @@ class Battle:
         if move_key == "willowisp":
             self._inflict(foe, "brn")
         if move_key == "thunderwave":
-            self._inflict(foe, "par")
+            if "Ground" in foe.types:
+                self.log.append(f"{foe.display} 是地面属性,电磁波无效。")
+            else:
+                self._inflict(foe, "par")
         if move_key in ("toxic", "poisonpowder", "poisongas"):
             self._inflict(foe, "tox" if move_key == "toxic" else "psn")
         if move_key in ("sleeppowder", "spore", "hypnosis", "sing", "grasswhistle", "lovelykiss", "darkvoid"):
@@ -1622,6 +1668,12 @@ class Battle:
         if status == "brn" and "Fire" in target.types:
             self.log.append(f"{target.display} 是火属性,不会灼伤。")
             return
+        if status == "frz" and "Ice" in target.types:
+            self.log.append(f"{target.display} 是冰属性,不会冰冻。")
+            return
+        if status == "par" and "Electric" in target.types:
+            self.log.append(f"{target.display} 是电属性,不会麻痹。")
+            return
         if status in ("psn", "tox"):
             if "Poison" in target.types or "Steel" in target.types:
                 self.log.append(f"{target.display} 不会中毒。")
@@ -1639,7 +1691,8 @@ class Battle:
             self.log.append(f"{target.display} 不会灼伤!")
             return
         if target.has_ability("magic-guard"):
-            return
+            # 魔法防守只免异常状态造成的伤害,不免异常状态本身(在伤害结算处处理)
+            pass
         if (ITEMS.get(target.item) or {}).get("effect", {}).get("cure_status"):
             self.log.append(f"{target.display} 的木子果治愈了异常状态!")
             return
@@ -1829,26 +1882,33 @@ class Battle:
 
     def _check_faints(self) -> bool:
         any_faint = False
-        for side, tag in ((self.player, "我方"), (self.enemy, "对方")):
-            mon = side.mon
-            if mon and mon.fainted and not mon.faint_logged:
-                mon.faint_logged = True
-                any_faint = True
-                self.log.append(f"{tag} {mon.display} 倒下了!")
-        if not any_faint:
-            return False
-        for side in (self.player, self.enemy):
-            mon = side.mon
-            if mon and mon.fainted:
-                if not side.alive():
-                    self._finish(side)
-                elif side is self.player:
-                    self.awaiting_switch = True
-                else:
-                    nxt = side.healthy()
-                    if nxt:
-                        self._send_out(side, nxt[0])
-        return True
+        # 循环处理“换上场后又被陷阱/天气打倒”的连环倒下
+        for _ in range(12):
+            round_faint = False
+            for side, tag in ((self.player, "我方"), (self.enemy, "对方")):
+                mon = side.mon
+                if mon and mon.fainted and not mon.faint_logged:
+                    mon.faint_logged = True
+                    round_faint = True
+                    any_faint = True
+                    self.log.append(f"{tag} {mon.display} 倒下了!")
+            if not round_faint:
+                break
+            for side in (self.player, self.enemy):
+                mon = side.mon
+                if mon and mon.fainted:
+                    if not side.alive():
+                        if not self.finished:
+                            self._finish(side)
+                    elif side is self.player:
+                        self.awaiting_switch = True
+                    else:
+                        nxt = side.healthy()
+                        if nxt:
+                            self._send_out(side, nxt[0])
+            if self.finished:
+                break
+        return any_faint
 
     def _finish(self, loser: Side) -> None:
         self.finished = True
@@ -2093,13 +2153,16 @@ def _defender_mods(
 
 
 def _calc_confusion_damage(battle: Battle, mon: Pokemon) -> int:
-    # 40 威力、无属性的物理自伤
+    # 40 威力、无属性的物理自伤(灼伤同样减半)
     atk = mon.battle_stat("atk", battle)
     dfn = mon.battle_stat("def", battle)
     base = math.floor(
         math.floor(math.floor(2 * mon.level / 5 + 2) * 40 * atk / dfn) / 50
     ) + 2
-    return max(1, int(base * battle._rng(16).uniform(0.85, 1.0)))
+    mods = 1.0
+    if mon.status == "brn" and not mon.has_ability("guts"):
+        mods *= 0.5
+    return max(1, int(base * mods * battle._rng(16).uniform(0.85, 1.0)))
 
 
 # ──────────────────────────── 工厂函数 ────────────────────────────

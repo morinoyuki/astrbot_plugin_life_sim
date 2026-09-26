@@ -749,6 +749,88 @@ def test_tool_arg_coercion():
     assert M._coerce_tool_kwargs(int_schema, {"event": object()}) != (None, None)
 
 
+def test_engine_bugfixes():
+    """审计修复回归:灼伤倍率/状态免疫/毒菱/太晶爆发/会心数值来源/换人/PP/随机数。"""
+    dex = get_dex()
+
+    def mk(s, lv=50, **k):
+        return create_pokemon(s, lv, **k)
+
+    # H1 灼伤只乘一次(物理伤害 ×0.5,而非 ×0.25)
+    b = start_battle([mk("machop", ability="no-guard")], [mk("snorlax")])
+    att, foe, ent = b.player.mon, b.enemy.mon, dex.moves["karatechop"]
+    healthy = b._calc_damage(att, foe, "karatechop", ent, 50, "Fighting", 1.0, False)
+    att.status = "brn"
+    burned = b._calc_damage(att, foe, "karatechop", ent, 50, "Fighting", 1.0, False)
+    assert 0.4 <= burned / healthy <= 0.6
+
+    # M2 魔法防守不阻止异常状态本身;M3 冰免冰/电免麻
+    b = start_battle([mk("clefable", ability="magic-guard")], [mk("snorlax")])
+    b._inflict(b.player.mon, "tox")
+    assert b.player.mon.status == "tox"
+    b = start_battle([mk("lapras")], [mk("snorlax")])
+    b._inflict(b.player.mon, "frz")
+    assert b.player.mon.status == ""
+    b = start_battle([mk("pikachu")], [mk("snorlax")])
+    b._inflict(b.player.mon, "par")
+    assert b.player.mon.status == ""
+
+    # M4 毒菱对钢属性无效
+    b = start_battle([mk("steelix")], [mk("snorlax")])
+    b.player.hazards["toxicspikes"] = 2
+    b._apply_hazards(b.player, b.player.mon)
+    assert b.player.mon.status == ""
+
+    # M6 太晶爆发:太晶化后威力 100、按攻/特攻较高者决定分类
+    b = start_battle([mk("machamp")], [mk("snorlax")])
+    m = b.player.mon
+    m.terastallized = True
+    m.tera_type = "Fighting"
+    assert b._effective_power(m, b.enemy.mon, "terablast", dex.moves["terablast"]) == 100
+
+    # M7 会心不改变「扑击」的数值来源(用防御)
+    b = start_battle([mk("snorlax")], [mk("pidgey")])
+    bp = b.player.mon
+    bp.stages["def"] = 6
+    n = b._calc_damage(bp, b.enemy.mon, "bodypress", dex.moves["bodypress"], 80, "Fighting", 1.0, False)
+    c = b._calc_damage(bp, b.enemy.mon, "bodypress", dex.moves["bodypress"], 80, "Fighting", 1.0, True)
+    assert 1.2 <= c / n <= 1.8
+
+    # H2 不能换上已倒下的宝可梦
+    p = [mk("pikachu"), mk("geodude"), mk("pidgey")]
+    b = start_battle(p, [mk("snorlax")])
+    b.player.party[1].cur_hp = 0
+    b.player.party[1].fainted = True
+    b._do_switch(b.player, 1)
+    assert b.player.active == 0
+
+    # H3 换上后又被陷阱打倒时能继续处理
+    b = start_battle([mk("pikachu")], [mk("geodude"), mk("pidgey"), mk("snorlax")])
+    b.enemy.hazards["stealthrock"] = 1
+    b.enemy.party[0].cur_hp = 1
+    b.enemy.party[1].cur_hp = 1
+    b.enemy.party[0].fainted = True
+    b._check_faints()
+    # 第 1 只倒下 → 派第 2 只 → 又被陷阱打倒 → 应继续派第 3 只
+    assert b.enemy.active == 2
+    assert not b.enemy.party[2].fainted
+
+    # N 元气之粉只回复一个招式
+    b = start_battle([mk("pikachu")], [mk("snorlax")])
+    mon = b.player.mon
+    mon.pp[mon.moves[0]] = 1
+    mon.pp[mon.moves[1]] = 1
+    b._apply_item_effect(mon, {"pp_restore": 10})
+    depleted = [m for m in mon.moves if mon.pp[m] == 1]
+    assert len(depleted) == 1
+
+    # M1 同 salt 的随机数不再完全相关
+    b = start_battle([mk("pikachu")], [mk("snorlax")])
+    b.turn = 1
+    b._rng_calls = 0
+    assert b._rng(6).random() != b._rng(6).random()
+
+
 if __name__ == "__main__":
     test_dex_lookup_and_types()
     test_dex_stats_and_learnset()
@@ -771,4 +853,5 @@ if __name__ == "__main__":
     test_pokemon_location_tools()
     test_pokemon_sprites()
     test_tool_arg_coercion()
+    test_engine_bugfixes()
     print("all pokesim tests passed")
