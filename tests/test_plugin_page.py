@@ -126,7 +126,7 @@ def test_register_web_apis():
     p.context = FakeCtx()
     p._register_web_apis()
 
-    assert len(registered) == 17
+    assert len(registered) == 20
     assert ("/astrbot_plugin_life_sim/api/overview", ("GET",)) in registered
     assert ("/astrbot_plugin_life_sim/api/session/<key>", ("GET",)) in registered
     assert ("/astrbot_plugin_life_sim/api/messages/truncate", ("POST",)) in registered

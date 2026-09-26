@@ -9,9 +9,11 @@
 
 from __future__ import annotations
 
+import random
 import re
 
 from .dex import STAT_ORDER, get_dex
+from .encounter import roll_encounter, roll_level
 from .engine import (
     STATUS_ZH,
     Battle,
@@ -31,6 +33,7 @@ from .items import (
     resolve_item,
 )
 from .store import PokeStore
+from .trainer import generate_team, team_to_enemy_string
 
 MAX_PARTY = 6
 
@@ -1343,6 +1346,136 @@ class PokemonMixin:
 
     # ──────────────────────────── 对战工具 ────────────────────────────
 
+    async def poke_wild_encounter(
+        self,
+        event,
+        area: str = "",
+        region: str = "",
+        level: int = 0,
+        gen: int = 0,
+        allow_rare: bool = False,
+    ) -> str:
+        """根据地点生态抽取一只野生宝可梦并直接开战(推荐用它代替自编对手)。
+
+        物种由本地图鉴按 出现率/进化阶段/种族值/生态属性 加权抽取,
+        不需要在上下文里列举宝可梦。传说/幻兽默认不出现。
+
+        Args:
+            area(string): Optional. 地点/生态关键词,如 "草地"、"森林"、"洞窟"、"水面"、"沙漠"、"雪山"、"城市"、"夜晚的森林"、"废弃发电厂"。
+            region(string): Optional. 地区,限定全国图鉴范围:关都/城都/丰缘/神奥/合众/卡洛斯/阿罗拉/伽勒尔/帕底亚。
+            level(int): Optional. 野生等级;0(默认)按玩家队首等级 ±3 浮动。
+            gen(int): Optional. 限定世代 1-9(与 region 二选一即可)。
+            allow_rare(bool): Optional. 是否允许极稀有/传说/幻兽出现(概率极低),默认 false。
+        """
+        dex = get_dex()
+        data = self._poke_load(event)
+        party = self._party_of(data)
+        if not party:
+            return "❌ 队伍是空的,无法进行野生遭遇。先 poke_add_pokemon。"
+        rng = random.Random()
+        enc = roll_encounter(
+            dex,
+            area=area or "",
+            region=region or "",
+            gen=int(gen or 0),
+            allow_rare=bool(allow_rare),
+            rng=rng,
+        )
+        if enc is None:
+            return (
+                f"❌ 在「{area or '此地'}」没有找到合适的野生宝可梦"
+                "(可换个生态关键词,如 草地/森林/洞窟/水面/沙漠/雪山/城市/夜晚)。"
+            )
+        lvl = roll_level(dex, party, level=int(level or 0), rng=rng)
+        types = " / ".join(dex.type_label(t) for t in enc["types"])
+        head = (
+            f"🌿 野生的 {enc['zh']} 出现了!(Lv{lvl} · {types} · 稀有度:{enc['rarity']})"
+        )
+        out = await self.poke_battle_start(event, enemy=f"{enc['zh']}|{lvl}", wild=True)
+        return head + "\n\n" + out
+
+    async def poke_trainer_battle(
+        self,
+        event,
+        trainer: str = "",
+        members: str = "",
+        theme: str = "",
+        level: int = 0,
+        size: int = 0,
+        difficulty: str = "",
+        weather: str = "",
+        terrain: str = "",
+        allow_rare: bool = False,
+    ) -> str:
+        """与 NPC/训练家对战。未指定队伍时,按玩家当前强度自动生成 NPC 队伍。
+
+        等级默认跟随玩家队首等级,并按训练家级别(短裤小子→冠军)与难度修正;
+        队伍规模与物种强度也随之变化,使 NPC 贴合当前剧情进度。
+        若玩家/剧情已确定该 NPC 的宝可梦,请用 members 明确指定。
+
+        Args:
+            trainer(string): Optional. 训练家称呼,如 "岩石道馆馆主小刚"、"精英训练家"、"冠军"、"宿敌小茂"。影响队伍规模/强度/属性主题。
+            members(string): Optional. 明确指定该 NPC 的宝可梦(同 poke_battle_start 的 enemy 语法:"名称|等级|招式|道具" 分号分隔)。一旦指定则不再自动生成。
+            theme(string): Optional. 属性主题(如 "岩石"、"水/冰");不填时尝试从 trainer 名称解析(如"岩石道馆")。
+            level(int): Optional. 强制 NPC 等级(剧情需要固定强度时用);0 表示按玩家队首等级自动缩放。
+            size(int): Optional. 强制队伍规模 1-6;0 表示按训练家级别决定。
+            difficulty(string): Optional. 难度修正:easy/normal/hard 或 简单/普通/困难。
+            weather(string): Optional. 开场天气: sun/rain/sand/snow。
+            terrain(string): Optional. 开场场地: electric/grassy/misty/psychic。
+            allow_rare(bool): Optional. 是否允许传说/幻兽(冠军/四天王剧情可用),默认 false。
+        """
+        dex = get_dex()
+        data = self._poke_load(event)
+        party = self._party_of(data)
+        if not party:
+            return "❌ 队伍是空的,无法进行训练家对战。先 poke_add_pokemon。"
+        if members:
+            out = await self.poke_battle_start(
+                event,
+                enemy=members,
+                trainer=True,
+                weather=weather,
+                terrain=terrain,
+            )
+            return f"🎽 {trainer or '训练家'} 的队伍(剧情指定):\n" + out
+
+        gen = generate_team(
+            dex,
+            party=party,
+            trainer=trainer,
+            theme=theme,
+            level=int(level or 0),
+            size=int(size or 0),
+            difficulty=difficulty,
+            allow_rare=bool(allow_rare),
+            rng=random.Random(),
+        )
+        team = gen["team"]
+        if not team:
+            return (
+                f"❌ 没有找到适合「{trainer or '该训练家'}」的宝可梦"
+                "(可换个 theme 或 allow_rare=true)。"
+            )
+        enemy_str = team_to_enemy_string(team, item_label)
+        out = await self.poke_battle_start(
+            event,
+            enemy=enemy_str,
+            trainer=True,
+            weather=weather,
+            terrain=terrain,
+        )
+        theme_txt = " / ".join(dex.type_label(t) for t in gen["theme"]) if gen["theme"] else "均衡"
+        header = (
+            f"🎽 {trainer or '训练家'} 派出了 {len(team)} 只宝可梦!"
+            f"(主题:{theme_txt} · 基准 Lv{gen['level']})"
+        )
+        lines = [header]
+        for i, m in enumerate(team, 1):
+            tag = " · 王牌" if m["is_ace"] else ""
+            it = f" · 携带 {item_label(m['item'])}" if m["item"] else ""
+            lines.append(f"  {i}. {m['zh']} Lv{m['level']}{it}{tag}")
+        return "\n".join(lines) + "\n\n" + out
+
     async def poke_battle_start(
         self,
         event,
@@ -1359,7 +1492,7 @@ class PokemonMixin:
         """开始一场宝可梦对战(单打)。对手以分号分隔多只组成训练家队伍。
 
         Args:
-            enemy(string): 对手。单只写名称;多只用分号分隔,每项可写 "名称|等级|招式1+招式2"。例如 "皮卡丘|50|十万伏特+电光一闪;喷火龙|52"。
+            enemy(string): 对手。单只写名称;多只用分号分隔,每项可写 "名称|等级|招式1+招式2|道具|特性"。例如 "皮卡丘|50|十万伏特+电光一闪|讲究眼镜;喷火龙|52"。
             enemy_level(int): Optional. 对手默认等级(每项未写等级时使用),默认 50。
             enemy_moves(string): Optional. 对手默认招式(逗号分隔),每项未写招式时使用。
             enemy_ability(string): Optional. 对手特性(仅单只时生效)。
@@ -1386,15 +1519,21 @@ class PokemonMixin:
                 continue
             lv = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else int(enemy_level or 50)
             mv = self._parse_moves(parts[2].replace("+", ",")) if len(parts) > 2 else []
+            ent_item = ""
+            if len(parts) > 3 and parts[3]:
+                _ir = resolve_item(parts[3])
+                ent_item = _ir[0] if _ir else ""
+            ent_ab = parts[4] if len(parts) > 4 else ""
             if not mv and i == 0:
                 mv = self._parse_moves(enemy_moves)
+            single = len(entries) == 1
             try:
                 enemy_party.append(
                     create_pokemon(
                         sp,
                         level=lv,
-                        ability=enemy_ability if len(entries) == 1 else "",
-                        item=enemy_item if len(entries) == 1 else "",
+                        ability=ent_ab or (enemy_ability if single else ""),
+                        item=ent_item or (enemy_item if single else ""),
                         moves=mv or None,
                     )
                 )

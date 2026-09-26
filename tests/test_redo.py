@@ -60,6 +60,12 @@ class _FakePlugin:
     def _sim_session_key(self, event):
         return f"group_{event.group_id}" if event.group_id else f"user_{event.sender_id}"
 
+    def _cfg(self, key, default=None):
+        # 测试不涉及向量记忆,关闭以免依赖 memory_store
+        if key == "memory_enable":
+            return False
+        return default
+
     def _rpg_restore(self, snapshot):
         return {"restored_chars": 0, "restored_sessions": 0,
                 "deleted_chars": 0, "deleted_sessions": 0}

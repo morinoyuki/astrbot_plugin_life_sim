@@ -13,7 +13,7 @@
 - **独立上下文** — 叙事历史走文件存储 + 显式 `contexts` 传入 LLM,不污染主对话
 - **LLM 智能压缩** — 超长历史调 LLM 提炼成摘要(失败自动回退规则抽取),不是简单丢消息
 - **LLM 模式识别** — `/创建` 时调 LLM 分析语境判断 A/B/C/P(失败回退关键词匹配)
-- **完整工具链** — 20 个 `rpg_*` 工具(HP/EXP/装备/技能点/物品/货币)+ 23 个 `poke_*` 工具(图鉴/属性/学招/培养/捕获/背包/训练/对战/太晶化/PvP)+ 6 个 `life_sim_*` 工具(保存/按需读取/剧情修订/主动召回/删除记忆)+ `roll_dice` 骰子工具(模式 C)
+- **完整工具链** — 20 个 `rpg_*` 工具(HP/EXP/装备/技能点/物品/货币)+ 25 个 `poke_*` 工具(图鉴/属性/学招/培养/捕获/背包/训练/野生遭遇/NPC 队伍/对战/太晶化/PvP)+ 6 个 `life_sim_*` 工具(保存/按需读取/剧情修订/主动召回/删除记忆)+ `roll_dice` 骰子工具(模式 C)
 - **持久化 lore** — 角色设定(支持多角色,按 `character` 分组)+ 世界观设定由 LLM 在对话中自动调用工具落库,后续每轮注入 system prompt
 - **向量记忆** — 自动记录「发生过的事情」(剧情/事件记忆)到向量库,后续轮次按语义召回与当前剧情相关的历史事件,注入当轮 user 消息;与 lore 完全解耦,生命周期 = 当前会话,/删除 /创建 时自动清空
 - **/undo 完整回滚** — 叙事历史 + lore 快照 + RPG 数值(HP/EXP/装备/会话)按 turn 计数一起回滚
@@ -100,6 +100,8 @@
 - **对战**:`poke_battle_start`(野生/训练家多只)→ 逐回合 `poke_battle_turn`;支持 `switch` 换人、`run` 逃跑;引擎按第 5 世代以后的伤害公式结算(属性相克 / STAB / 会心 / 随机数 / 天气 / 场地 / 墙 / 入场陷阱),支持异常状态、能力等级、特性(威吓/飘浮/魔法守护/多重鳞片/适应力等)、道具
 - **出招规则**:只能使用它已学到的招式;单招 PP 耗尽会拒绝并提示换招,全部招式 PP 耗尽时强制「挣扎」(无属性克制、1/4 最大 HP 反作用);战斗状态每回合列出**可用招式(含剩余 PP)与我方队伍序号**,便于玩家选择出招/换人/投球
 - **野生 vs 训练家**:只有野生战才能投球捕获/逃跑;与 NPC/道馆/联盟/宿敌/PvP 对战时传 `trainer=true`(多只对手自动判定为训练家战),训练家的宝可梦**不可捕获**
+- **野生遭遇生成**:`poke_wild_encounter(area="森林", region="关都")` —— 物种由本地图鉴按 出现率/进化阶段/种族值/生态属性(草地/洞窟/水面/沙漠/雪山/城市/夜晚…)加权抽取,传说/幻兽默认不出现,LLM 无需列举上千种宝可梦
+- **NPC 队伍生成**:`poke_trainer_battle(trainer="岩石道馆馆主小刚")` —— 未指定队伍时,按玩家队首等级 + 训练家级别(短裤小子→冠军)+ 属性主题自动生成贴合剧情强度的队伍;玩家/剧情已定则用 `members=...` 指定
 - **太晶化**:`tera move 招式` 触发;本系太晶 STAB ×2,星晶保留原属性并按原属性给 1.2 倍加成
 - **多玩家 / PvP**:每个玩家有独立队伍;`poke_trainers` 列出同群训练家,`poke_battle_pvp opponent="<uid>"` 与真人真实队伍对战(双方 HP/PP/异常写回各自存档),可组织道馆赛/淘汰赛
 - **确定性**:对战由 seed 驱动,同一行动同一结果,`/undo` 可回滚队伍与对战状态
@@ -295,9 +297,11 @@ astrbot_plugin_life_sim/
 │                         #     · 由 tools/build_pokemon_data.py 从 Pokémon Showdown + PokeAPI 生成
 │                         #   - dex.py    图鉴查询 / 属性相克 / 数值计算 / 招式学习
 │                         #   - engine.py 单打对战引擎(太晶化 / 状态 / 能力等级 / 特性 / 道具)
-│                         #   - items.py  对战常用道具表
-│                         #   - store.py  队伍与对战存档(<data_dir>/pokemon/<scope>.json)
-│                         #   - tools.py  PokemonMixin:23 个 poke_* LLM 工具
+│                         #   - items.py  对战常用道具表 + 背包道具表
+│                         #   - encounter.py 野生遭遇生态加权抽取
+│                         #   - trainer.py  NPC 训练家队伍生成(按剧情强度缩放)
+│                         #   - store.py  队伍/背包与对战存档(<data_dir>/pokemon/<scope>.json)
+│                         #   - tools.py  PokemonMixin:25 个 poke_* LLM 工具
 ├── avatar_store.py       # AvatarStore:角色头像存取(avatars/<scope>/<角色名>.png)
 ├── md_to_image.py        # Markdown → 图片渲染统一入口(基于 pillowmd,PNG/GIF)
 ├── pillowmd_patch.py     # 上游 pillowmd 库的兼容补丁(导入时自动应用)

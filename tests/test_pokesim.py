@@ -488,6 +488,102 @@ def test_pokemon_catch_only_wild():
         asyncio.run(run())
 
 
+def test_encounter_module():
+    import random
+
+    from lsim_pkg.pokesim.encounter import biome_types, roll_encounter, roll_level
+
+    dex = get_dex()
+    # 生态属性解析
+    assert "Water" in biome_types("海面")
+    assert "Bug" in biome_types("夜晚的森林") or "Grass" in biome_types("夜晚的森林")
+    # 地区限定 + 生态过滤
+    enc = roll_encounter(dex, area="水面", region="丰缘", rng=random.Random(1))
+    assert enc is not None and "Water" in enc["types"]
+    num = int(dex.species[enc["species"]]["num"])
+    assert 252 <= num <= 386
+    # 默认排除传说/幻兽
+    for seed in range(60):
+        e = roll_encounter(dex, area="", rng=random.Random(seed))
+        assert not dex.species[e["species"]].get("isLegendary")
+        assert not dex.species[e["species"]].get("isMythical")
+    # 等级浮动
+    lvl = roll_level(dex, [{"level": 20}], rng=random.Random(0))
+    assert 17 <= lvl <= 22
+    assert roll_level(dex, [{"level": 20}], level=42) == 42
+
+
+def test_pokemon_wild_encounter():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _FakePlugin(tmp)
+        ev = _Event()
+
+        async def run():
+            assert "队伍是空的" in await p.poke_wild_encounter(ev, area="草地")
+            await p.poke_add_pokemon(ev, "皮卡丘", level=15, moves="thundershock,quickattack")
+            out = await p.poke_wild_encounter(ev, area="草地", region="关都", level=10)
+            assert "野生的" in out and "野生战" in out and "Lv10" in out
+            out = await p.poke_wild_encounter(ev, area="海面", region="丰缘")
+            assert "野生的" in out and "野生战" in out
+
+        asyncio.run(run())
+
+
+def test_trainer_team_generation():
+    import random
+
+    from lsim_pkg.pokesim.trainer import generate_team, tier_of
+
+    dex = get_dex()
+    # 训练家级别解析
+    assert tier_of("冠军")[0] == (5, 6)
+    assert tier_of("短裤小子")[0] == (1, 2)
+    assert tier_of("精英训练家")[0] == (2, 4)
+    # 岩石主题:队伍均有岩石属性
+    gen = generate_team(
+        dex, party=[{"level": 20}], trainer="岩石道馆馆主", rng=random.Random(3)
+    )
+    assert gen["size"] >= 3
+    assert "Rock" in gen["theme"]
+    for m in gen["team"]:
+        assert "Rock" in dex.species[m["species"]]["types"]
+        assert 18 <= m["level"] <= 24
+    assert gen["team"][-1]["is_ace"]
+    # 等级跟随队首 + 难度修正
+    easy = generate_team(dex, party=[{"level": 30}], trainer="训练家", difficulty="easy", rng=random.Random(1))
+    hard = generate_team(dex, party=[{"level": 30}], trainer="训练家", difficulty="hard", rng=random.Random(1))
+    assert hard["level"] == easy["level"] + 4
+    # 显式等级固定
+    fixed = generate_team(dex, party=[{"level": 30}], trainer="道馆", level=42, rng=random.Random(2))
+    assert fixed["level"] == 42
+    # 默认不出传说/幻兽
+    for seed in range(30):
+        g = generate_team(dex, party=[{"level": 50}], trainer="冠军", rng=random.Random(seed))
+        for m in g["team"]:
+            e = dex.species[m["species"]]
+            assert not e.get("isLegendary") and not e.get("isMythical")
+
+
+def test_pokemon_trainer_battle():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _FakePlugin(tmp)
+        ev = _Event()
+
+        async def run():
+            assert "队伍是空的" in await p.poke_trainer_battle(ev, trainer="短裤小子")
+            await p.poke_add_pokemon(ev, "皮卡丘", level=12, moves="thundershock,quickattack")
+            out = await p.poke_trainer_battle(ev, trainer="短裤小子")
+            assert "派出了" in out and "训练家战" in out and "基准 Lv11" in out
+            await p.poke_heal_party(ev)
+            out = await p.poke_trainer_battle(ev, trainer="岩石道馆馆主小刚")
+            assert "主题:岩石" in out and "基准 Lv13" in out
+            await p.poke_heal_party(ev)
+            out = await p.poke_trainer_battle(ev, trainer="宿敌", members="杰尼龟|13|水枪;小火龙|13")
+            assert "剧情指定" in out and "杰尼龟" in out
+
+        asyncio.run(run())
+
+
 if __name__ == "__main__":
     test_dex_lookup_and_types()
     test_dex_stats_and_learnset()
@@ -502,4 +598,8 @@ if __name__ == "__main__":
     test_pokemon_battle_pp_rules()
     test_pokemon_learnset_display()
     test_pokemon_catch_only_wild()
+    test_encounter_module()
+    test_pokemon_wild_encounter()
+    test_trainer_team_generation()
+    test_pokemon_trainer_battle()
     print("all pokesim tests passed")
