@@ -48,6 +48,22 @@ class Dex:
     def __init__(self) -> None:
         self.species: dict[str, dict] = _load("species")
         self.moves: dict[str, dict] = _load("moves")
+        # 搏命(PokeAPI/Showdown 已有条目):无属性克制、1/4 最大 HP 反作用
+        self.moves.setdefault(
+            "struggle",
+            {
+                "name": "Struggle",
+                "zh": "挣扎",
+                "category": "Physical",
+                "basePower": 50,
+                "accuracy": True,
+                "pp": 1,
+                "priority": 0,
+            },
+        )
+        self.moves["struggle"].update(
+            {"type": "???", "recoilMaxHp": [1, 4], "struggle": True}
+        )
         self.learnsets: dict[str, dict] = _load("learnsets")
         self.learnset_gen: dict[str, int] = _load("learnset_gen")
         self.typechart: dict[str, dict[str, float]] = _load("typechart")

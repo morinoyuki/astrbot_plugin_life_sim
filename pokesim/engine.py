@@ -824,6 +824,9 @@ class Battle:
         if entry is None:
             self.log.append(f"{mon.display} 想使出的招式不存在。")
             return
+        if move_key not in mon.moves:
+            self.log.append(f"{mon.display} 不会使用「{self._move_zh(move_key)}」!")
+            return
         if mon.choice_locked and mon.choice_locked != move_key:
             self.log.append(f"{mon.display} 被讲究道具锁定,只能使用 {self._move_zh(mon.choice_locked)}!")
             move_key = mon.choice_locked
@@ -831,6 +834,27 @@ class Battle:
         if entry.get("category") == "Status" and (ITEMS.get(mon.item) or {}).get("effect", {}).get("no_status_moves"):
             self.log.append(f"{mon.display} 因突击背心无法使用变化招式!")
             return
+
+        # PP 检查:耗尽则拒绝;全部耗尽则强制搏命
+        cur_pp = mon.pp.get(move_key)
+        if cur_pp is None:
+            cur_pp = int(entry.get("pp", 10) or 10)
+        if cur_pp <= 0:
+            dex = get_dex()
+            others = [
+                m
+                for m in mon.moves
+                if m != move_key
+                and int(mon.pp.get(m, (dex.moves.get(m) or {}).get("pp", 10)) or 0) > 0
+            ]
+            if others and not mon.choice_locked:
+                self.log.append(
+                    f"{self._move_zh(move_key)} 的 PP 已耗尽!{mon.display} 无法使出这一招。"
+                )
+                return
+            self.log.append(f"{mon.display} 的招式 PP 全部耗尽,只能拼命了!")
+            move_key = "struggle"
+            entry = dex.moves["struggle"]
 
         # 混乱
         if mon.volatiles.get("confusion"):
@@ -1263,9 +1287,12 @@ class Battle:
             if healed:
                 self.log.append(f"{mon.display} 吸取了 {healed} HP!")
         recoil = entry.get("recoil")
-        if recoil and not mon.has_ability("rock-head", "magic-guard"):
-            num, den = (recoil if isinstance(recoil, list) else [1, 3])[:2]
-            rec = max(1, int(dealt * num / den))
+        recoil_hp = entry.get("recoilMaxHp")
+        if (recoil or recoil_hp) and not mon.has_ability("rock-head", "magic-guard"):
+            frac = recoil_hp or recoil
+            num, den = (frac if isinstance(frac, list) else [1, 3])[:2]
+            base = mon.max_hp if recoil_hp else dealt
+            rec = max(1, int(base * num / den))
             mon.take_damage(rec)
             self.log.append(f"{mon.display} 受到了 {rec} 点反作用力伤害。")
         life_orb = (ITEMS.get(mon.item) or {}).get("effect", {}).get("recoil")
@@ -1848,6 +1875,8 @@ class Battle:
             entry = dex.moves.get(mk)
             if entry is None:
                 continue
+            if int(mon.pp.get(mk, (entry.get("pp", 10) or 10)) or 0) <= 0:
+                continue  # PP 已尽,不再选
             if entry.get("category") == "Status":
                 score = 40.0
                 if mk in ("protect",) and self.turn > 1:

@@ -413,6 +413,34 @@ def test_pokemon_move_replace():
     _move_replace_scenario()
 
 
+def test_pokemon_battle_pp_rules():
+    with tempfile.TemporaryDirectory() as tmp:
+        p = _FakePlugin(tmp)
+        ev = _Event()
+
+        async def run():
+            await p.poke_add_pokemon(ev, "皮卡丘", level=20, moves="thundershock,quickattack")
+            await p.poke_battle_start(ev, "小拉达|15")
+            # 只能用已学会的招式
+            out = await p.poke_battle_turn(ev, "move 十万伏特")
+            assert "不会使用" in out
+            # 单招 PP 耗尽 -> 拒绝(还有其他可用招)
+            data = p._poke_load(ev)
+            data["battle"]["player"]["party"][0]["pp"]["thundershock"] = 0
+            p._poke_save(ev, data)
+            out = await p.poke_battle_turn(ev, "move 电击")
+            assert "PP 已耗尽" in out
+            # 全部 PP 耗尽 -> 强制挣扎(无属性、反作用)
+            data = p._poke_load(ev)
+            for m in data["battle"]["player"]["party"][0]["moves"]:
+                data["battle"]["player"]["party"][0]["pp"][m] = 0
+            p._poke_save(ev, data)
+            out = await p.poke_battle_turn(ev, "move 电击")
+            assert "挣扎" in out and "反作用力" in out
+
+        asyncio.run(run())
+
+
 if __name__ == "__main__":
     test_dex_lookup_and_types()
     test_dex_stats_and_learnset()
@@ -424,4 +452,5 @@ if __name__ == "__main__":
     test_pokemon_train_and_pvp()
     test_pokemon_evolution()
     test_pokemon_move_replace()
+    test_pokemon_battle_pp_rules()
     print("all pokesim tests passed")
